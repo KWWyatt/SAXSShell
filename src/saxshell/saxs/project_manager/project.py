@@ -4964,9 +4964,8 @@ def load_experimental_data_file(
     effective_skiprows = max(skiprows, 0)
     parse_error: Exception | None = None
     try:
-        data = np.loadtxt(
+        data = _load_experimental_numeric_data(
             file_path,
-            comments="#",
             skiprows=effective_skiprows,
         )
         column_names = _read_experimental_column_names(
@@ -4987,9 +4986,8 @@ def load_experimental_data_file(
             effective_skiprows,
         )
         try:
-            data = np.loadtxt(
+            data = _load_experimental_numeric_data(
                 file_path,
-                comments="#",
                 skiprows=effective_skiprows,
             )
         except Exception as header_exc:
@@ -5152,6 +5150,19 @@ def _guess_experimental_header_rows(file_path: Path) -> int:
                 return header_rows
             header_rows += 1
     return 0
+
+
+def _load_experimental_numeric_data(
+    file_path: Path,
+    *,
+    skiprows: int,
+) -> np.ndarray:
+    with file_path.open("r", encoding="utf-8", errors="replace") as handle:
+        return np.loadtxt(
+            handle,
+            comments="#",
+            skiprows=max(skiprows, 0),
+        )
 
 
 def _read_experimental_column_names(
