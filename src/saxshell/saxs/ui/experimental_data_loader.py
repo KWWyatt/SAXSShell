@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -75,7 +76,21 @@ class ExperimentalDataHeaderDialog(QDialog):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("Check Experimental Data File")
-        self.resize(900, 720)
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = max(900, int(available.width() * 0.85))
+            height = max(600, int(available.height() * 0.85))
+            self.resize(
+                min(width, available.width()),
+                min(height, available.height()),
+            )
+            self.setMaximumSize(
+                int(available.width() * 0.95),
+                int(available.height() * 0.95),
+            )
+        else:
+            self.resize(900, 600)
 
         root = QVBoxLayout(self)
         intro_label = QLabel(
@@ -91,6 +106,8 @@ class ExperimentalDataHeaderDialog(QDialog):
         self.file_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
+        self.file_label.setWordWrap(True)
+        self.file_label.setMinimumWidth(0)
         form.addRow("File", self.file_label)
 
         self.header_rows_spin = QSpinBox()
@@ -110,9 +127,11 @@ class ExperimentalDataHeaderDialog(QDialog):
 
         self.preview_box = QPlainTextEdit()
         self.preview_box.setReadOnly(True)
-        self.preview_box.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.preview_box.setMinimumHeight(420)
-        root.addWidget(self.preview_box)
+        self.preview_box.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.WidgetWidth
+        )
+        self.preview_box.setMinimumHeight(250)
+        root.addWidget(self.preview_box, stretch=1)
 
         self.status_label = QLabel(
             "Adjust the header length and selected columns, then click Load File."
