@@ -13294,6 +13294,41 @@ def test_experimental_data_header_dialog_allows_manual_column_selection(
     assert np.allclose(dialog.accepted_summary.errors, [0.1, 0.2])
 
 
+def test_experimental_data_header_dialog_geometry_is_screen_bounded(
+    qapp, tmp_path
+):
+    del qapp
+    data_path = tmp_path / "exp_long_lines.txt"
+    long_path_segment = "OneDrive - UCB-O365" * 20
+    data_path.write_text(
+        (
+            f"{long_path_segment}\n"
+            f"{'q intensity error ' * 80}\n"
+            f"{'0.05 10.0 0.1 ' * 80}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    dialog = ExperimentalDataHeaderDialog(data_path)
+
+    assert dialog.file_label.wordWrap()
+    assert dialog.file_label.minimumWidth() == 0
+    assert (
+        dialog.preview_box.lineWrapMode()
+        == dialog.preview_box.LineWrapMode.WidgetWidth
+    )
+    assert dialog.preview_box.minimumHeight() == 250
+
+    screen = QApplication.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        max_size = dialog.maximumSize()
+        assert max_size.width() <= available.width()
+        assert max_size.height() <= available.height()
+        assert dialog.minimumWidth() <= available.width()
+        assert dialog.minimumHeight() <= available.height()
+
+
 def test_project_setup_preview_updates_with_experimental_q_range(
     qapp, tmp_path
 ):
