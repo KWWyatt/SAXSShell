@@ -440,6 +440,41 @@ The standalone `xyz2pdb` command still exposes older CLI subcommands such as
 scripting. The Qt interface documented here is the newer native mapping UI and
 does not require the legacy JSON input file.
 
+## Project-backed CLI runs
+
+Use the setup window to save a project-local run file for repeatable
+conversions:
+
+From the main SAXSShell window, use **Tools > CLI Setup > Open XYZ -> PDB CLI
+Setup (Beta)**. The same setup window can also be launched from a terminal:
+
+```bash
+xyz2pdb setup-ui /path/to/saxshell_project --input-path /path/to/xyz_frames
+```
+
+The setup window records the XYZ input, output PDB folder, reference library,
+free-atom definitions, reference-molecule mappings, hydrogen handling, optional
+PBC JSON, assertion mode, and selected estimate solution. Paths inside the
+project folder are saved relative to the project, so the run file remains
+portable with the project folder.
+
+After saving, run the conversion from the project folder:
+
+```bash
+xyz2pdb run /path/to/saxshell_project
+```
+
+By default this reads `xyz2pdb_cli_run.json` in the project folder. To use a
+different run file:
+
+```bash
+xyz2pdb run /path/to/saxshell_project --run-file /path/to/run.json
+```
+
+The project-backed run uses the same native headless mapping workflow as the
+GUI export, writes the converted PDB frames, and updates the SAXSShell project
+`PDB structure folder` to point at the output directory.
+
 ## Related pages
 
 - [GUI Overview](gui-overview.md)

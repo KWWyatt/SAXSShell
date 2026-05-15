@@ -9,7 +9,7 @@ viewer updates, and Qt progress refreshes during the actual analysis.
 ## Workflow
 
 1. Open the main SAXSShell application from the source checkout.
-2. Open **Tools > (beta) > Open Representative CLI Setup (Beta)**.
+2. Open **Tools > CLI Setup > Open Representative CLI Setup (Beta)**.
 3. Select the project folder and representative input folder.
 4. Load or enter the bond-pair and angle-triplet definitions.
 5. Save the run file.
