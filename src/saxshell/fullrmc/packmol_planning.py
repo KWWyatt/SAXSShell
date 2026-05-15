@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import re
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,13 +34,48 @@ if False:  # pragma: no cover
 
 
 @dataclass(slots=True)
+class PackmolSupplementalComponentSettings:
+    role: str = "solute"
+    reference: str | None = None
+    element: str | None = None
+    residue_name: str = ""
+    name: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: dict[str, object] | None,
+    ) -> "PackmolSupplementalComponentSettings":
+        source = dict(payload or {})
+        return cls(
+            role=_normalized_component_role(source.get("role")),
+            reference=_optional_text(source.get("reference")),
+            element=_optional_text(source.get("element")),
+            residue_name=_normalized_optional_residue_name(
+                source.get("residue_name")
+            ),
+            name=str(source.get("name", "") or "").strip(),
+        )
+
+
+@dataclass(slots=True)
 class PackmolPlanningSettings:
     planning_mode: str = "per_element"
     box_side_length_a: float = 100.0
     free_solvent_reference: str | None = None
+    supplemental_components: tuple[
+        PackmolSupplementalComponentSettings, ...
+    ] = ()
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["supplemental_components"] = [
+            component.to_dict() for component in self.supplemental_components
+        ]
+        return payload
 
     @classmethod
     def from_dict(
@@ -58,6 +95,11 @@ class PackmolPlanningSettings:
             box_side_length_a=max(box_side_length_a, 1.0),
             free_solvent_reference=_optional_text(
                 source.get("free_solvent_reference")
+            ),
+            supplemental_components=tuple(
+                PackmolSupplementalComponentSettings.from_dict(entry)
+                for entry in source.get("supplemental_components", [])
+                if isinstance(entry, dict)
             ),
         )
 
@@ -142,6 +184,142 @@ class PackmolSolventAllocation:
 
 
 @dataclass(slots=True)
+class PackmolSupplementalAllocationEntry:
+    role: str
+    name: str
+    source_type: str
+    reference_name: str | None
+    reference_path: str | None
+    residue_name: str
+    planned_count: int
+    atom_count: int
+    element_counts: dict[str, int]
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: dict[str, object],
+    ) -> "PackmolSupplementalAllocationEntry":
+        return cls(
+            role=_normalized_component_role(payload.get("role")),
+            name=str(payload.get("name", "") or "").strip(),
+            source_type=str(payload.get("source_type", "") or "").strip(),
+            reference_name=_optional_text(payload.get("reference_name")),
+            reference_path=_optional_text(payload.get("reference_path")),
+            residue_name=_normalized_residue_name(
+                str(payload.get("residue_name", "") or "")
+            ),
+            planned_count=int(payload.get("planned_count", 0)),
+            atom_count=int(payload.get("atom_count", 0)),
+            element_counts={
+                _normalized_element_symbol(key): int(value)
+                for key, value in dict(
+                    payload.get("element_counts", {})
+                ).items()
+                if int(value) > 0
+            },
+        )
+
+
+@dataclass(slots=True)
+class PackmolSupplementalAllocation:
+    target_solute_formula_units: int
+    formula_unit_basis: dict[str, float]
+    cluster_solute_element_totals: dict[str, int]
+    target_solute_element_totals: dict[str, int]
+    missing_solute_element_totals: dict[str, int]
+    added_solute_element_totals: dict[str, int]
+    unfilled_solute_element_totals: dict[str, int]
+    entries: list[PackmolSupplementalAllocationEntry]
+    warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "target_solute_formula_units": self.target_solute_formula_units,
+            "formula_unit_basis": dict(self.formula_unit_basis),
+            "cluster_solute_element_totals": dict(
+                self.cluster_solute_element_totals
+            ),
+            "target_solute_element_totals": dict(
+                self.target_solute_element_totals
+            ),
+            "missing_solute_element_totals": dict(
+                self.missing_solute_element_totals
+            ),
+            "added_solute_element_totals": dict(
+                self.added_solute_element_totals
+            ),
+            "unfilled_solute_element_totals": dict(
+                self.unfilled_solute_element_totals
+            ),
+            "entries": [entry.to_dict() for entry in self.entries],
+            "warnings": list(self.warnings),
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: dict[str, object] | None,
+    ) -> "PackmolSupplementalAllocation | None":
+        if not payload:
+            return None
+        return cls(
+            target_solute_formula_units=int(
+                payload.get("target_solute_formula_units", 0)
+            ),
+            formula_unit_basis={
+                str(key): float(value)
+                for key, value in dict(
+                    payload.get("formula_unit_basis", {})
+                ).items()
+            },
+            cluster_solute_element_totals={
+                str(key): int(value)
+                for key, value in dict(
+                    payload.get("cluster_solute_element_totals", {})
+                ).items()
+            },
+            target_solute_element_totals={
+                str(key): int(value)
+                for key, value in dict(
+                    payload.get("target_solute_element_totals", {})
+                ).items()
+            },
+            missing_solute_element_totals={
+                str(key): int(value)
+                for key, value in dict(
+                    payload.get("missing_solute_element_totals", {})
+                ).items()
+            },
+            added_solute_element_totals={
+                str(key): int(value)
+                for key, value in dict(
+                    payload.get("added_solute_element_totals", {})
+                ).items()
+            },
+            unfilled_solute_element_totals={
+                str(key): int(value)
+                for key, value in dict(
+                    payload.get("unfilled_solute_element_totals", {})
+                ).items()
+            },
+            entries=[
+                PackmolSupplementalAllocationEntry.from_dict(dict(entry))
+                for entry in payload.get("entries", [])
+                if isinstance(entry, dict)
+            ],
+            warnings=tuple(
+                str(value)
+                for value in payload.get("warnings", [])
+                if str(value).strip()
+            ),
+        )
+
+
+@dataclass(slots=True)
 class PackmolPlanningEntry:
     structure: str
     motif: str
@@ -196,6 +374,7 @@ class PackmolPlanningMetadata:
     achieved_total_number_density_a3: float
     achieved_element_number_density_a3: dict[str, float]
     solvent_allocation: PackmolSolventAllocation | None
+    supplemental_allocation: PackmolSupplementalAllocation | None
     entries: list[PackmolPlanningEntry]
     report_text: str
 
@@ -224,6 +403,11 @@ class PackmolPlanningMetadata:
                 None
                 if self.solvent_allocation is None
                 else self.solvent_allocation.to_dict()
+            ),
+            "supplemental_allocation": (
+                None
+                if self.supplemental_allocation is None
+                else self.supplemental_allocation.to_dict()
             ),
             "entries": [entry.to_dict() for entry in self.entries],
             "report_text": self.report_text,
@@ -272,6 +456,11 @@ class PackmolPlanningMetadata:
                 if isinstance(payload.get("solvent_allocation"), dict)
                 else None
             ),
+            supplemental_allocation=PackmolSupplementalAllocation.from_dict(
+                payload.get("supplemental_allocation")
+                if isinstance(payload.get("supplemental_allocation"), dict)
+                else None
+            ),
             entries=[
                 PackmolPlanningEntry.from_dict(dict(entry))
                 for entry in payload.get("entries", [])
@@ -309,6 +498,22 @@ class PackmolPlanningMetadata:
                     ),
                 ]
             )
+        if self.supplemental_allocation is not None:
+            supplemental_count = sum(
+                entry.planned_count
+                for entry in self.supplemental_allocation.entries
+            )
+            if supplemental_count > 0:
+                lines.append(
+                    f"Supplemental solute components: {supplemental_count}"
+                )
+            if self.supplemental_allocation.unfilled_solute_element_totals:
+                lines.append(
+                    "Unfilled supplemental solute: "
+                    + _format_element_counts(
+                        self.supplemental_allocation.unfilled_solute_element_totals
+                    )
+                )
         lines.extend(
             [
                 (
@@ -429,15 +634,6 @@ def build_packmol_plan(
     planned_count_weights = _normalized_weights(counts.astype(float))
     planned_atom_weights = _normalized_weights(counts * atom_vector)
 
-    volume_a3 = settings.box_side_length_a**3
-    achieved_element_nd = {
-        element: float(
-            np.dot(counts, element_matrix[element_index]) / volume_a3
-        )
-        for element_index, element in enumerate(ordered_elements)
-    }
-    achieved_total_nd = float(np.dot(counts, atom_vector) / volume_a3)
-
     representative_entries = active_representatives.representative_entries
     entries: list[PackmolPlanningEntry] = []
     for index, representative_entry in enumerate(representative_entries):
@@ -463,6 +659,30 @@ def build_packmol_plan(
             )
         )
 
+    volume_a3 = settings.box_side_length_a**3
+    achieved_element_counts = _planned_element_totals(entries)
+    supplemental_allocation = _build_supplemental_allocation(
+        settings=settings,
+        solution=solution,
+        box_targets=box_targets,
+        planning_entries=entries,
+    )
+    if supplemental_allocation is not None:
+        for (
+            element,
+            count,
+        ) in supplemental_allocation.added_solute_element_totals.items():
+            achieved_element_counts[element] = achieved_element_counts.get(
+                element, 0
+            ) + int(count)
+    achieved_element_nd = {
+        element: float(count / volume_a3)
+        for element, count in sorted(achieved_element_counts.items())
+    }
+    achieved_total_nd = float(
+        sum(achieved_element_counts.values()) / volume_a3
+    )
+
     solvent_allocation = _build_solvent_allocation(
         settings=settings,
         box_targets=box_targets,
@@ -480,6 +700,7 @@ def build_packmol_plan(
         achieved_total_nd=achieved_total_nd,
         achieved_element_nd=achieved_element_nd,
         solvent_allocation=solvent_allocation,
+        supplemental_allocation=supplemental_allocation,
     )
     metadata = PackmolPlanningMetadata(
         settings=settings,
@@ -491,6 +712,7 @@ def build_packmol_plan(
         achieved_total_number_density_a3=achieved_total_nd,
         achieved_element_number_density_a3=achieved_element_nd,
         solvent_allocation=solvent_allocation,
+        supplemental_allocation=supplemental_allocation,
         entries=entries,
         report_text=report_text,
     )
@@ -688,6 +910,237 @@ def _vector_error(target: np.ndarray, achieved: np.ndarray) -> float:
     return float(np.linalg.norm(target - achieved, ord=2))
 
 
+def _planned_element_totals(
+    entries: list[PackmolPlanningEntry],
+) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for entry in entries:
+        if entry.planned_count <= 0:
+            continue
+        for element, count in entry.element_counts.items():
+            totals[element] = totals.get(element, 0) + (
+                int(entry.planned_count) * int(count)
+            )
+    return dict(sorted(totals.items()))
+
+
+def _build_supplemental_allocation(
+    *,
+    settings: PackmolPlanningSettings,
+    solution: SolutionProperties,
+    box_targets: dict[str, object],
+    planning_entries: list[PackmolPlanningEntry],
+) -> PackmolSupplementalAllocation | None:
+    solute_formula = {
+        _normalized_element_symbol(element): int(count)
+        for element, count in solution.solute_dict.items()
+        if int(count) > 0
+    }
+    cluster_totals = _planned_element_totals(planning_entries)
+    if not solute_formula:
+        return None
+
+    formula_units, formula_basis = _estimate_solute_formula_units(
+        solute_formula=solute_formula,
+        cluster_totals=cluster_totals,
+        box_targets=box_targets,
+    )
+    target_totals = {
+        element: int(formula_units) * int(count)
+        for element, count in sorted(solute_formula.items())
+    }
+    missing_totals = {
+        element: max(
+            0, int(target_count) - int(cluster_totals.get(element, 0))
+        )
+        for element, target_count in sorted(target_totals.items())
+        if max(0, int(target_count) - int(cluster_totals.get(element, 0))) > 0
+    }
+    if not missing_totals and not settings.supplemental_components:
+        return None
+
+    warnings: list[str] = []
+    resolved_components = [
+        _resolve_supplemental_component(component)
+        for component in settings.supplemental_components
+    ]
+    remaining = Counter(missing_totals)
+    added_totals: Counter[str] = Counter()
+    entries: list[PackmolSupplementalAllocationEntry] = []
+    for component in resolved_components:
+        planned_count = 0
+        if component.role == "solute":
+            planned_count = _supplemental_component_count(
+                component,
+                remaining,
+            )
+            if planned_count > 0:
+                for element, count in component.element_counts.items():
+                    total = int(planned_count) * int(count)
+                    remaining[element] -= total
+                    added_totals[element] += total
+        else:
+            warnings.append(
+                f"{component.name} is marked as solvent, so it was not used "
+                "to satisfy missing solute stoichiometry."
+            )
+        entries.append(
+            PackmolSupplementalAllocationEntry(
+                role=component.role,
+                name=component.name,
+                source_type=component.source_type,
+                reference_name=component.reference_name,
+                reference_path=component.reference_path,
+                residue_name=component.residue_name,
+                planned_count=int(planned_count),
+                atom_count=component.atom_count,
+                element_counts=dict(component.element_counts),
+            )
+        )
+
+    unfilled = {
+        element: int(count)
+        for element, count in sorted(remaining.items())
+        if int(count) > 0
+    }
+    unrepresented_unfilled = {
+        element: count
+        for element, count in unfilled.items()
+        if int(cluster_totals.get(element, 0)) <= 0
+    }
+    if unrepresented_unfilled:
+        raise ValueError(
+            "Supplemental solute components are required to supply missing "
+            "solute stoichiometry not present in the weighted cluster "
+            "structures: "
+            + _format_element_counts(unrepresented_unfilled)
+            + ". Add reference-molecule or single-atom solute components "
+            "before computing the Packmol plan."
+        )
+    if unfilled:
+        warnings.append(
+            "Some solute stoichiometry remains unfilled after supplemental "
+            "component allocation: " + _format_element_counts(unfilled)
+        )
+
+    return PackmolSupplementalAllocation(
+        target_solute_formula_units=int(formula_units),
+        formula_unit_basis=formula_basis,
+        cluster_solute_element_totals=cluster_totals,
+        target_solute_element_totals=target_totals,
+        missing_solute_element_totals=missing_totals,
+        added_solute_element_totals=dict(sorted(added_totals.items())),
+        unfilled_solute_element_totals=unfilled,
+        entries=entries,
+        warnings=tuple(warnings),
+    )
+
+
+@dataclass(slots=True)
+class _ResolvedSupplementalComponent:
+    role: str
+    name: str
+    source_type: str
+    reference_name: str | None
+    reference_path: str | None
+    residue_name: str
+    atom_count: int
+    element_counts: dict[str, int]
+
+
+def _estimate_solute_formula_units(
+    *,
+    solute_formula: dict[str, int],
+    cluster_totals: dict[str, int],
+    box_targets: dict[str, object],
+) -> tuple[int, dict[str, float]]:
+    ratios = {
+        element: float(cluster_totals[element]) / float(count)
+        for element, count in solute_formula.items()
+        if count > 0 and cluster_totals.get(element, 0) > 0
+    }
+    if ratios:
+        ratio_values = np.asarray(list(ratios.values()), dtype=float)
+        return max(0, int(round(float(np.median(ratio_values))))), dict(
+            sorted(ratios.items())
+        )
+    return (
+        max(
+            0,
+            int(round(float(box_targets.get("solute_molecules", 0) or 0))),
+        ),
+        {},
+    )
+
+
+def _resolve_supplemental_component(
+    settings: PackmolSupplementalComponentSettings,
+) -> _ResolvedSupplementalComponent:
+    role = _normalized_component_role(settings.role)
+    reference_identifier = _optional_text(settings.reference)
+    element_identifier = _optional_text(settings.element)
+    if reference_identifier is not None:
+        reference_path = (
+            resolve_reference_path(reference_identifier).expanduser().resolve()
+        )
+        structure = PDBStructure.from_file(reference_path)
+        counts = _count_elements(structure)
+        residue_name = _normalized_residue_name(
+            settings.residue_name
+            or (structure.atoms[0].residue_name if structure.atoms else "")
+            or reference_path.stem
+        )
+        name = settings.name.strip() or reference_path.stem
+        return _ResolvedSupplementalComponent(
+            role=role,
+            name=name,
+            source_type="reference",
+            reference_name=reference_path.stem,
+            reference_path=str(reference_path),
+            residue_name=residue_name,
+            atom_count=len(structure.atoms),
+            element_counts=counts,
+        )
+
+    if element_identifier is not None:
+        element = _normalized_element_symbol(element_identifier)
+        residue_name = _normalized_residue_name(
+            settings.residue_name or element
+        )
+        name = settings.name.strip() or element
+        return _ResolvedSupplementalComponent(
+            role=role,
+            name=name,
+            source_type="single_atom",
+            reference_name=None,
+            reference_path=None,
+            residue_name=residue_name,
+            atom_count=1,
+            element_counts={element: 1},
+        )
+
+    raise ValueError(
+        "Supplemental Packmol components must define either a reference "
+        "molecule or a single atom element."
+    )
+
+
+def _supplemental_component_count(
+    component: _ResolvedSupplementalComponent,
+    remaining: Counter[str],
+) -> int:
+    if not component.element_counts:
+        return 0
+    limiting_counts = [
+        int(remaining.get(element, 0)) // int(count)
+        for element, count in component.element_counts.items()
+        if int(count) > 0
+    ]
+    if not limiting_counts:
+        return 0
+    return max(0, min(limiting_counts))
+
+
 def _build_plan_report(
     *,
     settings: PackmolPlanningSettings,
@@ -698,6 +1151,7 @@ def _build_plan_report(
     achieved_total_nd: float,
     achieved_element_nd: dict[str, float],
     solvent_allocation: PackmolSolventAllocation | None,
+    supplemental_allocation: PackmolSupplementalAllocation | None,
 ) -> str:
     lines = [
         "== Packmol Planning ==",
@@ -722,6 +1176,19 @@ def _build_plan_report(
                     f"{solvent_allocation.solvent_molecules_in_clusters} in cluster files, "
                     f"{solvent_allocation.free_solvent_molecules} free solvent molecules"
                 ),
+            ]
+        )
+    if supplemental_allocation is not None:
+        supplemental_count = sum(
+            entry.planned_count for entry in supplemental_allocation.entries
+        )
+        lines.extend(
+            [
+                (
+                    "Supplemental solute formula units: "
+                    f"{supplemental_allocation.target_solute_formula_units}"
+                ),
+                ("Supplemental solute components: " f"{supplemental_count}"),
             ]
         )
     lines.extend(
@@ -770,6 +1237,50 @@ def _build_plan_report(
                 f"  - {element}: target={target_element_nd[element]:.6f}, "
                 f"achieved={achieved_element_nd.get(element, 0.0):.6f}"
             )
+    if supplemental_allocation is not None:
+        lines.extend(["", "Supplemental solute accounting:"])
+        lines.append(
+            "  Cluster solute totals: "
+            + _format_element_counts(
+                supplemental_allocation.cluster_solute_element_totals
+            )
+        )
+        lines.append(
+            "  Target solute totals: "
+            + _format_element_counts(
+                supplemental_allocation.target_solute_element_totals
+            )
+        )
+        lines.append(
+            "  Missing before supplemental components: "
+            + _format_element_counts(
+                supplemental_allocation.missing_solute_element_totals
+            )
+        )
+        lines.append(
+            "  Added by supplemental components: "
+            + _format_element_counts(
+                supplemental_allocation.added_solute_element_totals
+            )
+        )
+        if supplemental_allocation.unfilled_solute_element_totals:
+            lines.append(
+                "  Unfilled after supplemental components: "
+                + _format_element_counts(
+                    supplemental_allocation.unfilled_solute_element_totals
+                )
+            )
+        if supplemental_allocation.entries:
+            lines.append("  Components:")
+            for entry in supplemental_allocation.entries:
+                lines.append(
+                    "    - "
+                    f"{entry.name}: {entry.planned_count} x "
+                    f"{_format_element_counts(entry.element_counts)} "
+                    f"({entry.role}, residue {entry.residue_name})"
+                )
+        for warning in supplemental_allocation.warnings:
+            lines.append(f"  Warning: {warning}")
     return "\n".join(lines)
 
 
@@ -1110,6 +1621,40 @@ def _normalized_residue_name(text: str) -> str:
     return (collapsed or "CLU")[:3]
 
 
+def _normalized_optional_residue_name(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return _normalized_residue_name(text)
+
+
+def _normalized_component_role(value: object) -> str:
+    text = str(value or "solute").strip().lower()
+    return text if text in {"solute", "solvent"} else "solute"
+
+
+def _normalized_element_symbol(value: object) -> str:
+    text = re.sub(r"[^A-Za-z]", "", str(value or "")).strip()
+    if not text:
+        raise ValueError("Element symbols must contain at least one letter.")
+    if len(text) == 1:
+        return text.upper()
+    return text[0].upper() + text[1:].lower()
+
+
+def _format_element_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "none"
+    return (
+        ", ".join(
+            f"{element} x{int(count)}"
+            for element, count in sorted(counts.items())
+            if int(count) != 0
+        )
+        or "none"
+    )
+
+
 def _optional_text(value: object) -> str | None:
     if value is None:
         return None
@@ -1123,6 +1668,9 @@ __all__ = [
     "PackmolPlanningSettings",
     "PackmolSolventAllocation",
     "PackmolSolventAllocationEntry",
+    "PackmolSupplementalAllocation",
+    "PackmolSupplementalAllocationEntry",
+    "PackmolSupplementalComponentSettings",
     "build_packmol_plan",
     "load_packmol_planning_metadata",
     "save_packmol_planning_metadata",

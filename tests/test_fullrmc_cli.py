@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 import saxshell.fullrmc.cli as fullrmc_cli
+import saxshell.fullrmc.packmol_setup as packmol_setup_module
 import saxshell.fullrmc.solvent_shell_builder as solvent_shell_builder_module
 import saxshell.fullrmc.ui.main_window as fullrmc_ui_module
 from saxshell.fullrmc import (
@@ -28,6 +29,7 @@ from saxshell.fullrmc import (
     PackmolDockerValidationResult,
     PackmolPlanningSettings,
     PackmolSetupSettings,
+    PackmolSupplementalComponentSettings,
     RepresentativeSelectionSettings,
     SolutionPropertiesSettings,
     SolventHandlingSettings,
@@ -56,6 +58,9 @@ from saxshell.fullrmc import (
     select_first_file_representatives,
 )
 from saxshell.fullrmc.cli import main as fullrmc_main
+from saxshell.fullrmc.solvent_handling import (
+    analyze_representative_solvent_distribution,
+)
 from saxshell.fullrmc.ui.main_window import RMCSetupMainWindow
 from saxshell.fullrmc.ui.solvent_shell_builder_window import (
     SolventShellBuilderMainWindow,
@@ -1909,6 +1914,48 @@ def test_build_representative_solvent_outputs_preserves_single_atom_sources(
     assert [atom.element for atom in completed_structure.atoms] == ["Zn"]
 
 
+def test_representative_solvent_distribution_ignores_single_atom_status(
+    tmp_path,
+):
+    project_dir, _paths, _single_atom_path = (
+        _build_sample_saxs_project_with_single_atom_model(tmp_path)
+    )
+    reference_path = _write_custom_solvent_pdb(tmp_path)
+    complete_solvent_path = _write_test_solvent_shell_pdb(
+        tmp_path,
+        reference_path=reference_path,
+    )
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    state.representative_selection = select_first_file_representatives(
+        state,
+        selection,
+    )
+    for entry in state.representative_selection.representative_entries:
+        if entry.atom_count > 1:
+            entry.source_file = str(complete_solvent_path)
+            entry.source_file_name = complete_solvent_path.name
+
+    analysis = analyze_representative_solvent_distribution(
+        state,
+        _integrated_solvent_handling_settings(
+            reference_source="custom",
+            custom_reference_path=str(reference_path),
+            director_atom_name="O1",
+        ),
+    )
+
+    assert analysis.distribution_status == "complete_solvent"
+    assert analysis.distribution_status_entry_count == 2
+    assert analysis.ignored_distribution_status_entry_count == 1
+    assert "Ignored 1 single-atom representative" in (
+        analysis.distribution_note
+    )
+    assert "Zn1: No solvent molecules detected" in analysis.summary_text()
+    assert "ignored for distribution state" in analysis.summary_text()
+
+
 def test_build_packmol_plan_writes_metadata_and_reports(tmp_path):
     project_dir, _paths = _build_sample_saxs_project(tmp_path)
     state = load_rmc_project_source(project_dir)
@@ -2134,6 +2181,107 @@ def test_build_packmol_plan_tracks_solvent_allocation(tmp_path):
     assert "Cluster solvent molecules:" in metadata.summary_text()
 
 
+def test_build_packmol_plan_allocates_missing_solute_components(tmp_path):
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    state.representative_selection = select_first_file_representatives(
+        state,
+        selection,
+    )
+    solution_settings = SolutionPropertiesSettings(
+        mode="mass",
+        solution_density=1.05,
+        solute_stoich="C1H6N1Pb1I2",
+        solvent_stoich="C3H7NO",
+        molar_mass_solute=493.0,
+        molar_mass_solvent=73.09,
+        mass_solute=4.93,
+        mass_solvent=95.07,
+    )
+    state.solution_properties = save_solution_properties_metadata(
+        state.rmcsetup_paths.solution_properties_path,
+        settings=solution_settings,
+        result=calculate_solution_properties(solution_settings),
+    )
+
+    metadata = build_packmol_plan(
+        state,
+        PackmolPlanningSettings(
+            planning_mode="per_element",
+            box_side_length_a=80.0,
+            supplemental_components=(
+                PackmolSupplementalComponentSettings(
+                    role="solute",
+                    reference="ma",
+                    residue_name="MAI",
+                ),
+            ),
+        ),
+    )
+
+    allocation = metadata.supplemental_allocation
+
+    assert allocation is not None
+    assert allocation.target_solute_formula_units > 0
+    assert allocation.unfilled_solute_element_totals == {}
+    assert allocation.entries[0].planned_count == (
+        allocation.target_solute_formula_units
+    )
+    assert allocation.entries[0].element_counts == {
+        "C": 1,
+        "H": 6,
+        "N": 1,
+    }
+    assert metadata.achieved_element_number_density_a3["C"] > 0
+    assert "Supplemental solute accounting:" in (
+        state.rmcsetup_paths.packmol_plan_report_path.read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def test_build_packmol_plan_requires_components_for_absent_solute_species(
+    tmp_path,
+):
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    state.representative_selection = select_first_file_representatives(
+        state,
+        selection,
+    )
+    solution_settings = SolutionPropertiesSettings(
+        mode="mass",
+        solution_density=1.05,
+        solute_stoich="C1H6N1Pb1I2",
+        solvent_stoich="C3H7NO",
+        molar_mass_solute=493.0,
+        molar_mass_solvent=73.09,
+        mass_solute=4.93,
+        mass_solvent=95.07,
+    )
+    state.solution_properties = save_solution_properties_metadata(
+        state.rmcsetup_paths.solution_properties_path,
+        settings=solution_settings,
+        result=calculate_solution_properties(solution_settings),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Supplemental solute components are required",
+    ):
+        build_packmol_plan(
+            state,
+            PackmolPlanningSettings(
+                planning_mode="per_element",
+                box_side_length_a=80.0,
+            ),
+        )
+
+
 def test_build_packmol_setup_writes_input_files_and_audit(tmp_path):
     project_dir, _paths = _build_sample_saxs_project(tmp_path)
     state = load_rmc_project_source(project_dir)
@@ -2221,6 +2369,247 @@ def test_build_packmol_setup_writes_input_files_and_audit(tmp_path):
     assert "# Packmol Build Audit" in audit_text
     assert "Cluster solvent molecules:" in audit_text
     assert "Count-normalized weights" in audit_text
+    assert Path(metadata.build_report_path).is_file()
+    build_report_text = Path(metadata.build_report_path).read_text(
+        encoding="utf-8"
+    )
+    assert "Source input information" in build_report_text
+    assert "Computed solvent molecules:" in build_report_text
+    assert "Cluster solvent molecules:" in build_report_text
+    assert "Free solvent molecules:" in build_report_text
+    assert "Target total number density:" in build_report_text
+
+    solvated_entry = next(
+        entry for entry in metadata.entries if entry.solvent_atom_count > 0
+    )
+    solvated_structure = PDBStructure.from_file(solvated_entry.packmol_pdb)
+    solute_atoms = [
+        atom
+        for atom in solvated_structure.atoms
+        if atom.residue_name == solvated_entry.residue_name
+    ]
+    solvent_atoms = [
+        atom
+        for atom in solvated_structure.atoms
+        if atom.residue_name != solvated_entry.residue_name
+    ]
+
+    assert solute_atoms
+    assert solvent_atoms
+    assert len(solute_atoms) == solvated_entry.solute_atom_count
+    assert len(solvent_atoms) == solvated_entry.solvent_atom_count
+    assert {atom.residue_number for atom in solute_atoms} == {1}
+    assert {atom.residue_name for atom in solvent_atoms} == {"DMF"}
+    assert min(atom.residue_number for atom in solvent_atoms) >= 2
+    assert len({atom.residue_number for atom in solvent_atoms}) == (
+        solvated_entry.solvent_residue_count
+    )
+
+
+def test_packmol_preparation_keeps_solvent_residue_when_solute_is_last():
+    source_structure = PDBStructure(
+        atoms=[
+            PDBAtom(
+                atom_id=229,
+                atom_name="O1",
+                residue_name="DMF",
+                residue_number=20,
+                coordinates=np.asarray([10.073, 14.645, 2.873]),
+                element="O",
+            ),
+            PDBAtom(
+                atom_id=230,
+                atom_name="N1",
+                residue_name="DMF",
+                residue_number=20,
+                coordinates=np.asarray([8.539, 14.935, 4.538]),
+                element="N",
+            ),
+            PDBAtom(
+                atom_id=639,
+                atom_name="PB3",
+                residue_name="PBI",
+                residue_number=56,
+                coordinates=np.asarray([13.198, 14.311, 3.729]),
+                element="Pb",
+            ),
+            PDBAtom(
+                atom_id=642,
+                atom_name="I3",
+                residue_name="PBI",
+                residue_number=59,
+                coordinates=np.asarray([16.059, 14.562, 4.307]),
+                element="I",
+            ),
+            PDBAtom(
+                atom_id=643,
+                atom_name="I4",
+                residue_name="PBI",
+                residue_number=60,
+                coordinates=np.asarray([12.481, 15.296, 6.518]),
+                element="I",
+            ),
+        ],
+        source_name="solvent_first_cluster",
+    )
+
+    prepared = packmol_setup_module._prepare_packmol_structure(
+        source_structure,
+        residue_name="CAH",
+        solvent_residue_names=frozenset({"DMF"}),
+        expected_solute_element_counts={"Pb": 1, "I": 2},
+        solute_atom_count=2,
+    )
+
+    residue_names = [atom.residue_name for atom in prepared.structure.atoms]
+    residue_numbers = [
+        atom.residue_number for atom in prepared.structure.atoms
+    ]
+
+    assert residue_names == ["DMF", "DMF", "CAH", "CAH", "CAH"]
+    assert residue_numbers == [2, 2, 1, 1, 1]
+    assert prepared.solute_atom_count == 3
+    assert prepared.solvent_atom_count == 2
+    assert prepared.solvent_residue_names == ("DMF",)
+
+
+def test_packmol_preparation_can_identify_formula_solute_without_metadata():
+    source_structure = PDBStructure(
+        atoms=[
+            PDBAtom(
+                atom_id=1,
+                atom_name="O1",
+                residue_name="DMF",
+                residue_number=20,
+                coordinates=np.asarray([0.0, 0.0, 0.0]),
+                element="O",
+            ),
+            PDBAtom(
+                atom_id=2,
+                atom_name="C1",
+                residue_name="DMF",
+                residue_number=20,
+                coordinates=np.asarray([1.0, 0.0, 0.0]),
+                element="C",
+            ),
+            PDBAtom(
+                atom_id=3,
+                atom_name="PB1",
+                residue_name="PBI",
+                residue_number=56,
+                coordinates=np.asarray([2.0, 0.0, 0.0]),
+                element="Pb",
+            ),
+            PDBAtom(
+                atom_id=4,
+                atom_name="I1",
+                residue_name="PBI",
+                residue_number=59,
+                coordinates=np.asarray([3.0, 0.0, 0.0]),
+                element="I",
+            ),
+            PDBAtom(
+                atom_id=5,
+                atom_name="I2",
+                residue_name="PBI",
+                residue_number=60,
+                coordinates=np.asarray([4.0, 0.0, 0.0]),
+                element="I",
+            ),
+        ],
+        source_name="formula_fallback_cluster",
+    )
+
+    prepared = packmol_setup_module._prepare_packmol_structure(
+        source_structure,
+        residue_name="CAH",
+        expected_solute_element_counts={"Pb": 1, "I": 2},
+    )
+
+    assert [atom.residue_name for atom in prepared.structure.atoms] == [
+        "DMF",
+        "DMF",
+        "CAH",
+        "CAH",
+        "CAH",
+    ]
+    assert prepared.solute_atom_count == 3
+    assert prepared.solvent_residue_names == ("DMF",)
+
+
+def test_build_packmol_setup_writes_supplemental_solute_components(tmp_path):
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    state.representative_selection = select_first_file_representatives(
+        state,
+        selection,
+    )
+    solution_settings = SolutionPropertiesSettings(
+        mode="mass",
+        solution_density=1.05,
+        solute_stoich="C1H6N1Pb1I2",
+        solvent_stoich="C3H7NO",
+        molar_mass_solute=493.0,
+        molar_mass_solvent=73.09,
+        mass_solute=4.93,
+        mass_solvent=95.07,
+    )
+    state.solution_properties = save_solution_properties_metadata(
+        state.rmcsetup_paths.solution_properties_path,
+        settings=solution_settings,
+        result=calculate_solution_properties(solution_settings),
+    )
+    state.packmol_planning = build_packmol_plan(
+        state,
+        PackmolPlanningSettings(
+            planning_mode="per_element",
+            box_side_length_a=80.0,
+            free_solvent_reference="dmf",
+            supplemental_components=(
+                PackmolSupplementalComponentSettings(
+                    role="solute",
+                    reference="ma",
+                    residue_name="MAI",
+                ),
+            ),
+        ),
+    )
+
+    metadata = build_packmol_setup(
+        state,
+        PackmolSetupSettings(
+            tolerance_angstrom=2.2,
+            free_solvent_reference="dmf",
+        ),
+    )
+
+    assert metadata.supplemental_entries
+    supplemental_entry = metadata.supplemental_entries[0]
+    supplemental_structure = PDBStructure.from_file(
+        supplemental_entry.packmol_pdb
+    )
+    packmol_text = Path(metadata.packmol_input_path).read_text(
+        encoding="utf-8"
+    )
+    build_report_text = Path(metadata.build_report_path).read_text(
+        encoding="utf-8"
+    )
+
+    assert supplemental_entry.planned_count == (
+        state.packmol_planning.supplemental_allocation.target_solute_formula_units
+    )
+    assert {atom.residue_name for atom in supplemental_structure.atoms} == {
+        "MAI"
+    }
+    assert supplemental_entry.atom_count == 8
+    assert f"structure {Path(supplemental_entry.packmol_pdb).name}" in (
+        packmol_text
+    )
+    assert f"  number {supplemental_entry.planned_count}" in packmol_text
+    assert "Supplemental solute accounting" in build_report_text
+    assert "Supplemental Packmol components" in build_report_text
 
 
 def test_build_packmol_setup_requires_all_positive_weight_representatives(
@@ -2406,6 +2795,7 @@ def test_build_constraint_generation_writes_per_structure_and_merged_files(
     )
     assert "BOND_ANGLE_CONSTRAINTS" in merged_text
     assert "BOND_LENGTH_CONSTRAINTS" in merged_text
+    assert "DMF" not in merged_text
     assert any(entry.bond_length_count > 0 for entry in metadata.entries)
     assert any(entry.bond_angle_count > 0 for entry in metadata.entries)
 
@@ -3309,6 +3699,103 @@ def test_rmcsetup_solvent_handling_ui_builds_and_reloads(tmp_path):
     )
 
 
+def test_rmcsetup_reload_maps_representatives_to_current_dream_weights(
+    tmp_path,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    metadata = select_first_file_representatives(state, selection)
+    for entry in metadata.representative_entries:
+        entry.param = entry.structure
+        entry.selected_weight = 0.5
+    for entry in metadata.distribution_selection.entries:
+        entry.param = entry.structure
+        entry.selected_weight = 0.5
+    save_representative_selection_metadata(
+        state.rmcsetup_paths.representative_selection_path,
+        metadata,
+    )
+
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+
+    headers = [
+        window.generated_pdb_table.horizontalHeaderItem(column).text()
+        for column in range(window.generated_pdb_table.columnCount())
+    ]
+    assert "DREAM Weight" in headers
+    assert "DREAM Value" in headers
+    weight_column = headers.index("DREAM Weight")
+    value_column = headers.index("DREAM Value")
+    mapped = {
+        window.generated_pdb_table.item(row, 0).text(): (
+            window.generated_pdb_table.item(row, weight_column).text(),
+            window.generated_pdb_table.item(row, value_column).text(),
+        )
+        for row in range(window.generated_pdb_table.rowCount())
+    }
+
+    assert mapped["PbI2"] == ("w0", "0.25")
+    assert mapped["PbI2O/motif_1"] == ("w1", "0.75")
+    reloaded = load_representative_selection_metadata(
+        state.rmcsetup_paths.representative_selection_path
+    )
+    assert reloaded is not None
+    assert {
+        (entry.structure, entry.motif): (entry.param, entry.selected_weight)
+        for entry in reloaded.representative_entries
+    } == {
+        ("PbI2", "no_motif"): ("w0", pytest.approx(0.25)),
+        ("PbI2O", "motif_1"): ("w1", pytest.approx(0.75)),
+    }
+
+
+def test_rmcsetup_representative_reset_keeps_saved_representative_sources(
+    tmp_path,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    state.representative_selection = select_first_file_representatives(
+        state,
+        selection,
+    )
+    state.solvent_handling = build_representative_solvent_outputs(
+        state,
+        _integrated_solvent_handling_settings(),
+    )
+    source_paths = [
+        Path(entry.source_file)
+        for entry in state.representative_selection.representative_entries
+    ]
+    tracked_outputs = [
+        Path(entry.completed_pdb) for entry in state.solvent_handling.entries
+    ]
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+
+    reset = window._reset_representative_dependent_state(
+        confirm=False,
+        refresh=False,
+        clear_reason="test",
+    )
+
+    assert reset is True
+    assert window._project_source_state is not None
+    assert window._project_source_state.representative_selection is not None
+    assert all(path.is_file() for path in source_paths)
+    assert not any(path.exists() for path in tracked_outputs)
+    assert (
+        load_solvent_handling_metadata(
+            state.rmcsetup_paths.solvent_handling_path
+        )
+        is None
+    )
+
+
 def test_rmcsetup_imported_full_solvent_representatives_mark_solvent_ready(
     tmp_path,
 ):
@@ -4186,6 +4673,39 @@ def test_rmcsetup_ui_can_compute_packmol_plan_and_reload(tmp_path):
     assert "Planned clusters:" in (
         reloaded.packmol_plan_summary_box.toPlainText()
     )
+
+
+def test_rmcsetup_packmol_single_atom_uses_periodic_table_picker(
+    tmp_path,
+    monkeypatch,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+    monkeypatch.setattr(
+        fullrmc_ui_module.PeriodicTableElementDialog,
+        "get_element_symbol",
+        lambda **_kwargs: "Cs",
+    )
+    monkeypatch.setattr(
+        fullrmc_ui_module.QInputDialog,
+        "getItem",
+        lambda *_args, **_kwargs: ("solute", True),
+    )
+    monkeypatch.setattr(
+        fullrmc_ui_module.QInputDialog,
+        "getText",
+        lambda *_args, **_kwargs: ("CES", True),
+    )
+
+    window._add_packmol_supplemental_atom_component()
+
+    components = window._current_packmol_supplemental_components()
+    assert len(components) == 1
+    assert components[0].element == "Cs"
+    assert components[0].residue_name == "CES"
+    assert window.packmol_supplemental_table.item(0, 2).text() == "Cs"
+    window.close()
 
 
 def test_rmcsetup_ui_packmol_preview_includes_single_atom_model_sources(
