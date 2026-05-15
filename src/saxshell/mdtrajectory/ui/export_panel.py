@@ -60,6 +60,18 @@ class ExportPanel(QGroupBox):
         self.use_cutoff_box.toggled.connect(self._handle_use_cutoff_toggled)
         form.addRow("", self.use_cutoff_box)
 
+        self.include_restart_duplicates_box = QCheckBox(
+            "Include duplicate restart frames"
+        )
+        self.include_restart_duplicates_box.setToolTip(
+            "Export duplicate frames from overlapping simulation restarts. "
+            "Leave this off for the cleaned continuation trajectory."
+        )
+        self.include_restart_duplicates_box.toggled.connect(
+            lambda _checked: self.settings_changed.emit()
+        )
+        form.addRow("", self.include_restart_duplicates_box)
+
         self.post_cutoff_stride_box = QCheckBox(
             "After cutoff, keep every Nth frame"
         )
@@ -170,6 +182,9 @@ class ExportPanel(QGroupBox):
     def get_post_cutoff_stride(self) -> int:
         return self.post_cutoff_stride_spin.value()
 
+    def include_restart_duplicates(self) -> bool:
+        return self.include_restart_duplicates_box.isChecked()
+
     def set_selection_summary(self, text: str) -> None:
         self.selection_box.setPlainText(text)
 
@@ -188,6 +203,7 @@ class ExportPanel(QGroupBox):
         if self.output_dir_button is not None:
             self.output_dir_button.setEnabled(enabled)
         self.use_cutoff_box.setEnabled(enabled)
+        self.include_restart_duplicates_box.setEnabled(enabled)
         self.post_cutoff_stride_box.setEnabled(
             enabled and self.use_cutoff_box.isChecked()
         )
