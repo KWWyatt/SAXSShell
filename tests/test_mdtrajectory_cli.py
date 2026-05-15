@@ -61,6 +61,24 @@ def _write_sample_ener(path: Path) -> None:
     )
 
 
+def _write_restart_overlap_xyz(path: Path) -> None:
+    path.write_text(
+        "1\n"
+        "i = 0, time = 0.0, E = -1.0\n"
+        "H 0.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 1.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 9.0 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1.0, E = -1.0\n"
+        "H 2.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+
 def test_workflow_supports_notebook_style_end_to_end_usage(tmp_path):
     trajectory_file = tmp_path / "traj.xyz"
     energy_file = tmp_path / "traj.ener"
@@ -196,6 +214,265 @@ def test_mdtrajectory_cli_export_runs_complete_headless_workflow(
         "frame_0002.xyz",
         "frame_0003.xyz",
     ]
+
+
+def test_mdtrajectory_cli_export_can_include_restart_duplicates(
+    tmp_path,
+    capsys,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    _write_restart_overlap_xyz(trajectory_file)
+
+    exit_code = mdtrajectory_main(
+        [
+            "export",
+            str(trajectory_file),
+            "--include-restart-duplicates",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    output_dir = tmp_path / "splitxyz_f0_t0fs"
+    metadata_payload = json.loads(
+        (output_dir / "mdtrajectory_export.json").read_text()
+    )
+
+    assert exit_code == 0
+    assert "Restart duplicate frames: included" in captured.out
+    assert sorted(path.name for path in output_dir.glob("*.xyz")) == [
+        "frame_0000.xyz",
+        "frame_0001.xyz",
+        "frame_0001_duplicate0001.xyz",
+        "frame_0002.xyz",
+    ]
+    assert (
+        "H        1.0"
+        in (output_dir / "frame_0001_duplicate0001.xyz").read_text()
+    )
+    assert "H        9.0" in (output_dir / "frame_0001.xyz").read_text()
+    assert metadata_payload["selection"]["include_restart_duplicates"] is True
+
+
+def test_workflow_can_validate_exported_xyz_frame_mapping(tmp_path):
+    trajectory_file = tmp_path / "traj.xyz"
+    _write_sample_xyz(trajectory_file)
+
+    workflow = MDTrajectoryWorkflow(trajectory_file=trajectory_file)
+    export = workflow.export_frames(use_cutoff=True, cutoff_fs=50.0)
+
+    result = workflow.validate_export(
+        export.output_dir,
+        expect_contiguous=True,
+    )
+
+    assert result.passed
+    assert result.exported_files == 3
+    assert result.validated_files == 3
+    assert result.filename_index_min == 1
+    assert result.filename_index_max == 3
+    assert result.header_index_min == 1
+    assert result.header_index_max == 3
+    assert result.filename_header_offsets == {0: 3}
+    assert result.issue_counts == {}
+
+
+def test_workflow_validation_accepts_purged_source_duplicate_conflicts(
+    tmp_path,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    trajectory_file.write_text(
+        "1\n"
+        "i = 0, time = 0.0, E = -1.0\n"
+        "H 0.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 1.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 9.0 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1.0, E = -1.0\n"
+        "H 2.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    workflow = MDTrajectoryWorkflow(trajectory_file=trajectory_file)
+    export = workflow.export_frames()
+
+    result = workflow.validate_export(export.output_dir)
+    strict_result = workflow.validate_export(
+        export.output_dir,
+        strict_source_duplicates=True,
+    )
+
+    assert result.passed
+    assert result.source_duplicate_indices == 1
+    assert result.source_duplicate_conflicts == 1
+    assert result.issue_counts == {}
+    assert strict_result.failure_count == 1
+    assert not strict_result.passed
+    assert "H        9.0" in (export.output_dir / "frame_0001.xyz").read_text()
+
+
+def test_workflow_validation_allows_identical_source_duplicates_by_default(
+    tmp_path,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    trajectory_file.write_text(
+        "1\n"
+        "i = 0, time = 0.0, E = -1.0\n"
+        "H 0.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 1.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 1.0 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1.0, E = -1.0\n"
+        "H 2.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    workflow = MDTrajectoryWorkflow(trajectory_file=trajectory_file)
+    export = workflow.export_frames()
+
+    result = workflow.validate_export(export.output_dir)
+    strict_result = workflow.validate_export(
+        export.output_dir,
+        strict_source_duplicates=True,
+    )
+
+    assert result.passed
+    assert result.source_duplicate_indices == 1
+    assert result.source_duplicate_conflicts == 0
+    assert result.issue_counts == {}
+    assert strict_result.failure_count == 1
+    assert not strict_result.passed
+
+
+def test_workflow_validation_rejects_export_that_keeps_earlier_overlap(
+    tmp_path,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    trajectory_file.write_text(
+        "1\n"
+        "i = 0, time = 0.0, E = -1.0\n"
+        "H 0.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 1.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 9.0 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1.0, E = -1.0\n"
+        "H 2.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    bad_export_dir = tmp_path / "bad_frames"
+    bad_export_dir.mkdir()
+    (bad_export_dir / "frame_0001.xyz").write_text(
+        "1\n" "i = 1, time = 0.5, E = -1.0\n" "H 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    workflow = MDTrajectoryWorkflow(trajectory_file=trajectory_file)
+    result = workflow.validate_export(bad_export_dir)
+
+    assert not result.passed
+    assert result.source_duplicate_conflicts == 1
+    assert result.issue_counts == {"coordinate_mismatch": 1}
+
+
+def test_mdtrajectory_cli_validate_export_reports_mapping_failures(
+    tmp_path,
+    capsys,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    _write_sample_xyz(trajectory_file)
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    (frame_dir / "frame_0001.xyz").write_text(
+        "2\n"
+        "i = 1, time = 50.0, E = -1.0\n"
+        "H 0.0 0.1 0.0\n"
+        "O 1.0 0.1 0.0\n",
+        encoding="utf-8",
+    )
+    (frame_dir / "frame_0002.xyz").write_text(
+        "2\n"
+        "i = 1, time = 50.0, E = -1.0\n"
+        "H 0.0 0.1 0.0\n"
+        "O 1.0 0.1 0.0\n",
+        encoding="utf-8",
+    )
+
+    exit_code = mdtrajectory_main(
+        [
+            "validate-export",
+            str(trajectory_file),
+            str(frame_dir),
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Export validation failed." in captured.out
+    assert "- filename_header_offset: 1" in captured.out
+    assert "- coordinate_mismatch: 1" in captured.out
+    assert "- duplicate_export_header_index: 1" in captured.out
+
+
+def test_mdtrajectory_cli_validate_export_fails_empty_frame_directory(
+    tmp_path,
+    capsys,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    _write_sample_xyz(trajectory_file)
+    frame_dir = tmp_path / "empty_frames"
+    frame_dir.mkdir()
+
+    exit_code = mdtrajectory_main(
+        [
+            "validate-export",
+            str(trajectory_file),
+            str(frame_dir),
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "- no_exported_xyz_files: 1" in captured.out
+
+
+def test_mdtrajectory_cli_suggest_cutoff_defaults_to_window_two(
+    tmp_path,
+    capsys,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    energy_file = tmp_path / "traj.ener"
+    _write_sample_xyz(trajectory_file)
+    _write_sample_ener(energy_file)
+
+    exit_code = mdtrajectory_main(
+        [
+            "suggest-cutoff",
+            str(trajectory_file),
+            "--energy-file",
+            str(energy_file),
+            "--temp-target-k",
+            "300.0",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Suggested cutoff: 50.000 fs" in captured.out
+    assert "Window: 2" in captured.out
 
 
 def test_saxshell_cli_forwards_to_mdtrajectory_subcommand(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -63,20 +64,69 @@ from saxshell.pdf.debyer.workflow import (
     build_display_traces,
     check_debyer_runtime,
     classify_partial_pair,
+    compute_experimental_fit_metrics,
+    convert_distribution_values,
+    default_parallel_debyer_jobs,
     estimate_partial_peak_markers,
     find_partial_peak_markers,
+    fit_coordination_peak_from_r,
+    infer_default_solute_elements,
     inspect_frames_dir,
     list_saved_debyer_calculations,
     load_debyer_calculation,
+    rewrite_debyer_calculation_output,
     write_debyer_calculation_metadata,
+)
+from saxshell.saxs.project_manager import (
+    ExperimentalDataSummary,
+    load_experimental_data_file,
 )
 from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.saxs.ui.experimental_data_loader import (
+    ExperimentalDataHeaderDialog,
+)
 
 _OPEN_WINDOWS: list["DebyerPDFMainWindow"] = []
+
+_GROUP_TRACE_DEFAULT_COLORS = {
+    "group:solute-solute": "#cc79a7",
+    "group:solute-solvent": "#e69f00",
+    "group:solvent-solvent": "#009e73",
+}
+
+_SPLITTER_HANDLE_STYLE = """
+QSplitter::handle {
+    background-color: #c8d1de;
+    border: 1px solid #9aa8ba;
+    border-radius: 2px;
+}
+QSplitter::handle:hover {
+    background-color: #9fb2ca;
+    border-color: #6f83a0;
+}
+QSplitter::handle:pressed {
+    background-color: #8299b8;
+    border-color: #536b8c;
+}
+"""
+
+
+def _configure_resize_splitter(
+    splitter: QSplitter,
+    *,
+    handle_width: int,
+    tooltip: str,
+) -> None:
+    splitter.setChildrenCollapsible(False)
+    splitter.setHandleWidth(handle_width)
+    splitter.setOpaqueResize(True)
+    splitter.setStyleSheet(_SPLITTER_HANDLE_STYLE)
+    for index in range(1, splitter.count()):
+        splitter.handle(index).setToolTip(tooltip)
 
 
 class DebyerPDFWorker(QObject):
@@ -87,9 +137,30 @@ class DebyerPDFWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, settings: DebyerPDFSettings) -> None:
+    def __init__(
+        self,
+        settings: DebyerPDFSettings,
+        *,
+        preview_enabled: bool = True,
+    ) -> None:
         super().__init__()
         self.settings = settings
+        self._cancel_requested = threading.Event()
+        self._preview_enabled = threading.Event()
+        self._preview_update_requested = threading.Event()
+        if preview_enabled:
+            self._preview_enabled.set()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
+
+    def set_preview_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._preview_enabled.set()
+            self._preview_update_requested.set()
+        else:
+            self._preview_enabled.clear()
+            self._preview_update_requested.clear()
 
     @Slot()
     def run(self) -> None:
@@ -99,7 +170,9 @@ class DebyerPDFWorker(QObject):
                 progress_callback=self._emit_progress,
                 log_callback=self.log.emit,
                 status_callback=self.status.emit,
-                preview_callback=self.preview.emit,
+                preview_callback=self._emit_preview,
+                preview_decision_callback=self._should_emit_preview,
+                cancel_callback=self._cancel_requested.is_set,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -113,6 +186,20 @@ class DebyerPDFWorker(QObject):
         message: str,
     ) -> None:
         self.progress.emit(processed, total, message)
+
+    def _should_emit_preview(
+        self,
+        _processed: int,
+        _total: int,
+        checkpoint_due: bool,
+    ) -> bool:
+        if self._preview_update_requested.is_set():
+            return True
+        return bool(checkpoint_due and self._preview_enabled.is_set())
+
+    def _emit_preview(self, calculation: DebyerPDFCalculation) -> None:
+        self._preview_update_requested.clear()
+        self.preview.emit(calculation)
 
 
 class DebyerPeakEditorDialog(QDialog):
@@ -295,16 +382,20 @@ class DebyerPDFMainWindow(QMainWindow):
         super().__init__(parent)
         self._run_thread: QThread | None = None
         self._run_worker: DebyerPDFWorker | None = None
+        self._latest_run_preview: DebyerPDFCalculation | None = None
         self._loaded_summaries: list[DebyerPDFCalculationSummary] = []
         self._current_calculation: DebyerPDFCalculation | None = None
         self._current_traces: list[dict[str, object]] = []
         self._trace_visibility: dict[str, bool] = {}
         self._trace_tag_visibility: dict[str, bool] = {}
         self._trace_colors: dict[str, str] = {}
+        self._close_requested_during_run = False
         self._tag_artist_records: list[dict[str, object]] = []
         self._drag_state: dict[str, object] | None = None
         self._selected_tag: dict[str, object] | None = None
+        self._experimental_summary: ExperimentalDataSummary | None = None
         self._build_ui()
+        self._refresh_experimental_controls()
         self._delete_tag_shortcut = QShortcut(
             QKeySequence(Qt.Key.Key_Delete),
             self,
@@ -331,13 +422,18 @@ class DebyerPDFMainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._run_thread is not None and self._run_thread.isRunning():
-            QMessageBox.warning(
-                self,
-                "Debyer PDF",
-                "Please wait for the current Debyer PDF calculation to "
-                "finish before closing this window.",
+            self._request_run_cancel(
+                "Closing window; stopping Debyer after active frame jobs "
+                "finish and saving the partial average."
             )
-            event.ignore()
+            self.hide()
+            while (
+                self._run_thread is not None and self._run_thread.isRunning()
+            ):
+                QApplication.processEvents()
+                if self._run_thread is not None:
+                    self._run_thread.wait(50)
+            event.accept()
             return
         super().closeEvent(event)
 
@@ -350,11 +446,16 @@ class DebyerPDFMainWindow(QMainWindow):
         root = QHBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_left_panel())
-        splitter.addWidget(self._build_right_panel())
-        splitter.setSizes([460, 980])
-        root.addWidget(splitter)
+        self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter.addWidget(self._build_left_panel())
+        self._main_splitter.addWidget(self._build_right_panel())
+        _configure_resize_splitter(
+            self._main_splitter,
+            handle_width=14,
+            tooltip="Drag to resize the setup and results panes.",
+        )
+        self._main_splitter.setSizes([460, 980])
+        root.addWidget(self._main_splitter)
         self.setCentralWidget(central)
         self.statusBar().showMessage("Ready")
 
@@ -366,6 +467,7 @@ class DebyerPDFMainWindow(QMainWindow):
 
         layout.addWidget(self._build_runtime_group())
         layout.addWidget(self._build_paths_group())
+        layout.addWidget(self._build_experimental_group())
         layout.addWidget(self._build_saved_calculations_group())
         layout.addWidget(self._build_settings_group())
         layout.addWidget(self._build_run_group())
@@ -383,10 +485,15 @@ class DebyerPDFMainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._build_results_tab(), "Results")
-        tabs.addTab(self._build_plot_settings_tab(), "Settings")
-        layout.addWidget(tabs, stretch=1)
+        self.result_tabs = QTabWidget()
+        self.result_tabs.addTab(self._build_results_tab(), "Results")
+        self.result_tabs.addTab(
+            self._build_shape_function_tab(),
+            "Shape Function Analysis",
+        )
+        self.result_tabs.addTab(self._build_fit_tab(), "Fit")
+        self.result_tabs.addTab(self._build_plot_settings_tab(), "Settings")
+        layout.addWidget(self.result_tabs, stretch=1)
         return panel
 
     def _build_results_tab(self) -> QWidget:
@@ -461,8 +568,126 @@ class DebyerPDFMainWindow(QMainWindow):
         )
         table_layout.addWidget(self.trace_table, stretch=1)
         right_splitter.addWidget(table_container)
+        _configure_resize_splitter(
+            right_splitter,
+            handle_width=12,
+            tooltip="Drag to resize the plot and trace table.",
+        )
         right_splitter.setSizes([620, 260])
         layout.addWidget(right_splitter, stretch=1)
+        return tab
+
+    def _build_shape_function_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        self.shape_function_status_label = QLabel(
+            "Shape-function analysis setup will be added here."
+        )
+        self.shape_function_status_label.setWordWrap(True)
+        self.shape_function_status_label.setFrameShape(
+            QFrame.Shape.StyledPanel
+        )
+        layout.addWidget(self.shape_function_status_label)
+        layout.addStretch(1)
+        return tab
+
+    def _build_fit_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        form = QFormLayout()
+        self.coordination_fit_trace_combo = QComboBox()
+        self.coordination_fit_trace_combo.currentIndexChanged.connect(
+            self._suggest_coordination_fit_window
+        )
+        form.addRow("R(r) trace", self.coordination_fit_trace_combo)
+
+        window_widget = QWidget()
+        window_layout = QHBoxLayout(window_widget)
+        window_layout.setContentsMargins(0, 0, 0, 0)
+        self.coordination_fit_r_min_spin = QDoubleSpinBox()
+        self.coordination_fit_r_min_spin.setRange(0.0, 100000.0)
+        self.coordination_fit_r_min_spin.setDecimals(4)
+        self.coordination_fit_r_min_spin.setSingleStep(0.05)
+        self.coordination_fit_r_min_spin.setValue(1.0)
+        self.coordination_fit_r_max_spin = QDoubleSpinBox()
+        self.coordination_fit_r_max_spin.setRange(0.0, 100000.0)
+        self.coordination_fit_r_max_spin.setDecimals(4)
+        self.coordination_fit_r_max_spin.setSingleStep(0.05)
+        self.coordination_fit_r_max_spin.setValue(4.0)
+        window_layout.addWidget(QLabel("from"))
+        window_layout.addWidget(self.coordination_fit_r_min_spin)
+        window_layout.addWidget(QLabel("to"))
+        window_layout.addWidget(self.coordination_fit_r_max_spin)
+        window_layout.addStretch(1)
+        form.addRow("Fit window (A)", window_widget)
+
+        seed_widget = QWidget()
+        seed_layout = QHBoxLayout(seed_widget)
+        seed_layout.setContentsMargins(0, 0, 0, 0)
+        self.coordination_fit_center_spin = QDoubleSpinBox()
+        self.coordination_fit_center_spin.setRange(0.0, 100000.0)
+        self.coordination_fit_center_spin.setDecimals(4)
+        self.coordination_fit_center_spin.setSingleStep(0.05)
+        self.coordination_fit_center_spin.setValue(2.5)
+        self.coordination_fit_sigma_spin = QDoubleSpinBox()
+        self.coordination_fit_sigma_spin.setRange(0.0001, 100000.0)
+        self.coordination_fit_sigma_spin.setDecimals(4)
+        self.coordination_fit_sigma_spin.setSingleStep(0.01)
+        self.coordination_fit_sigma_spin.setValue(0.2)
+        seed_layout.addWidget(QLabel("center"))
+        seed_layout.addWidget(self.coordination_fit_center_spin)
+        seed_layout.addWidget(QLabel("sigma"))
+        seed_layout.addWidget(self.coordination_fit_sigma_spin)
+        seed_layout.addStretch(1)
+        form.addRow("Initial peak", seed_widget)
+        layout.addLayout(form)
+
+        button_row = QHBoxLayout()
+        self.coordination_fit_button = QPushButton("Fit R(r) Peak")
+        self.coordination_fit_button.clicked.connect(
+            self._fit_coordination_number
+        )
+        button_row.addWidget(self.coordination_fit_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        self.coordination_fit_status_label = QLabel(
+            "Load or calculate a Debyer result before fitting R(r)."
+        )
+        self.coordination_fit_status_label.setWordWrap(True)
+        self.coordination_fit_status_label.setFrameShape(
+            QFrame.Shape.StyledPanel
+        )
+        layout.addWidget(self.coordination_fit_status_label)
+
+        self.coordination_fit_results_table = QTableWidget(0, 9)
+        self.coordination_fit_results_table.setHorizontalHeaderLabels(
+            [
+                "Trace",
+                "r min",
+                "r max",
+                "Center",
+                "Sigma",
+                "CN",
+                "Amplitude",
+                "R^2",
+                "RMSE",
+            ]
+        )
+        self.coordination_fit_results_table.verticalHeader().setVisible(False)
+        self.coordination_fit_results_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        for column in range(1, 9):
+            self.coordination_fit_results_table.horizontalHeader().setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+        layout.addWidget(self.coordination_fit_results_table, stretch=1)
         return tab
 
     def _build_plot_settings_tab(self) -> QWidget:
@@ -612,11 +837,51 @@ class DebyerPDFMainWindow(QMainWindow):
         layout.addRow("Frames folder", frames_row)
 
         self.frames_summary_label = QLabel(
-            "Select a trajectory frame folder containing only .xyz or only .pdb files."
+            "Select a trajectory frame folder containing .xyz files."
         )
         self.frames_summary_label.setWordWrap(True)
         self.frames_summary_label.setFrameShape(QFrame.Shape.StyledPanel)
         layout.addRow("", self.frames_summary_label)
+        return group
+
+    def _build_experimental_group(self) -> QGroupBox:
+        group = QGroupBox("Experimental g(r)")
+        layout = QFormLayout(group)
+
+        file_row = QWidget()
+        file_layout = QHBoxLayout(file_row)
+        file_layout.setContentsMargins(0, 0, 0, 0)
+        self.experimental_file_edit = QLineEdit()
+        self.experimental_file_edit.editingFinished.connect(
+            self._load_experimental_path_from_edit
+        )
+        file_layout.addWidget(self.experimental_file_edit, stretch=1)
+        browse_button = QPushButton("Browse...")
+        browse_button.clicked.connect(self._choose_experimental_file)
+        file_layout.addWidget(browse_button)
+        layout.addRow("Data file", file_row)
+
+        button_row = QHBoxLayout()
+        self.experimental_columns_button = QPushButton("Columns...")
+        self.experimental_columns_button.clicked.connect(
+            self._configure_experimental_columns
+        )
+        button_row.addWidget(self.experimental_columns_button)
+        self.clear_experimental_button = QPushButton("Clear")
+        self.clear_experimental_button.clicked.connect(
+            self._clear_experimental_file
+        )
+        button_row.addWidget(self.clear_experimental_button)
+        button_row.addStretch(1)
+        layout.addRow("", button_row)
+
+        self.experimental_status_label = QLabel(
+            "Optional: load an experimental file with r(A) and g(r) columns."
+        )
+        self.experimental_status_label.setWordWrap(True)
+        self.experimental_status_label.setFrameShape(QFrame.Shape.StyledPanel)
+        layout.addRow("", self.experimental_status_label)
+        self._refresh_experimental_controls()
         return group
 
     def _build_saved_calculations_group(self) -> QGroupBox:
@@ -694,11 +959,30 @@ class DebyerPDFMainWindow(QMainWindow):
         )
         layout.addRow("Solute elements", self.solute_elements_edit)
 
+        self.apply_solute_groups_button = QPushButton("Apply Solute Groups")
+        self.apply_solute_groups_button.clicked.connect(
+            self._apply_solute_groups_from_ui
+        )
+        self.apply_solute_groups_button.setToolTip(
+            "Update the loaded Debyer result with these solute elements and "
+            "rebuild grouped partial traces without rerunning Debyer."
+        )
+        layout.addRow("", self.apply_solute_groups_button)
+
         self.store_frame_outputs_checkbox = QCheckBox(
             "Store per-frame Debyer output files"
         )
         self.store_frame_outputs_checkbox.setChecked(False)
         layout.addRow("", self.store_frame_outputs_checkbox)
+
+        self.parallel_jobs_spin = QSpinBox()
+        self.parallel_jobs_spin.setRange(1, 64)
+        self.parallel_jobs_spin.setValue(default_parallel_debyer_jobs())
+        self.parallel_jobs_spin.setToolTip(
+            "Run multiple independent Debyer frame calculations at the same "
+            "time. Use 1 for the old serial behavior."
+        )
+        layout.addRow("Parallel Debyer jobs", self.parallel_jobs_spin)
 
         self.update_plot_during_run_checkbox = QCheckBox(
             "Update plot while averaging"
@@ -706,7 +990,11 @@ class DebyerPDFMainWindow(QMainWindow):
         self.update_plot_during_run_checkbox.setChecked(True)
         self.update_plot_during_run_checkbox.setToolTip(
             "If enabled, the average PDF plot refreshes during the Debyer "
-            "run as more frame outputs are included."
+            "run as more frame outputs are included. You can toggle this "
+            "while averaging; turning it back on requests the next average."
+        )
+        self.update_plot_during_run_checkbox.toggled.connect(
+            self._on_update_plot_during_run_toggled
         )
         layout.addRow("", self.update_plot_during_run_checkbox)
 
@@ -753,11 +1041,17 @@ class DebyerPDFMainWindow(QMainWindow):
 
     def _build_plot_controls(self) -> QWidget:
         widget = QWidget()
-        layout = QHBoxLayout(widget)
+        widget.setObjectName("pdfPlotControls")
+        layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(4)
 
-        layout.addWidget(QLabel("Plot"))
+        selector_row = QHBoxLayout()
+        selector_row.setContentsMargins(0, 0, 0, 0)
+        selector_row.setSpacing(8)
+        layout.addLayout(selector_row)
+
+        selector_row.addWidget(QLabel("Plot"))
         self.representation_combo = QComboBox()
         for label in SUPPORTED_PLOT_REPRESENTATIONS:
             self.representation_combo.addItem(label)
@@ -765,9 +1059,9 @@ class DebyerPDFMainWindow(QMainWindow):
         self.representation_combo.currentIndexChanged.connect(
             self._rebuild_traces_and_plot
         )
-        layout.addWidget(self.representation_combo)
+        selector_row.addWidget(self.representation_combo)
 
-        layout.addWidget(QLabel("Partial colors"))
+        selector_row.addWidget(QLabel("Partial colors"))
         self.color_scheme_combo = QComboBox()
         for scheme in DEFAULT_COLOR_SCHEMES:
             self.color_scheme_combo.addItem(scheme)
@@ -775,26 +1069,43 @@ class DebyerPDFMainWindow(QMainWindow):
         self.color_scheme_combo.currentIndexChanged.connect(
             self._apply_color_scheme
         )
-        layout.addWidget(self.color_scheme_combo)
+        selector_row.addWidget(self.color_scheme_combo)
+
+        self.legend_checkbox = QCheckBox("Legend")
+        self.legend_checkbox.setChecked(True)
+        self.legend_checkbox.toggled.connect(self._refresh_plot)
+        selector_row.addWidget(self.legend_checkbox)
+
+        self.fit_box_checkbox = QCheckBox("Fit Coefficient")
+        self.fit_box_checkbox.setChecked(True)
+        self.fit_box_checkbox.toggled.connect(self._refresh_plot)
+        selector_row.addWidget(self.fit_box_checkbox)
+        selector_row.addStretch(1)
+
+        trace_row = QHBoxLayout()
+        trace_row.setContentsMargins(0, 0, 0, 0)
+        trace_row.setSpacing(8)
+        layout.addLayout(trace_row)
 
         self.average_toggle_button = QPushButton("Hide Average")
         self.average_toggle_button.clicked.connect(self._toggle_average_trace)
-        layout.addWidget(self.average_toggle_button)
+        trace_row.addWidget(self.average_toggle_button)
 
         self.partials_toggle_button = QPushButton("Show Partial PDFs")
         self.partials_toggle_button.clicked.connect(
             self._toggle_partial_traces
         )
-        layout.addWidget(self.partials_toggle_button)
+        trace_row.addWidget(self.partials_toggle_button)
 
         self.groups_toggle_button = QPushButton("Show Grouped Partials")
         self.groups_toggle_button.clicked.connect(self._toggle_group_traces)
-        layout.addWidget(self.groups_toggle_button)
+        trace_row.addWidget(self.groups_toggle_button)
 
-        self.legend_checkbox = QCheckBox("Legend")
-        self.legend_checkbox.setChecked(True)
-        self.legend_checkbox.toggled.connect(self._refresh_plot)
-        layout.addWidget(self.legend_checkbox)
+        self.experimental_toggle_button = QPushButton("Hide Experimental")
+        self.experimental_toggle_button.clicked.connect(
+            self._toggle_experimental_trace
+        )
+        trace_row.addWidget(self.experimental_toggle_button)
 
         self.export_active_traces_button = QPushButton(
             "Export Active Traces..."
@@ -802,8 +1113,8 @@ class DebyerPDFMainWindow(QMainWindow):
         self.export_active_traces_button.clicked.connect(
             self._export_active_traces
         )
-        layout.addWidget(self.export_active_traces_button)
-        layout.addStretch(1)
+        trace_row.addWidget(self.export_active_traces_button)
+        trace_row.addStretch(1)
         return widget
 
     def set_project_dir(self, project_dir: str | Path | None) -> None:
@@ -848,11 +1159,198 @@ class DebyerPDFMainWindow(QMainWindow):
         self.frames_dir_edit.setText(selected)
         self._inspect_frames_dir()
 
+    def _choose_experimental_file(self) -> None:
+        start_dir = (
+            self.experimental_file_edit.text().strip()
+            or self.project_dir_edit.text().strip()
+            or str(Path.home())
+        )
+        selected_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select experimental PDF g(r) data file",
+            start_dir,
+            "Data files (*.txt *.dat *.iq);;All files (*)",
+        )
+        if not selected_path:
+            return
+        self._load_experimental_file(Path(selected_path).expanduser())
+
+    def _load_experimental_path_from_edit(self) -> None:
+        text = self.experimental_file_edit.text().strip()
+        if not text:
+            if self._experimental_summary is not None:
+                self._clear_experimental_file()
+            return
+        path = Path(text).expanduser()
+        if (
+            self._experimental_summary is not None
+            and path.resolve() == self._experimental_summary.path
+        ):
+            return
+        self._load_experimental_file(path)
+
+    def _load_experimental_file(self, file_path: Path) -> None:
+        resolved = file_path.expanduser().resolve()
+        if not resolved.is_file():
+            QMessageBox.warning(
+                self,
+                "Experimental g(r)",
+                "The selected experimental data file does not exist: "
+                f"{resolved}",
+            )
+            return
+        try:
+            summary = load_experimental_data_file(resolved, skiprows=0)
+        except Exception:
+            dialog = self._build_experimental_header_dialog(resolved)
+            if dialog.exec() != int(QDialog.DialogCode.Accepted):
+                return
+            summary = dialog.accepted_summary
+            if summary is None:
+                return
+        self._apply_experimental_file(summary)
+
+    def _build_experimental_header_dialog(
+        self,
+        file_path: Path,
+    ) -> ExperimentalDataHeaderDialog:
+        initial_summary = (
+            self._experimental_summary
+            if self._experimental_summary is not None
+            and self._experimental_summary.path == file_path
+            else None
+        )
+        return ExperimentalDataHeaderDialog(
+            file_path,
+            self,
+            title="Check Experimental g(r) Data File",
+            independent_column_label="r(A) column",
+            dependent_column_label="g(r) column",
+            error_column_label="Error column (optional)",
+            intro_text=(
+                "Adjust the number of header rows to skip, confirm which "
+                "columns correspond to r(A) and g(r), and then load the file."
+            ),
+            initial_header_rows=(
+                initial_summary.header_rows
+                if initial_summary is not None
+                else None
+            ),
+            initial_q_column=(
+                initial_summary.q_column
+                if initial_summary is not None
+                else None
+            ),
+            initial_intensity_column=(
+                initial_summary.intensity_column
+                if initial_summary is not None
+                else None
+            ),
+            initial_error_column=(
+                initial_summary.error_column
+                if initial_summary is not None
+                else None
+            ),
+        )
+
+    def _configure_experimental_columns(self) -> None:
+        if self._experimental_summary is None:
+            text = self.experimental_file_edit.text().strip()
+            if not text:
+                self.experimental_status_label.setText(
+                    "Select an experimental g(r) file before configuring "
+                    "columns."
+                )
+                return
+            file_path = Path(text).expanduser().resolve()
+        else:
+            file_path = self._experimental_summary.path
+        dialog = self._build_experimental_header_dialog(file_path)
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        summary = dialog.accepted_summary
+        if summary is None:
+            return
+        self._apply_experimental_file(summary)
+
+    def _apply_experimental_file(
+        self,
+        summary: ExperimentalDataSummary,
+    ) -> None:
+        self._experimental_summary = summary
+        self.experimental_file_edit.setText(str(summary.path))
+        self._trace_visibility.setdefault("experimental", True)
+        self._trace_colors.setdefault("experimental", "#d62728")
+        self.experimental_status_label.setText(
+            self._experimental_summary_text(summary)
+        )
+        self._append_log(
+            "Loaded experimental g(r) data from " f"{summary.path}"
+        )
+        self._refresh_experimental_controls()
+        self._rebuild_traces_and_plot()
+
+    def _clear_experimental_file(self) -> None:
+        self._experimental_summary = None
+        self.experimental_file_edit.clear()
+        self._trace_visibility.pop("experimental", None)
+        self._trace_tag_visibility.pop("experimental", None)
+        self.experimental_status_label.setText(
+            "Optional: load an experimental file with r(A) and g(r) columns."
+        )
+        self._refresh_experimental_controls()
+        self._rebuild_traces_and_plot()
+
+    def _refresh_experimental_controls(self) -> None:
+        has_experimental = self._experimental_summary is not None
+        if hasattr(self, "experimental_columns_button"):
+            self.experimental_columns_button.setEnabled(has_experimental)
+        if hasattr(self, "clear_experimental_button"):
+            self.clear_experimental_button.setEnabled(has_experimental)
+        if hasattr(self, "experimental_toggle_button"):
+            self.experimental_toggle_button.setEnabled(has_experimental)
+        if hasattr(self, "fit_box_checkbox"):
+            self.fit_box_checkbox.setEnabled(has_experimental)
+
+    def _experimental_summary_text(
+        self,
+        summary: ExperimentalDataSummary,
+    ) -> str:
+        r_values = np.asarray(summary.q_values, dtype=float)
+        if r_values.size:
+            r_range = (
+                f"{float(np.nanmin(r_values)):.6g} to "
+                f"{float(np.nanmax(r_values)):.6g} A"
+            )
+        else:
+            r_range = "unknown"
+        return (
+            f"Loaded {summary.path.name}: {len(r_values)} points\n"
+            f"r range: {r_range}\n"
+            f"Columns: {self._experimental_column_text(summary)}"
+        )
+
+    @staticmethod
+    def _experimental_column_text(
+        summary: ExperimentalDataSummary,
+    ) -> str:
+        def _column_label(index: int | None, fallback: str) -> str:
+            if index is None:
+                return "None"
+            if 0 <= index < len(summary.column_names):
+                return summary.column_names[index]
+            return fallback
+
+        return (
+            f"r(A)={_column_label(summary.q_column, 'Column 1')}; "
+            f"g(r)={_column_label(summary.intensity_column, 'Column 2')}"
+        )
+
     def _inspect_frames_dir(self) -> None:
         text = self.frames_dir_edit.text().strip()
         if not text:
             self.frames_summary_label.setText(
-                "Select a trajectory frame folder containing only .xyz or only .pdb files."
+                "Select a trajectory frame folder containing .xyz files."
             )
             return
         try:
@@ -880,9 +1378,17 @@ class DebyerPDFMainWindow(QMainWindow):
                 self.box_b_edit.setText(f"{detected_box[1]:g}")
             if not self.box_c_edit.text().strip():
                 self.box_c_edit.setText(f"{detected_box[2]:g}")
+        inferred_solutes = infer_default_solute_elements(
+            inspection.element_counts
+        )
+        if inferred_solutes and not self.solute_elements_edit.text().strip():
+            self.solute_elements_edit.setText(", ".join(inferred_solutes))
         element_summary = ", ".join(
             f"{element}{count if count != 1 else ''}"
             for element, count in sorted(inspection.element_counts.items())
+        )
+        solute_summary = (
+            ", ".join(inferred_solutes) if inferred_solutes else "not inferred"
         )
         box_summary = "unknown"
         if inspection.detected_box_dimensions is not None:
@@ -907,6 +1413,7 @@ class DebyerPDFMainWindow(QMainWindow):
             f"Detected {inspection.frame_format.upper()} frames: "
             f"{len(inspection.frame_paths)} files\n"
             f"Elements in first frame: {element_summary or 'unknown'}\n"
+            f"Default solutes: {solute_summary}\n"
             f"Bounding box: {box_summary}"
         )
         self._update_rho0_label()
@@ -1011,6 +1518,12 @@ class DebyerPDFMainWindow(QMainWindow):
                 f"{calculation.to_value:g} A (step {calculation.step_value:g})"
             ),
             f"rho0: {calculation.rho0:.6g} atoms/A^3",
+            "Solute elements: "
+            + (
+                ", ".join(calculation.solute_elements)
+                if calculation.solute_elements
+                else "None"
+            ),
             f"Frames folder: {calculation.frames_dir}",
         ]
         if calculation.elapsed_seconds is not None:
@@ -1038,19 +1551,68 @@ class DebyerPDFMainWindow(QMainWindow):
             float(self.box_c_edit.text().strip()),
         )
 
+    def _coerce_r_range_maximum_for_box(
+        self,
+        r_max: float,
+        box_dimensions: tuple[float, float, float],
+    ) -> float:
+        box_values = np.asarray(box_dimensions, dtype=float)
+        if (
+            box_values.size != 3
+            or not np.all(np.isfinite(box_values))
+            or np.any(box_values <= 0.0)
+        ):
+            return r_max
+        allowed_r_max = float(np.min(box_values) * 0.5)
+        if r_max <= allowed_r_max:
+            return r_max
+        self.to_edit.setText(f"{allowed_r_max:g}")
+        self.statusBar().showMessage(
+            "Adjusted r-range maximum to half of the minimum box dimension.",
+            5000,
+        )
+        return allowed_r_max
+
     def _parse_solute_elements(self) -> tuple[str, ...]:
         raw = self.solute_elements_edit.text().strip()
         if not raw:
             return ()
         values = [token.strip() for token in raw.replace(";", ",").split(",")]
-        cleaned = sorted(
-            {
-                value[:1].upper() + value[1:].lower()
-                for value in values
-                if value
-            }
-        )
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if not value:
+                continue
+            element = value[:1].upper() + value[1:].lower()
+            if element in seen:
+                continue
+            cleaned.append(element)
+            seen.add(element)
         return tuple(cleaned)
+
+    def _apply_solute_groups_from_ui(self) -> None:
+        solute_elements = self._parse_solute_elements()
+        if self._current_calculation is None:
+            self.statusBar().showMessage(
+                "Solute elements will be used for the next Debyer run.",
+                4000,
+            )
+            return
+        self._current_calculation = replace(
+            self._current_calculation,
+            solute_elements=solute_elements,
+            target_peak_markers={},
+        )
+        rewrite_debyer_calculation_output(self._current_calculation)
+        self._persist_current_calculation()
+        self.calculation_info_label.setText(
+            self._calculation_summary_text(self._current_calculation)
+        )
+        self._rebuild_traces_and_plot()
+        self.statusBar().showMessage(
+            "Updated grouped partial traces from the solute elements.",
+            4000,
+        )
 
     def _suggest_project_dir(self) -> Path:
         frames_dir = self.frames_dir_edit.text().strip()
@@ -1069,6 +1631,12 @@ class DebyerPDFMainWindow(QMainWindow):
         if not frames_text:
             raise ValueError("Select a frames folder before running Debyer.")
 
+        box_dimensions = self._parse_box_dimensions()
+        to_value = self._coerce_r_range_maximum_for_box(
+            float(self.to_edit.text().strip()),
+            box_dimensions,
+        )
+
         return DebyerPDFSettings(
             project_dir=Path(project_text).expanduser().resolve(),
             frames_dir=Path(frames_text).expanduser().resolve(),
@@ -1076,14 +1644,15 @@ class DebyerPDFMainWindow(QMainWindow):
             or "debyer_pdf",
             mode=self.mode_combo.currentText(),
             from_value=float(self.from_edit.text().strip()),
-            to_value=float(self.to_edit.text().strip()),
+            to_value=to_value,
             step_value=float(self.step_edit.text().strip()),
-            box_dimensions=self._parse_box_dimensions(),
+            box_dimensions=box_dimensions,
             atom_count=int(float(self.atom_count_edit.text().strip())),
             store_frame_outputs=bool(
                 self.store_frame_outputs_checkbox.isChecked()
             ),
             solute_elements=self._parse_solute_elements(),
+            max_parallel_jobs=int(self.parallel_jobs_spin.value()),
         )
 
     def _current_peak_finder_settings_from_ui(
@@ -1492,6 +2061,49 @@ class DebyerPDFMainWindow(QMainWindow):
         ).strip("_")
         return text or "trace"
 
+    def _trace_x_values(self, trace: dict[str, object]) -> np.ndarray:
+        if "x_values" in trace:
+            return np.asarray(trace["x_values"], dtype=float)
+        if self._current_calculation is None:
+            return np.asarray([], dtype=float)
+        return np.asarray(self._current_calculation.r_values, dtype=float)
+
+    def _trace_values_on_export_grid(
+        self,
+        trace: dict[str, object],
+    ) -> np.ndarray:
+        if self._current_calculation is None:
+            return np.asarray([], dtype=float)
+        target_r = np.asarray(self._current_calculation.r_values, dtype=float)
+        source_r = self._trace_x_values(trace)
+        source_values = np.asarray(trace["values"], dtype=float)
+        if source_r.size == target_r.size and np.allclose(
+            source_r,
+            target_r,
+        ):
+            return source_values
+        valid = np.isfinite(source_r) & np.isfinite(source_values)
+        if valid.sum() < 2:
+            return np.full_like(target_r, np.nan, dtype=float)
+        source_r = source_r[valid]
+        source_values = source_values[valid]
+        order = np.argsort(source_r)
+        source_r = source_r[order]
+        source_values = source_values[order]
+        unique_r, unique_indices = np.unique(source_r, return_index=True)
+        source_r = unique_r
+        source_values = source_values[unique_indices]
+        if source_r.size < 2:
+            return np.full_like(target_r, np.nan, dtype=float)
+        interpolated = np.full_like(target_r, np.nan, dtype=float)
+        inside = (target_r >= source_r[0]) & (target_r <= source_r[-1])
+        interpolated[inside] = np.interp(
+            target_r[inside],
+            source_r,
+            source_values,
+        )
+        return interpolated
+
     def _active_trace_export_columns(
         self,
     ) -> tuple[list[str], list[np.ndarray]] | None:
@@ -1508,7 +2120,7 @@ class DebyerPDFMainWindow(QMainWindow):
             column_names.append(
                 self._sanitize_trace_column_name(str(trace["label"]))
             )
-            column_arrays.append(np.asarray(trace["values"], dtype=float))
+            column_arrays.append(self._trace_values_on_export_grid(trace))
         if len(column_names) <= 1:
             return None
         return column_names, column_arrays
@@ -1518,10 +2130,11 @@ class DebyerPDFMainWindow(QMainWindow):
             self.representation_combo.currentText()
         )
         if self._current_calculation is not None:
-            return (
-                self._current_calculation.calculation_dir
-                / f"{self._current_calculation.filename_prefix}_{representation}_active_traces.txt"
+            filename = (
+                f"{self._current_calculation.filename_prefix}_"
+                f"{representation}_active_traces.txt"
             )
+            return self._current_calculation.calculation_dir / filename
         project_text = self.project_dir_edit.text().strip()
         root = (
             Path(project_text).expanduser().resolve()
@@ -1640,9 +2253,13 @@ class DebyerPDFMainWindow(QMainWindow):
             "Estimated time remaining: collecting initial timing samples..."
         )
         self.console.clear()
+        self._latest_run_preview = None
 
         self._run_thread = QThread(self)
-        self._run_worker = DebyerPDFWorker(settings)
+        self._run_worker = DebyerPDFWorker(
+            settings,
+            preview_enabled=self.update_plot_during_run_checkbox.isChecked(),
+        )
         self._run_worker.moveToThread(self._run_thread)
         self._run_thread.started.connect(self._run_worker.run)
         self._run_worker.log.connect(self._append_log)
@@ -1656,6 +2273,18 @@ class DebyerPDFMainWindow(QMainWindow):
         self._run_thread.finished.connect(self._cleanup_run_thread)
         self._run_thread.finished.connect(self._run_thread.deleteLater)
         self._run_thread.start()
+
+    def _request_run_cancel(self, message: str) -> None:
+        self._close_requested_during_run = True
+        self.calculate_button.setEnabled(False)
+        self.progress_label.setText("Progress: stopping active Debyer jobs")
+        self.time_estimate_label.setText(
+            "Estimated time remaining: stopping active Debyer jobs..."
+        )
+        self.statusBar().showMessage(message, 5000)
+        self._append_log(message)
+        if self._run_worker is not None:
+            self._run_worker.request_cancel()
 
     def _append_log(self, message: str) -> None:
         self.console.append(message)
@@ -1674,10 +2303,36 @@ class DebyerPDFMainWindow(QMainWindow):
     def _on_status(self, message: str) -> None:
         self.statusBar().showMessage(message)
 
+    def _on_update_plot_during_run_toggled(self, checked: bool) -> None:
+        if self._run_worker is not None:
+            self._run_worker.set_preview_enabled(checked)
+        if checked and self._latest_run_preview is not None:
+            self._apply_loaded_calculation(self._latest_run_preview)
+            self.statusBar().showMessage(
+                "Plot updates resumed; showing the latest available average.",
+                3000,
+            )
+        elif (
+            checked
+            and self._run_thread is not None
+            and self._run_thread.isRunning()
+        ):
+            self.statusBar().showMessage(
+                "Plot updates resumed; the next completed frame will refresh "
+                "the average.",
+                3000,
+            )
+        elif self._run_thread is not None and self._run_thread.isRunning():
+            self.statusBar().showMessage(
+                "Plot updates paused; averaging will continue.",
+                3000,
+            )
+
     def _on_preview_update(self, result: object) -> None:
         calculation = result
         if not isinstance(calculation, DebyerPDFCalculation):
             return
+        self._latest_run_preview = calculation
         if not self.update_plot_during_run_checkbox.isChecked():
             return
         self._apply_loaded_calculation(calculation)
@@ -1692,10 +2347,25 @@ class DebyerPDFMainWindow(QMainWindow):
                 "The Debyer worker finished without returning a valid calculation.",
             )
             return
-        self._append_log("Debyer calculation completed successfully.")
-        self.time_estimate_label.setText("Estimated time remaining: 00:00")
+        if calculation.is_partial_average:
+            processed_frames = (
+                calculation.frame_count
+                if calculation.processed_frame_count is None
+                else int(calculation.processed_frame_count)
+            )
+            self._append_log(
+                "Debyer calculation stopped early; saved running average "
+                f"after {processed_frames}/{calculation.frame_count} frames."
+            )
+            self.time_estimate_label.setText(
+                "Estimated time remaining: stopped early"
+            )
+        else:
+            self._append_log("Debyer calculation completed successfully.")
+            self.time_estimate_label.setText("Estimated time remaining: 00:00")
         self._refresh_saved_calculations()
         self._apply_loaded_calculation(calculation)
+        self._latest_run_preview = None
 
     def _on_failed(self, message: str) -> None:
         self.calculate_button.setEnabled(True)
@@ -1703,6 +2373,9 @@ class DebyerPDFMainWindow(QMainWindow):
         self.time_estimate_label.setText(
             "Estimated time remaining: unavailable"
         )
+        self._latest_run_preview = None
+        if self._close_requested_during_run:
+            return
         QMessageBox.warning(self, "Debyer calculation failed", message)
 
     def _cleanup_run_thread(self) -> None:
@@ -1710,11 +2383,156 @@ class DebyerPDFMainWindow(QMainWindow):
             self._run_worker.deleteLater()
             self._run_worker = None
         self._run_thread = None
+        self._close_requested_during_run = False
+
+    def _coordination_fit_trace_candidates(self) -> list[dict[str, object]]:
+        if self._current_calculation is None:
+            return []
+        return [
+            trace
+            for trace in build_display_traces(
+                self._current_calculation,
+                representation="R(r)",
+                include_grouped_partials=True,
+            )
+            if str(trace.get("kind", "")) in {"average", "partial", "group"}
+        ]
+
+    def _refresh_coordination_fit_trace_combo(self) -> None:
+        if not hasattr(self, "coordination_fit_trace_combo"):
+            return
+        previous_key = self.coordination_fit_trace_combo.currentData()
+        traces = self._coordination_fit_trace_candidates()
+        self.coordination_fit_trace_combo.blockSignals(True)
+        self.coordination_fit_trace_combo.clear()
+        selected_index = 0
+        for index, trace in enumerate(traces):
+            key = str(trace["key"])
+            if previous_key == key:
+                selected_index = index
+            self.coordination_fit_trace_combo.addItem(
+                str(trace["label"]),
+                key,
+            )
+        if traces:
+            self.coordination_fit_trace_combo.setCurrentIndex(selected_index)
+            self.coordination_fit_button.setEnabled(True)
+        else:
+            self.coordination_fit_button.setEnabled(False)
+            self.coordination_fit_status_label.setText(
+                "Load or calculate a Debyer result before fitting R(r)."
+            )
+        self.coordination_fit_trace_combo.blockSignals(False)
+        if traces:
+            self._suggest_coordination_fit_window()
+
+    def _selected_coordination_fit_trace(
+        self,
+    ) -> dict[str, object] | None:
+        selected_key = self.coordination_fit_trace_combo.currentData()
+        if not selected_key:
+            return None
+        for trace in self._coordination_fit_trace_candidates():
+            if str(trace["key"]) == str(selected_key):
+                return trace
+        return None
+
+    def _suggest_coordination_fit_window(self, *_args) -> None:
+        trace = self._selected_coordination_fit_trace()
+        if trace is None:
+            return
+        r_values = self._trace_x_values(trace)
+        values = np.asarray(trace["values"], dtype=float)
+        valid = np.isfinite(r_values) & np.isfinite(values)
+        if valid.sum() < 5:
+            return
+        fit_r = r_values[valid]
+        fit_values = values[valid]
+        order = np.argsort(fit_r)
+        fit_r = fit_r[order]
+        fit_values = fit_values[order]
+        peak_index = int(np.nanargmax(fit_values))
+        peak_r = float(fit_r[peak_index])
+        span = max(float(fit_r[-1] - fit_r[0]), 1.0e-6)
+        half_width = max(0.35, span * 0.08)
+        r_min = max(float(fit_r[0]), peak_r - half_width)
+        r_max = min(float(fit_r[-1]), peak_r + half_width)
+        if r_max <= r_min:
+            r_min = float(fit_r[0])
+            r_max = float(fit_r[-1])
+        self.coordination_fit_r_min_spin.setValue(r_min)
+        self.coordination_fit_r_max_spin.setValue(r_max)
+        self.coordination_fit_center_spin.setValue(peak_r)
+        self.coordination_fit_sigma_spin.setValue(
+            max((r_max - r_min) / 6.0, 0.0001)
+        )
+
+    def _fit_coordination_number(self) -> None:
+        trace = self._selected_coordination_fit_trace()
+        if self._current_calculation is None or trace is None:
+            self.coordination_fit_status_label.setText(
+                "Load or calculate a Debyer result before fitting R(r)."
+            )
+            return
+        try:
+            result = fit_coordination_peak_from_r(
+                r_values=self._trace_x_values(trace),
+                r_distribution_values=np.asarray(trace["values"], dtype=float),
+                r_min=float(self.coordination_fit_r_min_spin.value()),
+                r_max=float(self.coordination_fit_r_max_spin.value()),
+                initial_center=float(
+                    self.coordination_fit_center_spin.value()
+                ),
+                initial_sigma=float(self.coordination_fit_sigma_spin.value()),
+            )
+        except Exception as exc:
+            self.coordination_fit_status_label.setText(str(exc))
+            return
+
+        trace_key = str(trace["key"])
+        trace_label = str(trace["label"])
+        self.representation_combo.setCurrentText("R(r)")
+        self._trace_visibility[trace_key] = True
+        self._refresh_trace_table()
+        self._refresh_plot()
+        self._append_coordination_fit_result(trace_label, result)
+        self.coordination_fit_status_label.setText(
+            f"{trace_label}: CN = {result.coordination_number:.4g}; "
+            f"center = {result.center:.4g} A; sigma = {result.sigma:.4g} A"
+        )
+
+    def _append_coordination_fit_result(
+        self,
+        trace_label: str,
+        result,
+    ) -> None:
+        row = self.coordination_fit_results_table.rowCount()
+        self.coordination_fit_results_table.insertRow(row)
+        values = [
+            trace_label,
+            f"{result.r_min:.5g}",
+            f"{result.r_max:.5g}",
+            f"{result.center:.5g}",
+            f"{result.sigma:.5g}",
+            f"{result.coordination_number:.6g}",
+            f"{result.amplitude:.6g}",
+            (
+                "nan"
+                if not np.isfinite(result.r_squared)
+                else f"{result.r_squared:.6g}"
+            ),
+            f"{result.rmse:.6g}",
+        ]
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
+            self.coordination_fit_results_table.setItem(row, column, item)
 
     def _rebuild_traces_and_plot(self) -> None:
         if self._current_calculation is None:
             self._current_traces = []
             self._refresh_trace_table()
+            self._refresh_coordination_fit_trace_combo()
             self._refresh_plot()
             return
         previous_visibility = dict(self._trace_visibility)
@@ -1725,12 +2543,39 @@ class DebyerPDFMainWindow(QMainWindow):
             representation=self.representation_combo.currentText(),
             include_grouped_partials=True,
         )
+        if self._experimental_summary is not None:
+            experimental_r = np.asarray(
+                self._experimental_summary.q_values,
+                dtype=float,
+            )
+            experimental_values = convert_distribution_values(
+                self._experimental_summary.intensities,
+                r_values=experimental_r,
+                rho0=self._current_calculation.rho0,
+                source_mode="PDF",
+                target_representation=self.representation_combo.currentText(),
+                is_component=False,
+            )
+            self._current_traces.append(
+                {
+                    "key": "experimental",
+                    "label": (
+                        "Experimental g(r) "
+                        f"({self._experimental_summary.path.name})"
+                    ),
+                    "kind": "experimental",
+                    "x_values": experimental_r,
+                    "values": experimental_values,
+                }
+            )
         for trace in self._current_traces:
             key = str(trace["key"])
             kind = str(trace["kind"])
             if key in previous_visibility:
                 self._trace_visibility[key] = bool(previous_visibility[key])
             elif kind == "average":
+                self._trace_visibility[key] = True
+            elif kind == "experimental":
                 self._trace_visibility[key] = True
             else:
                 self._trace_visibility[key] = False
@@ -1747,6 +2592,7 @@ class DebyerPDFMainWindow(QMainWindow):
             if key in previous_colors:
                 self._trace_colors[key] = str(previous_colors[key])
         self._apply_color_scheme(preserve_existing=True)
+        self._refresh_coordination_fit_trace_combo()
 
     def _apply_color_scheme(
         self, *_args, preserve_existing: bool = False
@@ -1760,17 +2606,21 @@ class DebyerPDFMainWindow(QMainWindow):
         colored_traces = [
             trace
             for trace in self._current_traces
-            if str(trace["kind"]) != "average"
+            if str(trace["kind"]) not in {"average", "experimental"}
         ]
         count = max(len(colored_traces), 1)
         for index, trace in enumerate(colored_traces):
             key = str(trace["key"])
             if preserve_existing and key in self._trace_colors:
                 continue
+            if key in _GROUP_TRACE_DEFAULT_COLORS:
+                self._trace_colors[key] = _GROUP_TRACE_DEFAULT_COLORS[key]
+                continue
             rgba = scheme(index / max(count - 1, 1))
             color = QColor.fromRgbF(rgba[0], rgba[1], rgba[2], rgba[3]).name()
             self._trace_colors[key] = color
         self._trace_colors["average"] = "#000000"
+        self._trace_colors.setdefault("experimental", "#d62728")
         self._refresh_trace_table()
         self._refresh_plot()
 
@@ -1795,6 +2645,14 @@ class DebyerPDFMainWindow(QMainWindow):
             str(trace["key"])
             for trace in self._current_traces
             if str(trace["kind"]) == "group"
+        ]
+        self._toggle_trace_keys(keys)
+
+    def _toggle_experimental_trace(self) -> None:
+        keys = [
+            str(trace["key"])
+            for trace in self._current_traces
+            if str(trace["kind"]) == "experimental"
         ]
         self._toggle_trace_keys(keys)
 
@@ -1832,12 +2690,14 @@ class DebyerPDFMainWindow(QMainWindow):
             key = str(trace["key"])
             if not self._trace_visibility.get(key, False):
                 continue
+            kind = str(trace["kind"])
             line = axis.plot(
-                self._current_calculation.r_values,
+                self._trace_x_values(trace),
                 np.asarray(trace["values"], dtype=float),
                 color=self._trace_colors.get(key, "#000000"),
-                linewidth=2.0 if str(trace["kind"]) == "average" else 1.4,
-                alpha=1.0 if str(trace["kind"]) == "average" else 0.9,
+                linewidth=2.0 if kind == "average" else 1.4,
+                alpha=1.0 if kind == "average" else 0.9,
+                linestyle="--" if kind == "experimental" else "-",
                 label=str(trace["label"]),
             )[0]
             plotted.append(line)
@@ -1861,6 +2721,7 @@ class DebyerPDFMainWindow(QMainWindow):
             labelsize=max(float(self.axis_label_size_spin.value()) - 1.0, 1.0)
         )
         self._draw_peak_tags(axis)
+        self._draw_fit_metrics_box(axis)
         if plotted and self.legend_checkbox.isChecked():
             axis.legend(loc="best", fontsize="small")
         elif not plotted:
@@ -1876,6 +2737,65 @@ class DebyerPDFMainWindow(QMainWindow):
         self.figure.tight_layout()
         self._update_toggle_button_labels()
         self.canvas.draw_idle()
+
+    def _experimental_fit_metrics_text(self) -> str | None:
+        if self._current_calculation is None:
+            return None
+        if self._experimental_summary is None:
+            return None
+        model_g = convert_distribution_values(
+            self._current_calculation.total_values,
+            r_values=self._current_calculation.r_values,
+            rho0=self._current_calculation.rho0,
+            source_mode=self._current_calculation.mode,
+            target_representation="g(r)",
+            is_component=False,
+        )
+        metrics = compute_experimental_fit_metrics(
+            model_r_values=self._current_calculation.r_values,
+            model_g_values=model_g,
+            experimental_r_values=self._experimental_summary.q_values,
+            experimental_g_values=self._experimental_summary.intensities,
+        )
+        if metrics is None:
+            return "Fit unavailable\nNo overlapping r range"
+        r_squared_text = (
+            "nan"
+            if not np.isfinite(metrics.r_squared)
+            else f"{metrics.r_squared:.4f}"
+        )
+        return (
+            "AIMD g(r) vs experimental\n"
+            f"R^2 = {r_squared_text}\n"
+            f"RMSE = {metrics.rmse:.4g}\n"
+            f"MAE = {metrics.mae:.4g}\n"
+            f"n = {metrics.point_count}"
+        )
+
+    def _draw_fit_metrics_box(self, axis) -> None:
+        if not hasattr(self, "fit_box_checkbox"):
+            return
+        if not self.fit_box_checkbox.isChecked():
+            return
+        metrics_text = self._experimental_fit_metrics_text()
+        if metrics_text is None:
+            return
+        axis.text(
+            0.02,
+            0.04,
+            metrics_text,
+            transform=axis.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize="small",
+            bbox={
+                "boxstyle": "round,pad=0.35",
+                "facecolor": "#ffffff",
+                "edgecolor": "#666666",
+                "alpha": 0.88,
+            },
+            zorder=10,
+        )
 
     def _draw_peak_tags(self, axis) -> None:
         if self._current_calculation is None:
@@ -2261,6 +3181,14 @@ class DebyerPDFMainWindow(QMainWindow):
         group_visible = any(
             self._trace_visibility.get(key, False) for key in group_keys
         )
+        experimental_keys = [
+            str(trace["key"])
+            for trace in self._current_traces
+            if str(trace["kind"]) == "experimental"
+        ]
+        experimental_visible = any(
+            self._trace_visibility.get(key, False) for key in experimental_keys
+        )
         self.average_toggle_button.setText(
             "Hide Average" if average_visible else "Show Average"
         )
@@ -2273,6 +3201,13 @@ class DebyerPDFMainWindow(QMainWindow):
             if group_visible
             else "Show Grouped Partials"
         )
+        if hasattr(self, "experimental_toggle_button"):
+            self.experimental_toggle_button.setEnabled(bool(experimental_keys))
+            self.experimental_toggle_button.setText(
+                "Hide Experimental"
+                if experimental_visible
+                else "Show Experimental"
+            )
 
     @staticmethod
     def _format_duration(seconds: float | None) -> str:

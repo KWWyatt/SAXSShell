@@ -39,6 +39,13 @@ repository conda environment file.
 ```bash
 git clone https://github.com/kewh5868/SAXSShell.git
 cd SAXSShell
+```
+
+### macOS, Linux, and WSL
+
+Create the Python 3.12 conda environment from the default environment file:
+
+```bash
 conda env create -f requirements/saxshell-py312.yml
 ```
 
@@ -53,6 +60,44 @@ Launch the main SAXSShell application from the repository root:
 
 ```bash
 PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
+```
+
+### Native Windows
+
+On native Windows, use the Windows-specific environment file:
+
+```cmd
+conda env create -f requirements\saxshell-py312-win.yml
+```
+
+If the `saxshell-py312` environment already exists, update it from the same
+file:
+
+```cmd
+conda env update -n saxshell-py312 -f requirements\saxshell-py312-win.yml --prune
+```
+
+From Anaconda Prompt, activate the environment, set `PYTHONPATH`, and launch
+the SAXS UI:
+
+```cmd
+conda activate saxshell-py312
+set PYTHONPATH=src
+python -m saxshell.saxs
+```
+
+You can also launch without activating the environment:
+
+```cmd
+set PYTHONPATH=src
+conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
+```
+
+From Windows PowerShell, set `PYTHONPATH` with PowerShell syntax:
+
+```powershell
+$env:PYTHONPATH = "src"
+conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
 ```
 
 ## First Project

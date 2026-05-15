@@ -62,6 +62,42 @@ plus a structure library for the observed smaller clusters.
    `SAXS` tabs.
 10. Save the dataset, CSV exports, or a detailed PowerPoint report if needed.
 
+## Project-Backed CLI Setup
+
+For background prediction runs, use **Tools > CLI Setup > Open Cluster Dynamics
+ML CLI Setup (Beta)**. The setup window writes
+`cluster_dynamics_ml_cli_run.json` in the active project folder and shows the
+terminal commands to run later:
+
+```bash
+clusterdynamicsml run /path/to/project
+saxshell clusterdynamicsml run /path/to/project
+```
+
+The command reads the project-local run file, runs the same prediction backend
+used by the UI, and saves the reloadable JSON dataset plus companion CSV files,
+predicted structures, SAXS profiles, histogram exports, and the inherited
+cluster-dynamics heatmap/lifetime exports under
+`exported_results/data/clusterdynamicsml` by default. It refreshes the
+project's registered frames, clusters, energy, and experimental-data references
+when a `saxs_project.json` file is present.
+
+You can launch the setup window directly:
+
+```bash
+clusterdynamicsml setup-ui /path/to/project
+```
+
+To process several prepared projects from one terminal session, use:
+
+```bash
+clusterdynamicsml batch-run /path/to/project_a /path/to/project_b --workers 2 --keep-going
+```
+
+Each project keeps its own run file and output dataset. The CLI path is
+separate from the interactive UI, so the existing tabs, cached-history browser,
+and plotting controls remain UI-only.
+
 ## Training data assembled by the workflow
 
 The workflow first runs the standard cluster-dynamics analysis and then joins

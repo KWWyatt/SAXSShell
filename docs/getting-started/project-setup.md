@@ -108,13 +108,20 @@ The **Component build mode** dropdown controls what happens when you click
 Representative structures are optional project-backed files that compatible
 Debye, Born, FFT, and RMCSetup workflows can use instead of average cluster
 folders. Use **Tools > Structure Analysis > Open Representative Structures** for
-the full interactive analysis UI, or use **Tools > (beta) > Open Representative
-CLI Setup (Beta)** to save `representative_structure_cli_run.json` and run the
-same backend from the source checkout:
+the full interactive analysis UI, or use **Tools > CLI Setup > Open
+Representative CLI Setup (Beta)** to save
+`representative_structure_cli_run.json` and run the same backend from the
+source checkout:
 
 ```bash
 PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.representativefinder run /path/to/project
 ```
+
+The same **Tools > CLI Setup** menu can prepare project-local run files for
+XYZ-to-PDB conversion, cluster extraction, cluster dynamics, and cluster
+dynamics ML. Those run files let you run long jobs from a terminal or batch
+several prepared project folders while keeping outputs linked back to their
+projects.
 
 ## Debye-Waller factors
 

@@ -193,6 +193,33 @@ settings outside the main computed-distribution flow.
 Use this section for smaller estimate windows such as volume-fraction, number
 density, attenuation, and fluorescence calculators.
 
+### CLI Setup
+
+Use this section when you want the GUI to prepare a project-local run file, but
+you want the heavier work to run later from a terminal.
+
+- `XYZ -> PDB CLI Setup` saves `xyz2pdb_cli_run.json` in the project folder so
+  `xyz2pdb run /path/to/project` can convert XYZ frames to PDB frames and
+  register the PDB output folder with the project.
+- `Cluster Extraction CLI Setup` saves `cluster_extraction_cli_run.json` in the
+  project folder so `clusters run /path/to/project` can export clusters and
+  register the clusters output folder with the project.
+- `Cluster Dynamics CLI Setup` saves `cluster_dynamics_cli_run.json` in the
+  project folder so `clusterdynamics run /path/to/project` can generate the
+  time-binned heatmap dataset, cluster lifetime table, and association /
+  dissociation rate exports from the terminal.
+- `Cluster Dynamics ML CLI Setup` saves `cluster_dynamics_ml_cli_run.json` in
+  the project folder so `clusterdynamicsml run /path/to/project` can run the
+  prediction workflow, write predicted structures and SAXS/profile exports,
+  and keep the outputs linked to the project folder.
+- `Representative CLI Setup` saves `representative_structure_cli_run.json` in
+  the project folder so `representativefinder run /path/to/project` can execute
+  the representative-selection backend without the plotting and viewer UI.
+
+Cluster Dynamics and Cluster Dynamics ML also provide `batch-run --workers N`
+subcommands for processing multiple prepared project folders from one terminal
+session.
+
 ### (beta)
 
 Use this section for early-access workflows that are exposed from the main
@@ -201,10 +228,6 @@ Use this section for early-access workflows that are exposed from the main
 - `Debye-Waller Analysis` estimates intra-molecular and inter-molecular
   Debye-Waller coefficients from sorted PDB cluster folders and saves them in
   the active project when requested from Project Setup or the Tools menu.
-- `Representative CLI Setup` saves
-  `representative_structure_cli_run.json` in the project folder so
-  the `representativefinder` source module can execute the same representative
-  selection without the plotting and viewer UI.
 
 !!! warning "Debye-Waller status"
 The linked **Compute Debye-Waller Factors (beta)** workflow is currently

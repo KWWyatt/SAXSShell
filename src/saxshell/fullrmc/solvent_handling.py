@@ -416,6 +416,7 @@ class RepresentativeSolventAnalysisEntry:
     source_file: str
     source_status: str
     analysis_result: "SolventShellAnalysisResult"
+    included_in_distribution_status: bool = True
 
     @property
     def representative_label(self) -> str:
@@ -441,6 +442,18 @@ class RepresentativeSolventDistributionAnalysis:
     entries: list[RepresentativeSolventAnalysisEntry]
 
     @property
+    def distribution_status_entry_count(self) -> int:
+        return sum(
+            1
+            for entry in self.entries
+            if entry.included_in_distribution_status
+        )
+
+    @property
+    def ignored_distribution_status_entry_count(self) -> int:
+        return len(self.entries) - self.distribution_status_entry_count
+
+    @property
     def build_required(self) -> bool:
         return self.distribution_status != "complete_solvent"
 
@@ -453,8 +466,16 @@ class RepresentativeSolventDistributionAnalysis:
                 "Detected representative distribution state: "
                 f"{_solvent_state_text(self.distribution_status)}"
             ),
-            f"Representative entries analyzed: {len(self.entries)}",
+            (
+                "Representative entries analyzed: "
+                f"{self.distribution_status_entry_count}"
+            ),
         ]
+        if self.ignored_distribution_status_entry_count:
+            lines.append(
+                "Single-atom representatives ignored for distribution state: "
+                f"{self.ignored_distribution_status_entry_count}"
+            )
         if self.distribution_note:
             lines.append(self.distribution_note)
         if self.aggregate_solute_element_counts:
@@ -470,9 +491,14 @@ class RepresentativeSolventDistributionAnalysis:
         if self.entries:
             lines.extend(["", "Detected representative states:"])
             for entry in self.entries:
+                suffix = (
+                    " (ignored for distribution state)"
+                    if not entry.included_in_distribution_status
+                    else ""
+                )
                 lines.append(
                     f"  {entry.representative_label}: "
-                    f"{entry.source_status_text}"
+                    f"{entry.source_status_text}{suffix}"
                 )
         return "\n".join(lines)
 
@@ -913,6 +939,12 @@ def analyze_representative_solvent_distribution(
             reference_match_tolerance_a=settings.reference_match_tolerance_a,
         )
         source_status = _classify_source_solvent_status(analysis_result)
+        included_in_distribution_status = (
+            not _representative_solvent_status_is_single_atom(
+                representative_entry,
+                analysis_result,
+            )
+        )
         entries.append(
             RepresentativeSolventAnalysisEntry(
                 structure=representative_entry.structure,
@@ -921,6 +953,9 @@ def analyze_representative_solvent_distribution(
                 source_file=representative_entry.source_file,
                 source_status=source_status,
                 analysis_result=analysis_result,
+                included_in_distribution_status=(
+                    included_in_distribution_status
+                ),
             )
         )
         aggregate_solute_counts.update(analysis_result.solute_element_counts)
@@ -1250,35 +1285,85 @@ def _classify_source_solvent_status(
 def _resolve_distribution_status(
     entries: list[RepresentativeSolventAnalysisEntry],
 ) -> tuple[str, str]:
+    ignored_count = sum(
+        1 for entry in entries if not entry.included_in_distribution_status
+    )
+    status_entries = [
+        entry for entry in entries if entry.included_in_distribution_status
+    ]
+    ignored_note = ""
+    if ignored_count:
+        ignored_note = (
+            f"Ignored {ignored_count} single-atom representative "
+            "structure(s) when determining the overall solvent state."
+        )
     statuses = {
         entry.source_status
-        for entry in entries
+        for entry in status_entries
         if str(entry.source_status).strip()
     }
     if not statuses:
         return (
-            "unknown",
-            "No representative solvent states were available.",
+            "no_solvent",
+            ignored_note or "No representative solvent states were available.",
         )
     if statuses == {"complete_solvent"}:
         return (
             "complete_solvent",
-            "Every representative structure already contains complete solvent molecules, so the existing solvent-decorated structures can be passed through.",
+            _join_distribution_notes(
+                "Every representative structure already contains complete "
+                "solvent molecules, so the existing solvent-decorated "
+                "structures can be passed through.",
+                ignored_note,
+            ),
         )
     if statuses == {"partial_solvent"}:
         return (
             "partial_solvent",
-            "Every representative structure contains partial solvent molecules, so the saved anchors will be used to rebuild complete solvent molecules.",
+            _join_distribution_notes(
+                "Every representative structure contains partial solvent "
+                "molecules, so the saved anchors will be used to rebuild "
+                "complete solvent molecules.",
+                ignored_note,
+            ),
         )
     if statuses == {"no_solvent"}:
         return (
             "no_solvent",
-            "No representative structure contains coordinated solvent molecules, so solvent shells will be built from the stripped solute structures.",
+            _join_distribution_notes(
+                "No representative structure contains coordinated solvent "
+                "molecules, so solvent shells will be built from the stripped "
+                "solute structures.",
+                ignored_note,
+            ),
         )
     return (
         "no_solvent",
-        "Representative solvent detections were inconsistent across the saved structures. Following the conservative workflow rule, the current cluster distribution is treated as having no coordinated solvent.",
+        _join_distribution_notes(
+            "Representative solvent detections were inconsistent across the "
+            "saved structures. Following the conservative workflow rule, the "
+            "current cluster distribution is treated as having no coordinated "
+            "solvent.",
+            ignored_note,
+        ),
     )
+
+
+def _representative_solvent_status_is_single_atom(
+    representative_entry: object,
+    analysis_result: "SolventShellAnalysisResult",
+) -> bool:
+    try:
+        atom_count = int(getattr(representative_entry, "atom_count"))
+    except Exception:
+        atom_count = 0
+    if atom_count > 0:
+        return atom_count <= 1
+    return int(analysis_result.total_atoms) <= 1
+
+
+def _join_distribution_notes(*notes: str) -> str:
+    return " ".join(str(note).strip() for note in notes if str(note).strip())
 
 
 def _solvent_state_text(status: str) -> str:

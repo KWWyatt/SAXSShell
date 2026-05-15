@@ -78,6 +78,40 @@ times, not the folder label.
 If the tool is launched from the main SAXS UI, it inherits the active project
 directory automatically.
 
+## Project-Backed CLI Setup
+
+For longer cluster-dynamics runs, use **Tools > CLI Setup > Open Cluster
+Dynamics CLI Setup (Beta)**. The setup window writes
+`cluster_dynamics_cli_run.json` in the active project folder and shows the
+terminal commands to run later:
+
+```bash
+clusterdynamics run /path/to/project
+saxshell clusterdynamics run /path/to/project
+```
+
+The command reads the project-local run file, runs the same backend used by the
+UI, and saves the reloadable JSON dataset plus the heatmap CSV, lifetime CSV,
+and optional energy CSV under `exported_results/data/clusterdynamics` by
+default. It also refreshes the project's registered frames and energy-file
+references when a `saxs_project.json` file is present.
+
+You can also launch the setup window directly:
+
+```bash
+clusterdynamics setup-ui /path/to/project
+```
+
+To process several prepared projects from one terminal session, use:
+
+```bash
+clusterdynamics batch-run /path/to/project_a /path/to/project_b --workers 2 --keep-going
+```
+
+Each project keeps its own run file and output dataset, so these runs can also
+be started in separate terminals or background jobs without touching the
+interactive plotting workflow.
+
 ## Saved Outputs
 
 The save action writes a JSON dataset plus companion CSV files beside it:

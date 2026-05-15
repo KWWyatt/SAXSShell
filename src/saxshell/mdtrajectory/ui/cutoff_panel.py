@@ -227,7 +227,7 @@ class CutoffPanel(QGroupBox):
 
         self.window_spin = QSpinBox()
         self.window_spin.setRange(1, 10**6)
-        self.window_spin.setValue(3)
+        self.window_spin.setValue(2)
         self.window_spin.setToolTip(
             "Number of consecutive energy samples that must satisfy the "
             "steady-state criteria."

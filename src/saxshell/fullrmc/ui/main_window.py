@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -67,6 +68,7 @@ from saxshell.fullrmc.packmol_docker import (
 from saxshell.fullrmc.packmol_planning import (
     PackmolPlanningMetadata,
     PackmolPlanningSettings,
+    PackmolSupplementalComponentSettings,
     build_packmol_plan,
 )
 from saxshell.fullrmc.packmol_setup import (
@@ -82,8 +84,11 @@ from saxshell.fullrmc.project_loader import (
 from saxshell.fullrmc.representatives import (
     RepresentativeSelectionMetadata,
     RepresentativeSelectionSettings,
+    build_distribution_selection,
     build_representative_preview_clusters,
     representative_source_solvent_mode_to_variant,
+    save_distribution_selection_metadata,
+    save_representative_selection_metadata,
     select_distribution_representatives,
     select_first_file_representatives,
 )
@@ -160,6 +165,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.periodic_table import PeriodicTableElementDialog
 
 _OPEN_WINDOWS: list["RMCSetupMainWindow"] = []
 
@@ -667,6 +673,14 @@ class RMCSetupMainWindow(QMainWindow):
 
         self.output_group = QGroupBox("RMCSetup Output Structure")
         output_layout = QVBoxLayout(self.output_group)
+        output_button_row = QHBoxLayout()
+        self.reset_rmcsetup_state_button = QPushButton("Reset RMCSetup State")
+        self.reset_rmcsetup_state_button.clicked.connect(
+            self._reset_complete_rmcsetup_state
+        )
+        output_button_row.addWidget(self.reset_rmcsetup_state_button)
+        output_button_row.addStretch(1)
+        output_layout.addLayout(output_button_row)
         self.output_summary_box = QPlainTextEdit()
         self.output_summary_box.setReadOnly(True)
         self.output_summary_box.setMinimumHeight(160)
@@ -1339,6 +1353,15 @@ class RMCSetupMainWindow(QMainWindow):
         representative_button_row.addWidget(
             self.preview_representatives_button
         )
+        self.reset_representative_state_button = QPushButton(
+            "Reset Representative Analysis"
+        )
+        self.reset_representative_state_button.clicked.connect(
+            self._reset_representative_analysis_state
+        )
+        representative_button_row.addWidget(
+            self.reset_representative_state_button
+        )
         representative_button_row.addStretch(1)
         representative_content_layout.addLayout(representative_button_row)
 
@@ -1580,7 +1603,7 @@ class RMCSetupMainWindow(QMainWindow):
         generated_pdb_button_row.addStretch(1)
         generated_pdb_layout.addLayout(generated_pdb_button_row)
 
-        self.generated_pdb_table = QTableWidget(0, 6)
+        self.generated_pdb_table = QTableWidget(0, 8)
         self.generated_pdb_table.setHorizontalHeaderLabels(
             [
                 "Representative",
@@ -1589,6 +1612,8 @@ class RMCSetupMainWindow(QMainWindow):
                 "Structure File",
                 "Atoms",
                 "Source",
+                "DREAM Weight",
+                "DREAM Value",
             ]
         )
         self.generated_pdb_table.setSelectionBehavior(
@@ -1687,6 +1712,55 @@ class RMCSetupMainWindow(QMainWindow):
             self.packmol_free_solvent_combo,
         )
         packmol_content_layout.addLayout(packmol_form)
+
+        self.packmol_supplemental_table = QTableWidget(0, 4)
+        self.packmol_supplemental_table.setHorizontalHeaderLabels(
+            ["Role", "Source", "Reference/Element", "Residue"]
+        )
+        self.packmol_supplemental_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.packmol_supplemental_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.packmol_supplemental_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.packmol_supplemental_table.horizontalHeader().setStretchLastSection(
+            True
+        )
+        packmol_content_layout.addWidget(self.packmol_supplemental_table)
+
+        supplemental_button_row = QHBoxLayout()
+        self.add_packmol_supplemental_reference_button = QPushButton(
+            "Add Reference Component"
+        )
+        self.add_packmol_supplemental_reference_button.clicked.connect(
+            self._add_packmol_supplemental_reference_component
+        )
+        supplemental_button_row.addWidget(
+            self.add_packmol_supplemental_reference_button
+        )
+        self.add_packmol_supplemental_atom_button = QPushButton(
+            "Add Single Atom"
+        )
+        self.add_packmol_supplemental_atom_button.clicked.connect(
+            self._add_packmol_supplemental_atom_component
+        )
+        supplemental_button_row.addWidget(
+            self.add_packmol_supplemental_atom_button
+        )
+        self.remove_packmol_supplemental_button = QPushButton(
+            "Remove Selected"
+        )
+        self.remove_packmol_supplemental_button.clicked.connect(
+            self._remove_selected_packmol_supplemental_component
+        )
+        supplemental_button_row.addWidget(
+            self.remove_packmol_supplemental_button
+        )
+        supplemental_button_row.addStretch(1)
+        packmol_content_layout.addLayout(supplemental_button_row)
 
         packmol_button_row = QHBoxLayout()
         self.compute_packmol_plan_button = QPushButton(
@@ -1884,6 +1958,148 @@ class RMCSetupMainWindow(QMainWindow):
             return
         self._append_run_log("Reloading saved representative structures.")
         self._refresh_project_source()
+
+    def _reset_representative_analysis_state(self) -> None:
+        self._reset_representative_dependent_state(
+            confirm=True,
+            refresh=True,
+            clear_reason="Representative analysis reset requested.",
+        )
+
+    def _reset_representative_dependent_state(
+        self,
+        *,
+        confirm: bool,
+        refresh: bool,
+        clear_reason: str,
+    ) -> bool:
+        state = self._project_source_state
+        if state is None:
+            if confirm:
+                QMessageBox.information(
+                    self,
+                    "No SAXS project loaded",
+                    "Load a SAXS project before resetting representative "
+                    "analysis.",
+                )
+            return False
+        if confirm:
+            response = QMessageBox.question(
+                self,
+                "Reset representative analysis?",
+                (
+                    "Clear solvent-state analysis, generated PDB outputs "
+                    "tracked by that analysis, Packmol planning, Packmol "
+                    "setup, and generated constraints for this project? "
+                    "Saved representative selections will be kept."
+                ),
+            )
+            if response != QMessageBox.StandardButton.Yes:
+                return False
+
+        self._delete_tracked_solvent_output_files(state)
+        for path in (
+            state.rmcsetup_paths.solvent_handling_path,
+            state.rmcsetup_paths.packmol_plan_path,
+            state.rmcsetup_paths.packmol_setup_path,
+            state.rmcsetup_paths.constraint_generation_path,
+        ):
+            self._write_empty_json_file(path)
+        self._clear_directory_contents(state.rmcsetup_paths.packmol_inputs_dir)
+        self._clear_directory_contents(state.rmcsetup_paths.constraints_dir)
+        self._clear_directory_contents(state.rmcsetup_paths.reports_dir)
+        state.solvent_handling = None
+        state.packmol_planning = None
+        state.packmol_setup = None
+        state.constraint_generation = None
+        self._solvent_distribution_analysis = None
+        self._append_run_log(
+            "Cleared representative-dependent rmcsetup state. " + clear_reason
+        )
+        if refresh:
+            self._refresh_project_source()
+        return True
+
+    def _reset_complete_rmcsetup_state(self) -> None:
+        state = self._project_source_state
+        if state is None:
+            QMessageBox.information(
+                self,
+                "No SAXS project loaded",
+                "Load a SAXS project before resetting rmcsetup state.",
+            )
+            return
+        response = QMessageBox.question(
+            self,
+            "Reset all rmcsetup state?",
+            (
+                "Clear the entire rmcsetup folder for this project, including "
+                "saved representative structures, solution properties, "
+                "solvent handling, Packmol inputs, reports, and generated "
+                "constraints?"
+            ),
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        self._clear_directory_contents(state.rmcsetup_paths.rmcsetup_dir)
+        self._append_run_log("Cleared the complete rmcsetup state.")
+        self._refresh_project_source()
+
+    def _delete_tracked_solvent_output_files(
+        self,
+        state: RMCDreamProjectSource,
+    ) -> None:
+        solvent_metadata = state.solvent_handling
+        if solvent_metadata is None:
+            return
+        representative_sources = {
+            Path(entry.source_file).expanduser().resolve()
+            for entry in (
+                state.representative_selection.representative_entries
+                if state.representative_selection is not None
+                else []
+            )
+            if str(entry.source_file).strip()
+        }
+        for entry in solvent_metadata.entries:
+            for raw_path in (entry.no_solvent_pdb, entry.completed_pdb):
+                path = Path(raw_path).expanduser().resolve()
+                if path in representative_sources:
+                    continue
+                if path.is_file() or path.is_symlink():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        continue
+                    self._remove_empty_parents(
+                        path.parent,
+                        stop_at=state.rmcsetup_paths.rmcsetup_dir,
+                    )
+
+    @staticmethod
+    def _write_empty_json_file(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+
+    @staticmethod
+    def _clear_directory_contents(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        for child in list(path.iterdir()):
+            if child.is_symlink() or child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                shutil.rmtree(child)
+
+    @staticmethod
+    def _remove_empty_parents(path: Path, *, stop_at: Path) -> None:
+        stop = stop_at.resolve()
+        current = path.resolve()
+        while current != stop and stop in current.parents:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
 
     def _handle_representative_structure_results_changed(
         self,
@@ -2090,8 +2306,24 @@ class RMCSetupMainWindow(QMainWindow):
                 )
             except Exception as exc:
                 self._append_run_log(f"Unable to load project source: {exc}")
+        self.reset_rmcsetup_state_button.setEnabled(
+            self._project_source_state is not None
+        )
         self._populate_dream_controls()
         self._populate_favorite_controls()
+        self._initialize_selection_from_state()
+        representative_weights_changed = (
+            self._sync_representatives_with_current_dream_weights()
+        )
+        if representative_weights_changed:
+            self._reset_representative_dependent_state(
+                confirm=False,
+                refresh=False,
+                clear_reason=(
+                    "DREAM weight mapping changed for saved representatives."
+                ),
+            )
+        self._clear_stale_representative_dependent_state()
         self._populate_solution_properties_controls()
         self._populate_representative_controls()
         self._populate_solvent_controls()
@@ -2100,10 +2332,200 @@ class RMCSetupMainWindow(QMainWindow):
         self.project_summary_box.setPlainText(self._project_summary_text())
         self.output_summary_box.setPlainText(self._output_structure_text())
         self.favorite_summary_box.setPlainText(self._favorite_summary_text())
-        self._initialize_selection_from_state()
         self._refresh_dream_source_summary()
         self._update_readiness_progress()
         self._set_task_progress("Project source loaded.", 100)
+
+    def _sync_representatives_with_current_dream_weights(self) -> bool:
+        state = self._project_source_state
+        if state is None or state.representative_selection is None:
+            return False
+        selection = self.current_selection()
+        if selection is None:
+            return False
+        metadata = state.representative_selection
+        try:
+            distribution = build_distribution_selection(
+                state,
+                selection,
+                selection_mode=metadata.selection_mode or "rmcsetup",
+            )
+        except Exception as exc:
+            self._append_run_log(
+                "Unable to map saved representative structures to the "
+                f"current DREAM weights: {exc}"
+            )
+            return False
+
+        lookup, duplicate_keys = self._dream_distribution_lookup(
+            distribution.entries
+        )
+        changed = self._selection_signature(
+            metadata.selection
+        ) != self._selection_signature(
+            selection
+        ) or self._distribution_signature(
+            metadata.distribution_selection
+        ) != self._distribution_signature(
+            distribution
+        )
+        unmatched_labels: list[str] = []
+        ambiguous_labels: list[str] = []
+        for entry in metadata.representative_entries:
+            key = (entry.structure, entry.motif)
+            if key in duplicate_keys:
+                ambiguous_labels.append(self._representative_label(entry))
+                continue
+            distribution_entry = lookup.get(key)
+            if distribution_entry is None:
+                unmatched_labels.append(self._representative_label(entry))
+                continue
+            if (
+                entry.param != distribution_entry.param
+                or abs(
+                    float(entry.selected_weight)
+                    - float(distribution_entry.selected_weight)
+                )
+                > 1e-12
+                or int(entry.cluster_count)
+                != int(distribution_entry.cluster_count)
+            ):
+                changed = True
+            entry.param = distribution_entry.param
+            entry.selected_weight = float(distribution_entry.selected_weight)
+            entry.cluster_count = int(distribution_entry.cluster_count)
+
+        if unmatched_labels:
+            self._append_run_log(
+                "Saved representatives without a current DREAM weight: "
+                + ", ".join(unmatched_labels)
+            )
+        if ambiguous_labels:
+            self._append_run_log(
+                "Saved representatives with ambiguous DREAM weights: "
+                + ", ".join(ambiguous_labels)
+            )
+
+        if not changed:
+            return False
+
+        metadata.selection = selection
+        metadata.distribution_selection = distribution
+        metadata.updated_at = datetime.now().isoformat(timespec="seconds")
+        save_distribution_selection_metadata(
+            state.rmcsetup_paths.distribution_selection_path,
+            distribution,
+        )
+        save_representative_selection_metadata(
+            state.rmcsetup_paths.representative_selection_path,
+            metadata,
+        )
+        state.representative_selection = metadata
+        self._append_run_log(
+            "Mapped saved representative structures to the current DREAM "
+            "weight parameters."
+        )
+        return True
+
+    @staticmethod
+    def _dream_distribution_lookup(
+        entries: list[object],
+    ) -> tuple[dict[tuple[str, str], object], set[tuple[str, str]]]:
+        lookup: dict[tuple[str, str], object] = {}
+        duplicate_keys: set[tuple[str, str]] = set()
+        for entry in entries:
+            key = (
+                str(getattr(entry, "structure", "")).strip(),
+                str(getattr(entry, "motif", "no_motif")).strip() or "no_motif",
+            )
+            if not key[0]:
+                continue
+            if key in lookup:
+                duplicate_keys.add(key)
+            lookup[key] = entry
+        return lookup, duplicate_keys
+
+    @staticmethod
+    def _selection_signature(
+        selection: DreamBestFitSelection,
+    ) -> tuple[object, ...]:
+        return (
+            selection.run_name,
+            selection.run_relative_path,
+            selection.bestfit_method,
+            selection.posterior_filter_mode,
+            float(selection.posterior_top_percent),
+            int(selection.posterior_top_n),
+            float(selection.credible_interval_low),
+            float(selection.credible_interval_high),
+            selection.template_name,
+            selection.model_name,
+        )
+
+    @staticmethod
+    def _distribution_signature(metadata: object) -> tuple[object, ...]:
+        entries = getattr(metadata, "entries", ())
+        return tuple(
+            (
+                str(getattr(entry, "param", "")).strip(),
+                str(getattr(entry, "structure", "")).strip(),
+                str(getattr(entry, "motif", "no_motif")).strip() or "no_motif",
+                round(float(getattr(entry, "selected_weight", 0.0)), 12),
+                int(getattr(entry, "cluster_count", 0)),
+                bool(getattr(entry, "is_active", False)),
+            )
+            for entry in entries
+        )
+
+    @staticmethod
+    def _representative_label(entry: object) -> str:
+        structure = str(getattr(entry, "structure", "")).strip()
+        motif = str(getattr(entry, "motif", "no_motif")).strip()
+        if not motif or motif == "no_motif":
+            return structure
+        return f"{structure}/{motif}"
+
+    def _clear_stale_representative_dependent_state(self) -> None:
+        state = self._project_source_state
+        metadata = (
+            state.representative_selection if state is not None else None
+        )
+        if metadata is None:
+            return
+        metadata_updated_at = str(metadata.updated_at or "").strip()
+        downstream_metadata = (
+            state.solvent_handling,
+            state.packmol_planning,
+            state.packmol_setup,
+            state.constraint_generation,
+        )
+        if any(
+            self._timestamp_is_newer(
+                metadata_updated_at,
+                str(getattr(item, "updated_at", "") or "").strip(),
+            )
+            for item in downstream_metadata
+            if item is not None
+        ):
+            self._reset_representative_dependent_state(
+                confirm=False,
+                refresh=False,
+                clear_reason=(
+                    "Saved representative metadata is newer than downstream "
+                    "rmcsetup outputs."
+                ),
+            )
+
+    @staticmethod
+    def _timestamp_is_newer(candidate: str, reference: str) -> bool:
+        if not candidate or not reference:
+            return False
+        try:
+            return datetime.fromisoformat(candidate) > datetime.fromisoformat(
+                reference
+            )
+        except ValueError:
+            return candidate > reference
 
     def _populate_dream_controls(self) -> None:
         self._updating_dream_controls = True
@@ -2248,6 +2670,7 @@ class RMCSetupMainWindow(QMainWindow):
             ("Constraint metadata: " f"{paths.constraint_generation_path}"),
             ("Packmol plan report: " f"{paths.packmol_plan_report_path}"),
             ("Packmol audit report: " f"{paths.packmol_audit_report_path}"),
+            ("Packmol build report: " f"{paths.packmol_build_report_path}"),
             ("Cluster counts report: " f"{paths.cluster_counts_csv_path}"),
             ("Packmol input file: " f"{paths.packmol_input_path}"),
             ("Merged constraints file: " f"{paths.merged_constraints_path}"),
@@ -2566,6 +2989,11 @@ class RMCSetupMainWindow(QMainWindow):
             "Reload the selected project folder and rescan its saved data.",
         )
         self._set_widget_tooltip(
+            self.reset_rmcsetup_state_button,
+            "Clear the generated rmcsetup metadata and outputs for this "
+            "project after confirmation.",
+        )
+        self._set_widget_tooltip(
             self.dream_run_combo,
             "Choose the DREAM run whose model fit and weights should drive "
             "the downstream RMC setup workflow.",
@@ -2777,6 +3205,13 @@ class RMCSetupMainWindow(QMainWindow):
             "Reload the saved representative structures from this project.",
         )
         self._set_widget_tooltip(
+            self.reset_representative_state_button,
+            "Clear solvent-state analysis, generated representative PDBs "
+            "tracked by that analysis, Packmol planning, Packmol setup, "
+            "and generated constraints while keeping the saved representative "
+            "selection.",
+        )
+        self._set_widget_tooltip(
             self.solvent_reference_source_combo,
             "Choose whether the solvent reference structure comes from a "
             "bundled preset or a custom PDB file.",
@@ -2856,6 +3291,21 @@ class RMCSetupMainWindow(QMainWindow):
             self.packmol_free_solvent_combo,
             "Choose the solvent structure file used for the free bulk "
             "solvent population in the Packmol box.",
+        )
+        self._set_widget_tooltip(
+            self.packmol_supplemental_table,
+            "List extra solute or solvent components that are not part of "
+            "the weighted representative cluster files.",
+        )
+        self._set_widget_tooltip(
+            self.add_packmol_supplemental_reference_button,
+            "Add a reference molecule, such as an organic cation, for "
+            "Packmol stoichiometry completion.",
+        )
+        self._set_widget_tooltip(
+            self.add_packmol_supplemental_atom_button,
+            "Add a single unclustered atom, such as Cs, for Packmol "
+            "stoichiometry completion.",
         )
         self._set_widget_tooltip(
             self.compute_packmol_plan_button,
@@ -2939,6 +3389,7 @@ class RMCSetupMainWindow(QMainWindow):
             self._apply_representative_metadata(None)
             self.compute_representatives_button.setEnabled(False)
             self.preview_representatives_button.setEnabled(False)
+            self.reset_representative_state_button.setEnabled(False)
             self.representative_status_label.setText(
                 "Representative structures: no SAXS project loaded."
             )
@@ -2950,6 +3401,13 @@ class RMCSetupMainWindow(QMainWindow):
         self._apply_representative_metadata(state.representative_selection)
         self.compute_representatives_button.setEnabled(True)
         self.preview_representatives_button.setEnabled(True)
+        self.reset_representative_state_button.setEnabled(
+            state.representative_selection is not None
+            or state.solvent_handling is not None
+            or state.packmol_planning is not None
+            or state.packmol_setup is not None
+            or state.constraint_generation is not None
+        )
         if state.representative_selection is None:
             self.representative_status_label.setText(
                 "Representative structures: no saved project set loaded."
@@ -2994,6 +3452,10 @@ class RMCSetupMainWindow(QMainWindow):
             self.compute_packmol_plan_button.setEnabled(False)
             self.build_packmol_setup_button.setEnabled(False)
             self.packmol_free_solvent_combo.setEnabled(False)
+            self.packmol_supplemental_table.setEnabled(False)
+            self.add_packmol_supplemental_reference_button.setEnabled(False)
+            self.add_packmol_supplemental_atom_button.setEnabled(False)
+            self.remove_packmol_supplemental_button.setEnabled(False)
             self.packmol_plan_summary_box.setPlainText(
                 "Load a SAXS project, calculate solution properties, and "
                 "save representative structures before planning Packmol "
@@ -3020,6 +3482,12 @@ class RMCSetupMainWindow(QMainWindow):
         )
         self.packmol_free_solvent_combo.setEnabled(
             self.packmol_free_solvent_combo.count() > 0
+        )
+        self.packmol_supplemental_table.setEnabled(True)
+        self.add_packmol_supplemental_reference_button.setEnabled(True)
+        self.add_packmol_supplemental_atom_button.setEnabled(True)
+        self.remove_packmol_supplemental_button.setEnabled(
+            self.packmol_supplemental_table.rowCount() > 0
         )
         self.packmol_plan_summary_box.setPlainText(
             self._packmol_plan_summary_text(state.packmol_planning)
@@ -3751,14 +4219,17 @@ class RMCSetupMainWindow(QMainWindow):
                 preview_path.name,
                 str(atom_count),
                 source_text,
+                representative_entry.param or "n/a",
+                f"{representative_entry.selected_weight:.6g}",
             ]
             details_lines = [
                 f"Representative: {values[0]}",
                 f"Detected source solvent state: {detected_state}",
                 f"Active structure set: {active_mode_label}",
                 f"Structure file: {preview_path}",
+                ("DREAM weight: " f"{representative_entry.param or 'n/a'}"),
                 (
-                    "Selected weight: "
+                    "DREAM-derived weight value: "
                     f"{representative_entry.selected_weight:.6g}"
                 ),
                 f"Cluster count: {representative_entry.cluster_count}",
@@ -4022,13 +4493,21 @@ class RMCSetupMainWindow(QMainWindow):
             )
         )
         status_lines = [
-            f"Representative entries analyzed: {len(analysis.entries)}",
+            (
+                "Representative entries analyzed: "
+                f"{analysis.distribution_status_entry_count}"
+            ),
             (
                 "Saved full-solvent representatives are not available yet. "
                 "Build solvent-decorated representative PDBs to store the "
                 "Full solvent representative structure set."
             ),
         ]
+        if analysis.ignored_distribution_status_entry_count:
+            status_lines.append(
+                "Single-atom representatives ignored for distribution state: "
+                f"{analysis.ignored_distribution_status_entry_count}"
+            )
         if analysis.distribution_note:
             status_lines.append(analysis.distribution_note)
         status_lines.append(
@@ -4168,6 +4647,9 @@ class RMCSetupMainWindow(QMainWindow):
             settings.planning_mode,
         )
         self.packmol_box_side_spin.setValue(settings.box_side_length_a)
+        self._set_packmol_supplemental_components(
+            settings.supplemental_components
+        )
         selected_reference = settings.free_solvent_reference
         if (
             selected_reference is None
@@ -4551,6 +5033,7 @@ class RMCSetupMainWindow(QMainWindow):
             return
 
         state.representative_selection = metadata
+        state.solvent_handling = None
         state.packmol_planning = None
         state.packmol_setup = None
         state.constraint_generation = None
@@ -4808,6 +5291,156 @@ class RMCSetupMainWindow(QMainWindow):
             self._append_run_log(log_completion)
         return analysis
 
+    def _add_packmol_supplemental_reference_component(self) -> None:
+        choices = [preset.name for preset in self._available_solvent_presets]
+        if not choices:
+            QMessageBox.information(
+                self,
+                "No reference molecules",
+                "No xyz2pdb reference molecules are available.",
+            )
+            return
+        reference_name, accepted = QInputDialog.getItem(
+            self,
+            "Add Reference Component",
+            "Reference molecule",
+            choices,
+            0,
+            False,
+        )
+        if not accepted or not reference_name:
+            return
+        role_label, accepted = QInputDialog.getItem(
+            self,
+            "Component Role",
+            "Role",
+            ["solute", "solvent"],
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        preset_lookup = {
+            preset.name: preset for preset in self._available_solvent_presets
+        }
+        preset = preset_lookup.get(reference_name)
+        default_residue = "" if preset is None else preset.residue_name
+        residue_name, accepted = QInputDialog.getText(
+            self,
+            "Component Residue",
+            "Residue name",
+            text=default_residue,
+        )
+        if not accepted:
+            return
+        reference_path = (
+            None if preset is None else str(Path(preset.path).resolve())
+        )
+        self._append_packmol_supplemental_component(
+            PackmolSupplementalComponentSettings(
+                role=str(role_label or "solute"),
+                reference=reference_path or reference_name,
+                residue_name=str(residue_name or default_residue).strip(),
+                name=reference_name,
+            )
+        )
+
+    def _add_packmol_supplemental_atom_component(self) -> None:
+        element = PeriodicTableElementDialog.get_element_symbol(
+            parent=self,
+            title="Add Single Atom",
+        )
+        if not element:
+            return
+        role_label, accepted = QInputDialog.getItem(
+            self,
+            "Component Role",
+            "Role",
+            ["solute", "solvent"],
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        residue_name, accepted = QInputDialog.getText(
+            self,
+            "Component Residue",
+            "Residue name",
+            text=element.upper()[:3],
+        )
+        if not accepted:
+            return
+        self._append_packmol_supplemental_component(
+            PackmolSupplementalComponentSettings(
+                role=str(role_label or "solute"),
+                element=element,
+                residue_name=residue_name.strip(),
+                name=element,
+            )
+        )
+
+    def _remove_selected_packmol_supplemental_component(self) -> None:
+        selected_rows = sorted(
+            {
+                index.row()
+                for index in self.packmol_supplemental_table.selectedIndexes()
+            },
+            reverse=True,
+        )
+        for row in selected_rows:
+            self.packmol_supplemental_table.removeRow(row)
+        self.remove_packmol_supplemental_button.setEnabled(
+            self.packmol_supplemental_table.rowCount() > 0
+        )
+
+    def _append_packmol_supplemental_component(
+        self,
+        component: PackmolSupplementalComponentSettings,
+    ) -> None:
+        row = self.packmol_supplemental_table.rowCount()
+        self.packmol_supplemental_table.insertRow(row)
+        source_label = "Reference" if component.reference else "Atom"
+        identifier = component.reference or component.element or ""
+        identifier_label = (
+            Path(identifier).stem if component.reference else identifier
+        )
+        values = [
+            component.role,
+            source_label,
+            identifier_label,
+            component.residue_name,
+        ]
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            if column == 0:
+                item.setData(Qt.ItemDataRole.UserRole, component)
+            self.packmol_supplemental_table.setItem(row, column, item)
+        self.remove_packmol_supplemental_button.setEnabled(True)
+
+    def _set_packmol_supplemental_components(
+        self,
+        components: tuple[PackmolSupplementalComponentSettings, ...],
+    ) -> None:
+        self.packmol_supplemental_table.setRowCount(0)
+        for component in components:
+            self._append_packmol_supplemental_component(component)
+        self.remove_packmol_supplemental_button.setEnabled(
+            self.packmol_supplemental_table.rowCount() > 0
+        )
+
+    def _current_packmol_supplemental_components(
+        self,
+    ) -> list[PackmolSupplementalComponentSettings]:
+        components: list[PackmolSupplementalComponentSettings] = []
+        for row in range(self.packmol_supplemental_table.rowCount()):
+            item = self.packmol_supplemental_table.item(row, 0)
+            if item is None:
+                continue
+            component = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(component, PackmolSupplementalComponentSettings):
+                components.append(component)
+        return components
+
     def _current_packmol_planning_settings(self) -> PackmolPlanningSettings:
         return PackmolPlanningSettings(
             planning_mode=str(
@@ -4815,6 +5448,9 @@ class RMCSetupMainWindow(QMainWindow):
             ),
             box_side_length_a=float(self.packmol_box_side_spin.value()),
             free_solvent_reference=self._selected_packmol_free_solvent_reference(),
+            supplemental_components=tuple(
+                self._current_packmol_supplemental_components()
+            ),
         )
 
     def _current_packmol_setup_settings(self) -> PackmolSetupSettings:
@@ -5783,6 +6419,8 @@ class RMCSetupMainWindow(QMainWindow):
             + str(state.rmcsetup_paths.packmol_setup_path)
             + "\nAudit report:\n"
             + str(state.rmcsetup_paths.packmol_audit_report_path)
+            + "\nBuild report:\n"
+            + str(state.rmcsetup_paths.packmol_build_report_path)
         )
         if state.packmol_docker_link is not None:
             text += (
