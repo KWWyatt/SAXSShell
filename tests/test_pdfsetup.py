@@ -7,19 +7,38 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QWidget
 
+import saxshell.pdf.debyer.ui.batch_queue_window as batch_queue_module
+import saxshell.pdf.debyer.workflow as debyer_workflow
 import saxshell.pdfsetup as pdfsetup_module
 from saxshell import saxshell as saxshell_module
-from saxshell.pdf.debyer.ui.main_window import DebyerPDFMainWindow
+from saxshell.pdf.debyer.ui.batch_queue_window import (
+    DebyerPDFBatchItem,
+    DebyerPDFBatchItemWidget,
+    DebyerPDFBatchQueueWindow,
+    DebyerPDFBatchWorker,
+    DebyerPDFExistingPartialsJob,
+    DebyerPDFExistingPartialsWorker,
+)
+from saxshell.pdf.debyer.ui.main_window import (
+    DebyerPDFMainWindow,
+    DebyerPDFWorker,
+)
 from saxshell.pdf.debyer.workflow import (
+    DebyerPDFCalculation,
     DebyerPDFSettings,
     DebyerPDFWorkflow,
     calculate_number_density,
+    compute_experimental_fit_metrics,
     convert_distribution_values,
+    fit_coordination_peak_from_r,
     list_saved_debyer_calculations,
     load_debyer_calculation,
+    parse_debyer_output_file,
 )
+from saxshell.saxs.project_manager import SAXSProjectManager
 
 
 @pytest.fixture(scope="module")
@@ -31,10 +50,11 @@ def qapp():
     yield app
 
 
-def _write_fake_debyer(path: Path) -> Path:
+def _write_fake_debyer(path: Path, *, sleep_seconds: float = 0.0) -> Path:
     script = """#!/usr/bin/env python3
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +83,9 @@ def main(argv):
     digits = re.findall(r"(\\d+)", input_file.stem)
     frame_index = int(digits[-1]) if digits else 0
     scale = 1.0 + frame_index
+    sleep_seconds = __SLEEP_SECONDS__
+    if sleep_seconds > 0.0:
+        time.sleep(sleep_seconds)
     r_values = np.array([0.5, 1.0, 1.5], dtype=float)
     partial_pbpb = scale * np.array([0.10, 0.12, 0.14], dtype=float)
     partial_pbi = scale * np.array([0.55, 0.60, 0.65], dtype=float)
@@ -92,23 +115,80 @@ def main(argv):
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
 """
+    script = script.replace("__SLEEP_SECONDS__", repr(float(sleep_seconds)))
     path.write_text(script, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
 
 
-def _build_frames_dir(tmp_path: Path) -> Path:
+def _build_frames_dir(
+    tmp_path: Path,
+    *,
+    frame_count: int = 2,
+    xyz: str | None = None,
+) -> Path:
     frames_dir = tmp_path / "splitxyz_f0_t0fs"
-    frames_dir.mkdir()
-    xyz = (
-        "3\n" "frame\n" "Pb 0.0 0.0 0.0\n" "I 2.0 0.0 0.0\n" "I 0.0 2.0 0.0\n"
+    frames_dir.mkdir(parents=True)
+    xyz_text = (
+        xyz
+        or "3\n"
+        "frame\n"
+        "Pb 0.0 0.0 0.0\n"
+        "I 2.0 0.0 0.0\n"
+        "I 0.0 2.0 0.0\n"
     )
-    for index in range(2):
+    for index in range(frame_count):
         (frames_dir / f"frame_{index:04d}.xyz").write_text(
-            xyz,
+            xyz_text,
             encoding="utf-8",
         )
     return frames_dir
+
+
+def _pdb_atom_line(
+    serial: int,
+    atom_name: str,
+    residue_name: str,
+    residue_id: int,
+    element: str,
+    x: float,
+    y: float,
+    z: float,
+) -> str:
+    return (
+        f"ATOM  {serial:5d} {atom_name:<4s} {residue_name:>3s} "
+        f"A{residue_id:4d}    {x:8.3f}{y:8.3f}{z:8.3f}"
+        f"  1.00  0.00          {element:>2s}\n"
+    )
+
+
+def _build_pdb_frames_dir(tmp_path: Path, *, frame_count: int = 2) -> Path:
+    frames_dir = tmp_path / "splitpdb_f0_t0fs"
+    frames_dir.mkdir(parents=True)
+    pdb_text = "".join(
+        [
+            _pdb_atom_line(1, "PB", "PER", 1, "Pb", 0.0, 0.0, 0.0),
+            _pdb_atom_line(2, "I1", "PER", 1, "I", 2.0, 0.0, 0.0),
+            _pdb_atom_line(3, "O1", "DMS", 2, "O", 0.0, 2.0, 0.0),
+            _pdb_atom_line(4, "C1", "DMS", 2, "C", 0.0, 0.0, 2.0),
+            "END\n",
+        ]
+    )
+    for index in range(frame_count):
+        (frames_dir / f"frame_{index:04d}.pdb").write_text(
+            pdb_text,
+            encoding="utf-8",
+        )
+    return frames_dir
+
+
+def _write_pbc_source_file(frames_dir: Path, token: str = "12x10x8") -> Path:
+    source = frames_dir.parent / f"sample_pbc_{token}-pos-1.xyz"
+    source.write_text(
+        "1\nsource\nPb 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    return source
 
 
 def test_convert_distribution_values_from_pdf_mode():
@@ -133,6 +213,313 @@ def test_convert_distribution_values_from_pdf_mode():
     expected_g = 4.0 * np.pi * rho0 * r_values * (g_values - 1.0)
     assert np.allclose(converted_r, expected_r)
     assert np.allclose(converted_g, expected_g)
+
+
+def test_infers_default_solute_elements_from_frame_elements():
+    assert debyer_workflow.infer_default_solute_elements(
+        {"Pb": 1, "I": 2}
+    ) == ("Pb", "I")
+    assert debyer_workflow.infer_default_solute_elements(
+        {"Cs": 1, "Pb": 1, "I": 3}
+    ) == ("Cs", "Pb", "I")
+    assert (
+        debyer_workflow.infer_default_solute_elements({"Na": 1, "Cl": 1}) == ()
+    )
+
+
+def test_pdfsetup_rejects_pdb_frame_folders(tmp_path):
+    frames_dir = _build_pdb_frames_dir(tmp_path)
+
+    with pytest.raises(ValueError, match="require XYZ frame files"):
+        debyer_workflow.inspect_frames_dir(frames_dir)
+
+
+def test_pdf_batch_settings_module_inspects_xyz_defaults(qapp, tmp_path):
+    project_dir = tmp_path / "project"
+    frames_dir = _build_frames_dir(
+        tmp_path,
+        xyz=(
+            "3\n"
+            "frame\n"
+            "Cs 0.0 0.0 0.0\n"
+            "Pb 2.0 0.0 0.0\n"
+            "I 0.0 2.0 0.0\n"
+        ),
+    )
+    _write_pbc_source_file(frames_dir)
+    widget = DebyerPDFBatchItemWidget(
+        DebyerPDFBatchItem(
+            item_id="batch-item",
+            project_dir=project_dir,
+            frames_dir=frames_dir,
+        )
+    )
+    widget.to_edit.setText("25")
+
+    widget.inspect_frames()
+    settings = widget.settings()
+
+    assert settings.project_dir == project_dir.resolve()
+    assert settings.frames_dir == frames_dir.resolve()
+    assert settings.filename_prefix == frames_dir.name
+    assert settings.atom_count == 3
+    assert settings.box_dimensions == pytest.approx((12.0, 10.0, 8.0))
+    assert settings.to_value == pytest.approx(4.0)
+    assert settings.solute_elements == ("Cs", "Pb", "I")
+    assert "Detected XYZ frames" in widget.inspection_summary_label.text()
+
+
+def test_pdf_batch_queue_window_keeps_collapsible_reorderable_items(
+    qapp,
+    tmp_path,
+):
+    first_frames_dir = _build_frames_dir(tmp_path / "first")
+    second_frames_dir = _build_frames_dir(tmp_path / "second")
+    window = DebyerPDFBatchQueueWindow()
+
+    first = window.add_queue_item(
+        DebyerPDFBatchItem(
+            item_id="first",
+            project_dir=tmp_path / "first_project",
+            frames_dir=first_frames_dir,
+            filename_prefix="first_pdf",
+            box_dimensions=(10.0, 10.0, 10.0),
+            atom_count=3,
+        )
+    )
+    second = window.add_queue_item(
+        DebyerPDFBatchItem(
+            item_id="second",
+            project_dir=tmp_path / "second_project",
+            frames_dir=second_frames_dir,
+            filename_prefix="second_pdf",
+            box_dimensions=(11.0, 11.0, 11.0),
+            atom_count=3,
+        )
+    )
+
+    assert (
+        window.queue_list.dragDropMode()
+        == QAbstractItemView.DragDropMode.InternalMove
+    )
+    assert first.settings_group.isHidden()
+    assert second.settings_group.isHidden()
+    first._set_settings_visible(True)
+    assert not first.settings_group.isHidden()
+    first._set_settings_visible(False)
+    assert first.settings_group.isHidden()
+    window.queue_list.setCurrentItem(window.queue_list.item(0))
+    window._refresh_item_selection_styles()
+    assert first.header_frame.property("selected") is True
+    assert second.header_frame.property("selected") is False
+    assert [
+        item_id for item_id, _settings in window.queue_settings_in_order()
+    ] == [
+        "first",
+        "second",
+    ]
+    assert second.item().display_name() == "second_project"
+
+
+def test_pdf_batch_queue_adds_multiple_selected_project_folders(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    project_a = tmp_path / "project_a"
+    project_b = tmp_path / "project_b"
+    project_a.mkdir()
+    project_b.mkdir()
+    window = DebyerPDFBatchQueueWindow()
+    monkeypatch.setattr(
+        batch_queue_module,
+        "_choose_existing_directories",
+        lambda *_args, **_kwargs: (project_a.resolve(), project_b.resolve()),
+    )
+
+    window._choose_project_to_add()
+
+    assert window.queue_list.count() == 2
+    project_dirs = []
+    for row in range(window.queue_list.count()):
+        item_id = str(
+            window.queue_list.item(row).data(Qt.ItemDataRole.UserRole)
+        )
+        project_dirs.append(window._widgets_by_id[item_id].item().project_dir)
+    assert project_dirs == [project_a.resolve(), project_b.resolve()]
+
+
+def test_pdf_batch_queue_prefills_project_debyer_defaults(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    frames_dir = _build_frames_dir(
+        tmp_path / "frames",
+        xyz=(
+            "3\n"
+            "frame\n"
+            "Cs 0.0 0.0 0.0\n"
+            "Pb 2.0 0.0 0.0\n"
+            "I 0.0 2.0 0.0\n"
+        ),
+    )
+    project_dir = tmp_path / "project_defaults"
+    manager = SAXSProjectManager()
+    settings = manager.create_project(project_dir)
+    settings.frames_dir = str(frames_dir)
+    project_file = manager.save_project(settings)
+    payload = json.loads(project_file.read_text(encoding="utf-8"))
+    payload["debyer_pdf_settings"] = {
+        "filename_prefix": "stored_pdf",
+        "mode": "PDF",
+        "from_value": 0.7,
+        "to_value": 3.5,
+        "step_value": 0.02,
+        "box_dimensions": [12.0, 10.0, 8.0],
+        "atom_count": 3,
+        "solute_elements": ["Cs", "Pb", "I"],
+        "parallel_jobs": 2,
+    }
+    project_file.write_text(json.dumps(payload), encoding="utf-8")
+    window = DebyerPDFBatchQueueWindow()
+    monkeypatch.setattr(
+        batch_queue_module,
+        "_choose_existing_directories",
+        lambda *_args, **_kwargs: (project_dir.resolve(),),
+    )
+
+    window._choose_project_to_add()
+
+    assert window.queue_list.count() == 1
+    item_id = str(window.queue_list.item(0).data(Qt.ItemDataRole.UserRole))
+    widget = window._widgets_by_id[item_id]
+    queued_settings = widget.settings()
+    assert queued_settings.project_dir == project_dir.resolve()
+    assert queued_settings.frames_dir == frames_dir.resolve()
+    assert queued_settings.filename_prefix == "stored_pdf"
+    assert queued_settings.from_value == pytest.approx(0.7)
+    assert queued_settings.to_value == pytest.approx(3.5)
+    assert queued_settings.step_value == pytest.approx(0.02)
+    assert queued_settings.box_dimensions == pytest.approx((12.0, 10.0, 8.0))
+    assert queued_settings.atom_count == 3
+    assert queued_settings.solute_elements == ("Cs", "Pb", "I")
+    assert queued_settings.max_parallel_jobs == 2
+
+
+def test_pdf_batch_queue_append_mode_uses_project_solute_jobs(
+    qapp,
+    tmp_path,
+):
+    project_dir = tmp_path / "project"
+    window = DebyerPDFBatchQueueWindow()
+    item_widget = window.add_queue_item(
+        DebyerPDFBatchItem(
+            item_id="existing",
+            project_dir=project_dir,
+            solute_elements=("Pb",),
+        )
+    )
+    append_index = window.queue_mode_combo.findData("append_grouped")
+
+    window.queue_mode_combo.setCurrentIndex(append_index)
+    jobs = window.existing_partials_jobs_in_order()
+
+    assert window.run_button.text() == "Append Grouped Partial Columns"
+    assert window.add_frames_button.isEnabled() is False
+    assert item_widget.frames_dir_edit.isEnabled() is False
+    assert item_widget.solute_elements_edit.isEnabled() is True
+    assert jobs == [
+        (
+            "existing",
+            DebyerPDFExistingPartialsJob(
+                project_dir=project_dir.resolve(),
+                solute_elements=("Pb",),
+            ),
+        )
+    ]
+
+    item_widget.solute_elements_edit.setText("Cs, Pb, I")
+    item_widget._on_editor_changed()
+    jobs = window.existing_partials_jobs_in_order()
+
+    assert jobs[0][1].solute_elements == ("Cs", "Pb", "I")
+
+
+def test_compute_experimental_fit_metrics_interpolates_model_gr():
+    metrics = compute_experimental_fit_metrics(
+        model_r_values=np.array([0.0, 1.0, 2.0], dtype=float),
+        model_g_values=np.array([1.0, 2.0, 3.0], dtype=float),
+        experimental_r_values=np.array([0.5, 1.5], dtype=float),
+        experimental_g_values=np.array([1.5, 2.5], dtype=float),
+    )
+
+    assert metrics is not None
+    assert metrics.r_squared == pytest.approx(1.0)
+    assert metrics.rmse == pytest.approx(0.0)
+    assert metrics.mae == pytest.approx(0.0)
+    assert metrics.point_count == 2
+    assert metrics.r_min == pytest.approx(0.5)
+    assert metrics.r_max == pytest.approx(1.5)
+
+
+def test_fit_coordination_peak_from_r_recovers_gaussian_area():
+    r_values = np.linspace(1.5, 3.5, 121)
+    expected_cn = 4.25
+    center = 2.62
+    sigma = 0.11
+    baseline = 0.35 + 0.08 * (r_values - center)
+    r_values_distribution = baseline + (
+        expected_cn
+        / (sigma * np.sqrt(2.0 * np.pi))
+        * np.exp(-0.5 * ((r_values - center) / sigma) ** 2)
+    )
+
+    result = fit_coordination_peak_from_r(
+        r_values=r_values,
+        r_distribution_values=r_values_distribution,
+        r_min=2.2,
+        r_max=3.05,
+        initial_center=2.6,
+        initial_sigma=0.12,
+    )
+
+    assert result.coordination_number == pytest.approx(expected_cn, rel=0.03)
+    assert result.center == pytest.approx(center, abs=0.02)
+    assert result.sigma == pytest.approx(sigma, abs=0.02)
+    assert result.r_squared > 0.99
+
+
+def test_running_debyer_average_matches_batch_average_without_frame_cache():
+    r_values = np.linspace(0.1, 6.0, 240, dtype=float)
+    batch_outputs = []
+    running_average = debyer_workflow._RunningDebyerAverage()
+
+    for index in range(250):
+        scale = 1.0 + float(index)
+        columns = {
+            "sum": scale * np.sin(r_values),
+            "Pb-I": scale * np.cos(r_values),
+        }
+        if index >= 25:
+            columns["I-I"] = scale * (r_values**2)
+        batch_outputs.append((r_values, columns))
+        running_average.add_frame(r_values, columns)
+
+    batch_r, batch_columns, batch_values = (
+        debyer_workflow._average_frame_outputs(batch_outputs)
+    )
+    running_r, running_columns, running_values = running_average.average()
+    raw_cache_bytes = sum(
+        r_array.nbytes + sum(values.nbytes for values in columns.values())
+        for r_array, columns in batch_outputs
+    )
+
+    assert np.allclose(running_r, batch_r)
+    assert running_columns == batch_columns
+    for key in batch_columns:
+        assert np.allclose(running_values[key], batch_values[key])
+    assert running_average.memory_bytes < raw_cache_bytes / 100
 
 
 def test_debyer_workflow_averages_and_persists_calculation(tmp_path):
@@ -186,6 +573,24 @@ def test_debyer_workflow_averages_and_persists_calculation(tmp_path):
     assert "# processed_frames:" in averaged_text
     assert "# total_frames:" in averaged_text
     assert "# columns: sum" in averaged_text
+    _output_r, output_values = parse_debyer_output_file(
+        result.averaged_output_file
+    )
+    assert "solute-solute" in output_values
+    assert "solute-solvent" in output_values
+    assert "solvent-solvent" in output_values
+    assert np.allclose(
+        output_values["solute-solute"],
+        result.partial_values["Pb-Pb"],
+    )
+    assert np.allclose(
+        output_values["solute-solvent"],
+        result.partial_values["Pb-I"],
+    )
+    assert np.allclose(
+        output_values["solvent-solvent"],
+        result.partial_values["I-I"],
+    )
 
     summaries = list_saved_debyer_calculations(project_dir)
     assert len(summaries) == 1
@@ -193,10 +598,580 @@ def test_debyer_workflow_averages_and_persists_calculation(tmp_path):
     assert loaded.filename_prefix == "demo_pdf"
     assert np.allclose(loaded.total_values, result.total_values)
     assert loaded.solute_elements == ("Pb",)
+    assert sorted(loaded.partial_values) == ["I-I", "Pb-I", "Pb-Pb"]
     assert loaded.processed_frame_count == loaded.frame_count
     assert "Pb-I" in loaded.partial_peak_markers
     assert loaded.partial_peak_markers["Pb-I"]
     assert loaded.peak_finder_settings.max_peak_count >= 0
+
+
+def test_pdf_batch_worker_runs_projects_in_sequence(qapp, tmp_path):
+    fake_debyer = _write_fake_debyer(tmp_path / "debyer")
+    first_frames_dir = _build_frames_dir(tmp_path / "first")
+    second_frames_dir = _build_frames_dir(tmp_path / "second")
+    entries = [
+        (
+            "first",
+            DebyerPDFSettings(
+                project_dir=tmp_path / "first_project",
+                frames_dir=first_frames_dir,
+                filename_prefix="first_pdf",
+                mode="PDF",
+                from_value=0.5,
+                to_value=5.0,
+                step_value=0.01,
+                box_dimensions=(10.0, 10.0, 10.0),
+                atom_count=3,
+                solute_elements=("Pb", "I"),
+            ),
+        ),
+        (
+            "second",
+            DebyerPDFSettings(
+                project_dir=tmp_path / "second_project",
+                frames_dir=second_frames_dir,
+                filename_prefix="second_pdf",
+                mode="PDF",
+                from_value=0.5,
+                to_value=5.0,
+                step_value=0.01,
+                box_dimensions=(11.0, 11.0, 11.0),
+                atom_count=3,
+                solute_elements=("Pb", "I"),
+            ),
+        ),
+    ]
+    worker = DebyerPDFBatchWorker(entries, debyer_executable=fake_debyer)
+    started_items: list[str] = []
+    finished_results: list[DebyerPDFCalculation] = []
+    worker.item_started.connect(
+        lambda item_id, _index, _total: started_items.append(item_id)
+    )
+    worker.finished.connect(lambda results: finished_results.extend(results))
+
+    worker.run()
+
+    assert started_items == ["first", "second"]
+    assert [result.filename_prefix for result in finished_results] == [
+        "first_pdf",
+        "second_pdf",
+    ]
+    assert all(
+        result.averaged_output_file.is_file() for result in finished_results
+    )
+    assert all(not result.is_partial_average for result in finished_results)
+    for (_item_id, settings), result in zip(entries, finished_results):
+        summaries = list_saved_debyer_calculations(settings.project_dir)
+        assert len(summaries) == 1
+        assert summaries[0].filename_prefix == result.filename_prefix
+        loaded = load_debyer_calculation(summaries[0].calculation_dir)
+        assert loaded.project_dir == settings.project_dir.resolve()
+        assert loaded.frames_dir == settings.frames_dir.resolve()
+        assert loaded.filename_prefix == result.filename_prefix
+        assert loaded.mode == result.mode
+        assert loaded.frame_count == result.frame_count
+        assert loaded.processed_frame_count == loaded.frame_count
+        assert np.allclose(loaded.total_values, result.total_values)
+        assert loaded.solute_elements == ("Pb", "I")
+        _output_r, output_values = parse_debyer_output_file(
+            loaded.averaged_output_file
+        )
+        assert "solute-solute" in output_values
+        assert "solute-solvent" not in output_values
+        assert "solvent-solvent" not in output_values
+        assert np.allclose(
+            output_values["solute-solute"],
+            sum(loaded.partial_values.values()),
+        )
+        assert (loaded.calculation_dir / "calculation.json").is_file()
+        assert loaded.averaged_output_file.is_file()
+
+
+def test_pdf_existing_partials_worker_updates_saved_calculations(
+    qapp,
+    tmp_path,
+):
+    fake_debyer = _write_fake_debyer(tmp_path / "debyer")
+    frames_dir = _build_frames_dir(
+        tmp_path,
+        xyz=("2\n" "frame\n" "Na 0.0 0.0 0.0\n" "Cl 2.0 0.0 0.0\n"),
+    )
+    project_dir = tmp_path / "project"
+    result = DebyerPDFWorkflow(
+        DebyerPDFSettings(
+            project_dir=project_dir,
+            frames_dir=frames_dir,
+            filename_prefix="existing_average",
+            mode="PDF",
+            from_value=0.5,
+            to_value=5.0,
+            step_value=0.01,
+            box_dimensions=(10.0, 10.0, 10.0),
+            atom_count=2,
+            solute_elements=(),
+        ),
+        debyer_executable=fake_debyer,
+    ).run()
+    _r_values, before_values = parse_debyer_output_file(
+        result.averaged_output_file
+    )
+    assert "solute-solute" not in before_values
+    worker = DebyerPDFExistingPartialsWorker(
+        [
+            (
+                "project",
+                DebyerPDFExistingPartialsJob(
+                    project_dir=project_dir,
+                    solute_elements=("Pb",),
+                ),
+            )
+        ]
+    )
+    updated_results: list[DebyerPDFCalculation] = []
+    progress_messages: list[str] = []
+    worker.item_progress.connect(
+        lambda _item_id, _processed, _total, message: progress_messages.append(
+            message
+        )
+    )
+    worker.finished.connect(lambda results: updated_results.extend(results))
+
+    worker.run()
+
+    assert len(updated_results) == 1
+    assert progress_messages
+    _r_values, after_values = parse_debyer_output_file(
+        result.averaged_output_file
+    )
+    assert "solute-solute" in after_values
+    assert "solute-solvent" in after_values
+    assert "solvent-solvent" in after_values
+    loaded = load_debyer_calculation(result.calculation_dir)
+    assert loaded.solute_elements == ("Pb",)
+    assert sorted(loaded.partial_values) == ["I-I", "Pb-I", "Pb-Pb"]
+
+
+def test_debyer_workflow_parallel_jobs_match_serial_average(tmp_path):
+    fake_debyer = _write_fake_debyer(tmp_path / "debyer")
+    frames_dir = _build_frames_dir(tmp_path, frame_count=8)
+
+    serial = DebyerPDFWorkflow(
+        DebyerPDFSettings(
+            project_dir=tmp_path / "serial_project",
+            frames_dir=frames_dir,
+            filename_prefix="serial_pdf",
+            mode="PDF",
+            from_value=0.5,
+            to_value=15.0,
+            step_value=0.01,
+            box_dimensions=(10.0, 10.0, 10.0),
+            atom_count=3,
+            store_frame_outputs=False,
+            solute_elements=("Pb",),
+            max_parallel_jobs=1,
+        ),
+        debyer_executable=fake_debyer,
+    ).run()
+    parallel = DebyerPDFWorkflow(
+        DebyerPDFSettings(
+            project_dir=tmp_path / "parallel_project",
+            frames_dir=frames_dir,
+            filename_prefix="parallel_pdf",
+            mode="PDF",
+            from_value=0.5,
+            to_value=15.0,
+            step_value=0.01,
+            box_dimensions=(10.0, 10.0, 10.0),
+            atom_count=3,
+            store_frame_outputs=False,
+            solute_elements=("Pb",),
+            max_parallel_jobs=4,
+        ),
+        debyer_executable=fake_debyer,
+    ).run()
+
+    assert parallel.parallel_jobs == 4
+    assert parallel.processed_frame_count == serial.processed_frame_count == 8
+    assert np.allclose(parallel.total_values, serial.total_values)
+    assert parallel.partial_values.keys() == serial.partial_values.keys()
+    for key in parallel.partial_values:
+        assert np.allclose(
+            parallel.partial_values[key],
+            serial.partial_values[key],
+        )
+    loaded = load_debyer_calculation(parallel.calculation_dir)
+    assert loaded.parallel_jobs == 4
+    averaged_text = parallel.averaged_output_file.read_text(encoding="utf-8")
+    assert "# parallel_jobs: 4" in averaged_text
+
+
+def test_debyer_workflow_defaults_solute_elements_when_omitted(tmp_path):
+    fake_debyer = _write_fake_debyer(tmp_path / "debyer")
+    frames_dir = _build_frames_dir(tmp_path)
+    result = DebyerPDFWorkflow(
+        DebyerPDFSettings(
+            project_dir=tmp_path / "project",
+            frames_dir=frames_dir,
+            filename_prefix="default_solute_pdf",
+            mode="PDF",
+            from_value=0.5,
+            to_value=15.0,
+            step_value=0.01,
+            box_dimensions=(10.0, 10.0, 10.0),
+            atom_count=3,
+            store_frame_outputs=False,
+            solute_elements=(),
+        ),
+        debyer_executable=fake_debyer,
+    ).run()
+
+    assert result.solute_elements == ("Pb", "I")
+    loaded = load_debyer_calculation(result.calculation_dir)
+    assert loaded.solute_elements == ("Pb", "I")
+
+
+def test_debyer_workflow_checkpoints_sparse_running_averages(tmp_path):
+    fake_debyer = _write_fake_debyer(tmp_path / "debyer")
+    frames_dir = _build_frames_dir(tmp_path, frame_count=12)
+    project_dir = tmp_path / "project"
+    workflow = DebyerPDFWorkflow(
+        DebyerPDFSettings(
+            project_dir=project_dir,
+            frames_dir=frames_dir,
+            filename_prefix="sparse_preview_pdf",
+            mode="PDF",
+            from_value=0.5,
+            to_value=15.0,
+            step_value=0.01,
+            box_dimensions=(10.0, 10.0, 10.0),
+            atom_count=3,
+            store_frame_outputs=False,
+            solute_elements=("Pb",),
+        ),
+        debyer_executable=fake_debyer,
+    )
+    preview_counts: list[int | None] = []
+
+    result = workflow.run(
+        preview_callback=lambda calculation: preview_counts.append(
+            calculation.processed_frame_count
+        )
+    )
+
+    assert preview_counts == [12]
+    assert result.processed_frame_count == 12
+    assert result.is_partial_average is False
+
+
+def test_debyer_workflow_respects_live_preview_decision(tmp_path):
+    fake_debyer = _write_fake_debyer(tmp_path / "debyer")
+    frames_dir = _build_frames_dir(tmp_path, frame_count=12)
+    project_dir = tmp_path / "project"
+    workflow = DebyerPDFWorkflow(
+        DebyerPDFSettings(
+            project_dir=project_dir,
+            frames_dir=frames_dir,
+            filename_prefix="live_preview_pdf",
+            mode="PDF",
+            from_value=0.5,
+            to_value=15.0,
+            step_value=0.01,
+            box_dimensions=(10.0, 10.0, 10.0),
+            atom_count=3,
+            store_frame_outputs=False,
+            solute_elements=("Pb",),
+        ),
+        debyer_executable=fake_debyer,
+    )
+    previews = []
+    preview_enabled = {"value": False}
+
+    def update_preview_toggle(processed, _total, _message):
+        if processed == 6:
+            preview_enabled["value"] = True
+        elif processed == 7:
+            preview_enabled["value"] = False
+
+    def should_preview(processed, _total, checkpoint_due):
+        if processed == 6:
+            assert checkpoint_due is False
+        return preview_enabled["value"]
+
+    result = workflow.run(
+        progress_callback=update_preview_toggle,
+        preview_callback=previews.append,
+        preview_decision_callback=should_preview,
+    )
+
+    assert [preview.processed_frame_count for preview in previews] == [6]
+    assert result.processed_frame_count == 12
+    assert result.is_partial_average is False
+    loaded = load_debyer_calculation(result.calculation_dir)
+    assert loaded.processed_frame_count == 12
+
+
+def test_debyer_worker_preview_toggle_requests_next_average(tmp_path):
+    settings = DebyerPDFSettings(
+        project_dir=tmp_path / "project",
+        frames_dir=tmp_path / "frames",
+        filename_prefix="worker_preview",
+    )
+    worker = DebyerPDFWorker(settings, preview_enabled=False)
+
+    assert worker._should_emit_preview(1, 10, True) is False
+
+    worker.set_preview_enabled(True)
+    assert worker._should_emit_preview(2, 10, False) is True
+    worker._emit_preview(object())
+    assert worker._should_emit_preview(3, 10, False) is False
+    assert worker._should_emit_preview(10, 10, True) is True
+
+    worker.set_preview_enabled(False)
+    assert worker._should_emit_preview(10, 10, True) is False
+
+
+def test_debyer_window_clamps_rejected_r_range_maximum_to_half_min_box(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    frames_dir = _build_frames_dir(tmp_path)
+    project_dir = tmp_path / "project"
+    window = DebyerPDFMainWindow()
+    window.project_dir_edit.setText(str(project_dir))
+    window.frames_dir_edit.setText(str(frames_dir))
+    window.filename_prefix_edit.setText("box_limited_pdf")
+    window.from_edit.setText("0.5")
+    window.to_edit.setText("15.0")
+    window.step_edit.setText("0.01")
+    window.box_a_edit.setText("20.0")
+    window.box_b_edit.setText("8.0")
+    window.box_c_edit.setText("12.0")
+    window.atom_count_edit.setText("3")
+
+    settings = window._build_settings()
+
+    assert settings.to_value == pytest.approx(4.0)
+    assert window.to_edit.text() == "4"
+    assert (
+        "half of the minimum box dimension"
+        in window.statusBar().currentMessage()
+    )
+    window.close()
+
+
+def test_debyer_window_defaults_solutes_from_inspected_frames(qapp, tmp_path):
+    del qapp
+    pb_i_frames = _build_frames_dir(tmp_path / "pb_i")
+    cs_pb_i_frames = _build_frames_dir(
+        tmp_path / "cs_pb_i",
+        xyz=(
+            "4\n"
+            "frame\n"
+            "Cs 0.0 0.0 0.0\n"
+            "Pb 2.0 0.0 0.0\n"
+            "I 0.0 2.0 0.0\n"
+            "I 0.0 0.0 2.0\n"
+        ),
+    )
+    window = DebyerPDFMainWindow()
+
+    window.frames_dir_edit.setText(str(pb_i_frames))
+    window._inspect_frames_dir()
+    assert window.solute_elements_edit.text() == "Pb, I"
+    assert "Default solutes: Pb, I" in window.frames_summary_label.text()
+
+    window.solute_elements_edit.clear()
+    window.frames_dir_edit.setText(str(cs_pb_i_frames))
+    window._inspect_frames_dir()
+    assert window.solute_elements_edit.text() == "Cs, Pb, I"
+    assert "Default solutes: Cs, Pb, I" in window.frames_summary_label.text()
+    window.close()
+
+
+def test_debyer_window_splitter_handle_is_grabbable(qapp):
+    del qapp
+    window = DebyerPDFMainWindow()
+
+    tab_names = [
+        window.result_tabs.tabText(index)
+        for index in range(window.result_tabs.count())
+    ]
+    assert "Shape Function Analysis" in tab_names
+    assert "Fit" in tab_names
+    assert tab_names.index("Shape Function Analysis") < tab_names.index("Fit")
+    assert window._main_splitter.handleWidth() >= 12
+    assert window._main_splitter.handle(1).toolTip()
+    assert window._main_splitter.widget(1).minimumSizeHint().width() < 800
+    assert (
+        window.findChild(QWidget, "pdfPlotControls").minimumSizeHint().width()
+        < 800
+    )
+    window.close()
+
+
+def test_debyer_window_fits_coordination_number_from_r_trace(qapp, tmp_path):
+    r_values = np.linspace(1.5, 3.5, 121)
+    expected_cn = 3.75
+    center = 2.55
+    sigma = 0.13
+    r_distribution = 0.2 + (
+        expected_cn
+        / (sigma * np.sqrt(2.0 * np.pi))
+        * np.exp(-0.5 * ((r_values - center) / sigma) ** 2)
+    )
+    calculation = DebyerPDFCalculation(
+        calculation_id="fit_demo",
+        calculation_dir=tmp_path,
+        created_at="2026-05-13T00:00:00",
+        project_dir=tmp_path,
+        frames_dir=tmp_path,
+        frame_format="xyz",
+        frame_count=1,
+        filename_prefix="fit_demo",
+        mode="RDF",
+        from_value=1.5,
+        to_value=3.5,
+        step_value=float(r_values[1] - r_values[0]),
+        box_dimensions=(20.0, 20.0, 20.0),
+        box_source=None,
+        box_source_kind=None,
+        atom_count=2,
+        rho0=1.0,
+        store_frame_outputs=False,
+        frame_output_dir=None,
+        averaged_output_file=tmp_path / "averaged_raw.txt",
+        solute_elements=("Pb",),
+        parallel_jobs=1,
+        r_values=r_values,
+        total_values=r_distribution,
+        partial_values={"Pb-I": r_distribution},
+    )
+    window = DebyerPDFMainWindow()
+    window._apply_loaded_calculation(calculation)
+    qapp.processEvents()
+
+    trace_index = window.coordination_fit_trace_combo.findData("partial:Pb-I")
+    assert trace_index >= 0
+    window.coordination_fit_trace_combo.setCurrentIndex(trace_index)
+    window.coordination_fit_r_min_spin.setValue(2.1)
+    window.coordination_fit_r_max_spin.setValue(3.0)
+    window.coordination_fit_center_spin.setValue(2.5)
+    window.coordination_fit_sigma_spin.setValue(0.12)
+    window._fit_coordination_number()
+    qapp.processEvents()
+
+    assert window.representation_combo.currentText() == "R(r)"
+    assert window.coordination_fit_results_table.rowCount() == 1
+    fitted_cn = float(window.coordination_fit_results_table.item(0, 5).text())
+    assert fitted_cn == pytest.approx(expected_cn, rel=0.05)
+    assert "CN =" in window.coordination_fit_status_label.text()
+    window.close()
+
+
+def test_debyer_window_applies_solute_groups_after_calculation(
+    qapp,
+    tmp_path,
+):
+    fake_debyer = _write_fake_debyer(tmp_path / "debyer")
+    frames_dir = _build_frames_dir(
+        tmp_path,
+        xyz=("2\n" "frame\n" "Na 0.0 0.0 0.0\n" "Cl 2.0 0.0 0.0\n"),
+    )
+    project_dir = tmp_path / "project"
+    result = DebyerPDFWorkflow(
+        DebyerPDFSettings(
+            project_dir=project_dir,
+            frames_dir=frames_dir,
+            filename_prefix="forgot_solutes",
+            mode="PDF",
+            from_value=0.5,
+            to_value=15.0,
+            step_value=0.01,
+            box_dimensions=(10.0, 10.0, 10.0),
+            atom_count=2,
+            store_frame_outputs=False,
+            solute_elements=(),
+        ),
+        debyer_executable=fake_debyer,
+    ).run()
+    assert result.solute_elements == ()
+
+    window = DebyerPDFMainWindow(initial_project_dir=project_dir)
+    qapp.processEvents()
+    assert not any(
+        window.trace_table.item(row, 3) is not None
+        and window.trace_table.item(row, 3).text() == "Group"
+        for row in range(window.trace_table.rowCount())
+    )
+
+    window.solute_elements_edit.setText("Pb")
+    window._apply_solute_groups_from_ui()
+    qapp.processEvents()
+
+    assert window._current_calculation is not None
+    assert window._current_calculation.solute_elements == ("Pb",)
+    assert any(
+        window.trace_table.item(row, 3) is not None
+        and window.trace_table.item(row, 3).text() == "Group"
+        and window.trace_table.item(row, 2) is not None
+        and window.trace_table.item(row, 2).text() == "solute-solvent"
+        for row in range(window.trace_table.rowCount())
+    )
+    loaded = load_debyer_calculation(result.calculation_dir)
+    assert loaded.solute_elements == ("Pb",)
+    _output_r, output_values = parse_debyer_output_file(
+        loaded.averaged_output_file
+    )
+    assert "solute-solute" in output_values
+    assert "solute-solvent" in output_values
+    assert "solvent-solvent" in output_values
+    assert sorted(loaded.partial_values) == ["I-I", "Pb-I", "Pb-Pb"]
+    assert "Solute elements: Pb" in window.calculation_info_label.text()
+    window.close()
+
+
+def test_debyer_workflow_cancellation_saves_partial_average(tmp_path):
+    fake_debyer = _write_fake_debyer(tmp_path / "debyer")
+    frames_dir = _build_frames_dir(tmp_path)
+    project_dir = tmp_path / "project"
+    stop_requested = {"value": False}
+    workflow = DebyerPDFWorkflow(
+        DebyerPDFSettings(
+            project_dir=project_dir,
+            frames_dir=frames_dir,
+            filename_prefix="cancelled_pdf",
+            mode="PDF",
+            from_value=0.5,
+            to_value=15.0,
+            step_value=0.01,
+            box_dimensions=(10.0, 10.0, 10.0),
+            atom_count=3,
+            store_frame_outputs=False,
+            solute_elements=("Pb",),
+        ),
+        debyer_executable=fake_debyer,
+    )
+
+    def request_stop_after_first_frame(processed, _total, _message):
+        if processed >= 1:
+            stop_requested["value"] = True
+
+    result = workflow.run(
+        progress_callback=request_stop_after_first_frame,
+        cancel_callback=lambda: stop_requested["value"],
+    )
+
+    assert result.processed_frame_count == 1
+    assert result.frame_count == 2
+    assert result.is_partial_average is True
+    assert np.allclose(result.total_values, np.array([1.0, 1.1, 1.2]))
+
+    loaded = load_debyer_calculation(result.calculation_dir)
+    assert loaded.processed_frame_count == 1
+    assert loaded.frame_count == 2
+    assert loaded.is_partial_average is True
+    assert np.allclose(loaded.total_values, result.total_values)
 
 
 def test_debyer_load_backfills_missing_peak_metadata(tmp_path):
@@ -288,6 +1263,20 @@ def test_debyer_window_loads_saved_calculation(qapp, tmp_path, monkeypatch):
     assert average_row is not None
     assert grouped_row is not None
     assert partial_row is not None
+    group_colors = {
+        key: window._trace_colors[key]
+        for key in (
+            "group:solute-solute",
+            "group:solute-solvent",
+            "group:solvent-solvent",
+        )
+    }
+    assert group_colors == {
+        "group:solute-solute": "#cc79a7",
+        "group:solute-solvent": "#e69f00",
+        "group:solvent-solvent": "#009e73",
+    }
+    assert len(set(group_colors.values())) == 3
     average_tag_box = window.trace_table.cellWidget(average_row, 1)
     grouped_tag_box = window.trace_table.cellWidget(grouped_row, 1)
     assert average_tag_box is not None
@@ -430,6 +1419,74 @@ def test_debyer_window_loads_saved_calculation(qapp, tmp_path, monkeypatch):
     assert (
         len(window._current_calculation.partial_peak_markers["Pb-I"])
         == original_marker_count
+    )
+    window.close()
+
+
+def test_debyer_window_loads_experimental_gr_trace(qapp, tmp_path):
+    fake_debyer = _write_fake_debyer(tmp_path / "debyer")
+    frames_dir = _build_frames_dir(tmp_path)
+    project_dir = tmp_path / "project"
+    workflow = DebyerPDFWorkflow(
+        DebyerPDFSettings(
+            project_dir=project_dir,
+            frames_dir=frames_dir,
+            filename_prefix="experimental_demo",
+            mode="PDF",
+            from_value=0.5,
+            to_value=15.0,
+            step_value=0.01,
+            box_dimensions=(12.0, 12.0, 12.0),
+            atom_count=3,
+            store_frame_outputs=False,
+            solute_elements=("Pb",),
+        ),
+        debyer_executable=fake_debyer,
+    )
+    workflow.run()
+    experimental_path = tmp_path / "experimental_gr.txt"
+    experimental_path.write_text(
+        "r(A) g(r)\n" "0.5 1.5\n" "1.0 1.65\n" "1.5 1.8\n",
+        encoding="utf-8",
+    )
+
+    window = DebyerPDFMainWindow(initial_project_dir=project_dir)
+    qapp.processEvents()
+    window._load_experimental_file(experimental_path)
+    qapp.processEvents()
+
+    experimental_row = None
+    for row in range(window.trace_table.rowCount()):
+        kind_item = window.trace_table.item(row, 3)
+        if kind_item is not None and kind_item.text() == "Experimental":
+            experimental_row = row
+            break
+    assert experimental_row is not None
+    visible_box = window.trace_table.cellWidget(experimental_row, 0)
+    assert visible_box is not None
+    assert visible_box.isChecked() is True
+    experimental_line = next(
+        line
+        for line in window.figure.axes[0].get_lines()
+        if line.get_label().startswith("Experimental g(r)")
+    )
+    assert experimental_line.get_linestyle() == "--"
+    assert "R^2 = 1.0000" in window._experimental_fit_metrics_text()
+    assert any(
+        "R^2 = 1.0000" in text_artist.get_text()
+        for text_artist in window.figure.axes[0].texts
+    )
+
+    window._toggle_experimental_trace()
+    qapp.processEvents()
+    assert window._trace_visibility["experimental"] is False
+    assert window.experimental_toggle_button.text() == "Show Experimental"
+
+    window.fit_box_checkbox.setChecked(False)
+    qapp.processEvents()
+    assert not any(
+        "R^2 =" in text_artist.get_text()
+        for text_artist in window.figure.axes[0].texts
     )
     window.close()
 

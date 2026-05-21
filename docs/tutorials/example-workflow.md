@@ -20,7 +20,7 @@ PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshel
 Use either a manual cutoff or the suggested one:
 
 ```bash
-PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 3
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 2
 ```
 
 ## Step 3: convert to PDB only if needed

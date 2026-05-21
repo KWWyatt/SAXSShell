@@ -27,7 +27,7 @@ class CP2KEnergyAnalyzer:
         self,
         temp_target_k: float,
         temp_tol_k: float = 1.0,
-        window: int = 10,
+        window: int = 2,
         kinetic_rel_std_max: float = 1.0e-3,
         potential_rel_std_max: float = 1.0e-3,
     ) -> SteadyStateResult:

@@ -36,12 +36,22 @@ class ExperimentalDataHeaderDialog(QDialog):
         file_path: str | Path,
         parent: QWidget | None = None,
         *,
+        title: str = "Check Experimental Data File",
+        independent_column_label: str = "q column",
+        dependent_column_label: str = "Intensity column",
+        error_column_label: str = "Error column",
+        intro_text: str | None = None,
         initial_header_rows: int | None = None,
         initial_q_column: int | None = None,
         initial_intensity_column: int | None = None,
         initial_error_column: int | None = None,
     ) -> None:
         super().__init__(parent)
+        self._dialog_title = title
+        self._independent_column_label = independent_column_label
+        self._dependent_column_label = dependent_column_label
+        self._error_column_label = error_column_label
+        self._intro_text = intro_text
         self.file_path = Path(file_path).expanduser().resolve()
         self._accepted_summary: ExperimentalDataSummary | None = None
         self._preview_lines = self._read_preview_lines()
@@ -76,7 +86,7 @@ class ExperimentalDataHeaderDialog(QDialog):
         return None if data is None else int(data)
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("Check Experimental Data File")
+        self.setWindowTitle(self._dialog_title)
         screen = QApplication.primaryScreen()
         if screen is None:
             self.resize(900, 600)
@@ -92,9 +102,13 @@ class ExperimentalDataHeaderDialog(QDialog):
 
         root = QVBoxLayout(self)
         intro_label = QLabel(
-            "The selected file could not be parsed directly. Adjust the "
-            "number of header rows to skip, confirm which columns correspond "
-            "to q, intensity, and error, and then load the file again."
+            self._intro_text
+            or (
+                "The selected file could not be parsed directly. Adjust the "
+                "number of header rows to skip, confirm which columns "
+                "correspond to q, intensity, and error, and then load the "
+                "file again."
+            )
         )
         intro_label.setWordWrap(True)
         root.addWidget(intro_label)
@@ -119,15 +133,18 @@ class ExperimentalDataHeaderDialog(QDialog):
 
         self.q_column_combo = QComboBox()
         self._configure_column_combo(self.q_column_combo)
-        form.addRow("q column", self.q_column_combo)
+        form.addRow(self._independent_column_label, self.q_column_combo)
 
         self.intensity_column_combo = QComboBox()
         self._configure_column_combo(self.intensity_column_combo)
-        form.addRow("Intensity column", self.intensity_column_combo)
+        form.addRow(
+            self._dependent_column_label,
+            self.intensity_column_combo,
+        )
 
         self.error_column_combo = QComboBox()
         self._configure_column_combo(self.error_column_combo)
-        form.addRow("Error column", self.error_column_combo)
+        form.addRow(self._error_column_label, self.error_column_combo)
         root.addLayout(form)
 
         self.preview_box = QPlainTextEdit()

@@ -36,6 +36,7 @@ class RMCSetupPaths:
     constraint_generation_path: Path
     packmol_plan_report_path: Path
     packmol_audit_report_path: Path
+    packmol_build_report_path: Path
     cluster_counts_csv_path: Path
     planned_count_weights_csv_path: Path
     planned_atom_weights_csv_path: Path
@@ -92,6 +93,9 @@ def build_rmcsetup_paths(
         packmol_audit_report_path=rmcsetup_dir
         / "reports"
         / "packmol_audit.md",
+        packmol_build_report_path=rmcsetup_dir
+        / "reports"
+        / "packmol_build_report.txt",
         cluster_counts_csv_path=rmcsetup_dir
         / "reports"
         / "cluster_counts.csv",

@@ -42,12 +42,15 @@ class TrajectoryManager:
         input_file: str | Path,
         topology_file: str | Path | None = None,
         backend: str = "auto",
+        *,
+        include_restart_duplicates: bool = False,
     ) -> None:
         self.input_file = Path(input_file)
         self.topology_file = (
             Path(topology_file) if topology_file is not None else None
         )
         self.backend_name = backend
+        self.include_restart_duplicates = bool(include_restart_duplicates)
         self.backend = self._build_backend()
         self.frames: list[FrameRecord] | None = None
 
@@ -58,6 +61,7 @@ class TrajectoryManager:
             return CP2KTrajectoryBackend(
                 input_file=self.input_file,
                 topology_file=self.topology_file,
+                include_restart_duplicates=self.include_restart_duplicates,
             )
 
         if self.backend_name == "auto":
@@ -65,11 +69,25 @@ class TrajectoryManager:
                 return CP2KTrajectoryBackend(
                     input_file=self.input_file,
                     topology_file=self.topology_file,
+                    include_restart_duplicates=(
+                        self.include_restart_duplicates
+                    ),
                 )
 
         raise ValueError(
             "Only CP2K .xyz/.pdb backend is implemented in this version."
         )
+
+    def set_include_restart_duplicates(
+        self,
+        include_restart_duplicates: bool,
+    ) -> None:
+        include_restart_duplicates = bool(include_restart_duplicates)
+        if self.include_restart_duplicates == include_restart_duplicates:
+            return
+        self.include_restart_duplicates = include_restart_duplicates
+        self.backend = self._build_backend()
+        self.frames = None
 
     def inspect(self) -> dict[str, object]:
         return self.backend.inspect()
@@ -189,6 +207,9 @@ class TrajectoryManager:
             return export_xyz_frames(
                 frames,
                 output_dir=output_dir,
+                allow_duplicate_frame_indices=(
+                    self.include_restart_duplicates
+                ),
                 progress_callback=progress_callback,
             )
 
@@ -224,6 +245,8 @@ class CP2KFrameExtractionWorkflow:
         self,
         trajectory_file: str | Path,
         energy_file: str | Path | None = None,
+        *,
+        include_restart_duplicates: bool = False,
     ) -> None:
         self.trajectory_file = Path(trajectory_file)
         self.energy_file = (
@@ -232,6 +255,7 @@ class CP2KFrameExtractionWorkflow:
         self.trajectory = TrajectoryManager(
             input_file=self.trajectory_file,
             backend="cp2k",
+            include_restart_duplicates=include_restart_duplicates,
         )
         self.energy_data: CP2KEnergyData | None = None
         self.steady_state: SteadyStateResult | None = None
@@ -249,7 +273,7 @@ class CP2KFrameExtractionWorkflow:
         self,
         temp_target_k: float,
         temp_tol_k: float = 1.0,
-        window: int = 10,
+        window: int = 2,
     ) -> SteadyStateResult:
         if self.energy_data is None:
             self.load_energy()

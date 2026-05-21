@@ -34,8 +34,8 @@ Example:
 
 ```bash
 PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory inspect traj.xyz --energy-file traj.ener
-PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory suggest-cutoff traj.xyz --energy-file traj.ener --temp-target-k 300 --window 3
-PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 3
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory suggest-cutoff traj.xyz --energy-file traj.ener --temp-target-k 300 --window 2
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 2
 ```
 
 When a cutoff is applied, the default folder name now uses the form
@@ -75,6 +75,36 @@ The cluster workflow supports both UI and CLI usage. Its CLI exposes separate
 
 The CLI help text explicitly calls out faster neighbor search modes such as
 `kdtree` and `vectorized`.
+
+### Project-backed cluster run files
+
+For repeatable project runs, launch the setup window and save a run file in the
+SAXSShell project folder:
+
+From the main SAXSShell window, use **Tools > CLI Setup > Open Cluster
+Extraction CLI Setup (Beta)**. The same setup window can also be launched from
+a terminal:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster setup-ui /path/to/saxs_project
+```
+
+The setup window records the project folder, extracted frames folder, output
+clusters folder, atom rules, pair cutoffs, PBC/box settings, shell options, and
+neighbor-search settings in `cluster_extraction_cli_run.json`. Paths inside the
+project are stored relative to the project folder so the project can move as a
+unit.
+
+After saving, run the extraction from the terminal:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster run /path/to/saxs_project
+```
+
+Use `--run-file custom_run.json` to run a different JSON file. Relative
+`--run-file` paths are resolved against the project folder. A completed run
+updates the project `clusters_dir` reference to the output folder while leaving
+the existing frames and PDB-frames references unchanged.
 
 ## `clusterdynamics`
 

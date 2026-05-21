@@ -1,5 +1,7 @@
 import pytest
 
+from saxshell.mdtrajectory.frame.base import FrameRecord
+from saxshell.mdtrajectory.frame.exporters import export_xyz_frames
 from saxshell.mdtrajectory.frame.manager import TrajectoryManager
 
 
@@ -238,3 +240,170 @@ def test_export_frames_keeps_exact_half_fs_cutoff_boundary(tmp_path):
     assert preview.first_time_fs == pytest.approx(497.5)
     assert written_files[0].name == "frame_0995.xyz"
     assert written_files[-1].name == "frame_1004.xyz"
+
+
+def test_cp2k_restart_overlap_frames_keep_later_source_index_occurrence(
+    tmp_path,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    trajectory_file.write_text(
+        "1\n"
+        "i = 0, time = 0.0, E = -1.0\n"
+        "H 0.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 1.0 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1.0, E = -1.0\n"
+        "H 2.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 9.0 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1.0, E = -1.0\n"
+        "H 9.0 0.0 0.0\n"
+        "1\n"
+        "i = 3, time = 1.5, E = -1.0\n"
+        "H 3.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    manager = TrajectoryManager(input_file=trajectory_file)
+    summary = manager.inspect()
+    preview = manager.preview_selection(min_time_fs=0.5)
+    written_files = manager.export_frames(
+        output_dir=tmp_path / "frames",
+        min_time_fs=0.5,
+    )
+
+    assert summary["n_frames"] == 4
+    assert summary["raw_frames"] == 6
+    assert summary["duplicate_source_frames"] == 2
+    assert preview.total_frames == 4
+    assert preview.selected_frames == 3
+    assert preview.first_frame_index == 1
+    assert preview.last_frame_index == 3
+    assert [path.name for path in written_files] == [
+        "frame_0001.xyz",
+        "frame_0002.xyz",
+        "frame_0003.xyz",
+    ]
+    assert "H        9.0" in written_files[0].read_text()
+    assert "H        9.0" in written_files[1].read_text()
+    assert "H        3.0" in written_files[2].read_text()
+
+
+def test_cp2k_restart_overlap_frames_can_include_duplicate_occurrences(
+    tmp_path,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    trajectory_file.write_text(
+        "1\n"
+        "i = 0, time = 0.0, E = -1.0\n"
+        "H 0.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 1.0 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1.0, E = -1.0\n"
+        "H 2.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 0.5, E = -1.0\n"
+        "H 9.1 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1.0, E = -1.0\n"
+        "H 9.2 0.0 0.0\n"
+        "1\n"
+        "i = 3, time = 1.5, E = -1.0\n"
+        "H 3.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    manager = TrajectoryManager(
+        input_file=trajectory_file,
+        include_restart_duplicates=True,
+    )
+    summary = manager.inspect()
+    preview = manager.preview_selection(min_time_fs=0.5)
+    written_files = manager.export_frames(
+        output_dir=tmp_path / "frames",
+        min_time_fs=0.5,
+    )
+
+    assert summary["n_frames"] == 6
+    assert summary["raw_frames"] == 6
+    assert summary["duplicate_source_frames"] == 2
+    assert summary["include_restart_duplicates"] is True
+    assert preview.total_frames == 6
+    assert preview.selected_frames == 5
+    assert [path.name for path in written_files] == [
+        "frame_0001_duplicate0001.xyz",
+        "frame_0002_duplicate0001.xyz",
+        "frame_0001.xyz",
+        "frame_0002.xyz",
+        "frame_0003.xyz",
+    ]
+    assert (
+        "H        1.0"
+        in (tmp_path / "frames" / "frame_0001_duplicate0001.xyz").read_text()
+    )
+    assert (
+        "H        9.1" in (tmp_path / "frames" / "frame_0001.xyz").read_text()
+    )
+    assert (
+        "H        2.0"
+        in (tmp_path / "frames" / "frame_0002_duplicate0001.xyz").read_text()
+    )
+    assert (
+        "H        9.2" in (tmp_path / "frames" / "frame_0002.xyz").read_text()
+    )
+
+
+def test_export_rejects_xyz_header_index_mismatch(tmp_path):
+    frame = FrameRecord(
+        frame_index=2559,
+        file_type="xyz",
+        atom_count=1,
+        lines=[
+            "i = 2501, time = 1250.5, E = -1.0\n",
+            "H 0.0 0.0 0.0\n",
+        ],
+        time_fs=1250.5,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="header reports i = 2501",
+    ):
+        export_xyz_frames([frame], tmp_path / "frames")
+
+
+def test_export_rejects_duplicate_xyz_output_names(tmp_path):
+    frames = [
+        FrameRecord(
+            frame_index=7,
+            file_type="xyz",
+            atom_count=1,
+            lines=[
+                "i = 7, time = 3.5, E = -1.0\n",
+                "H 0.0 0.0 0.0\n",
+            ],
+            time_fs=3.5,
+        ),
+        FrameRecord(
+            frame_index=7,
+            file_type="xyz",
+            atom_count=1,
+            lines=[
+                "i = 7, time = 3.5, E = -1.0\n",
+                "H 1.0 0.0 0.0\n",
+            ],
+            time_fs=3.5,
+        ),
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="same output file",
+    ):
+        export_xyz_frames(frames, tmp_path / "frames")
