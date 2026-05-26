@@ -2957,6 +2957,31 @@ class ExtractedFrameFolderClusterAnalyzer:
         atom_elements: dict[int, str] = {}
         active_runs = self._rebuild_smart_shell_run_states(frame_entries)
 
+        def finalize_smart_shell_runs(
+            runs: Sequence[_SmartShellRunState],
+        ) -> None:
+            for run in runs:
+                self._apply_smart_shell_union_to_run(
+                    run,
+                    frame_entries,
+                    elements=atom_elements,
+                )
+
+        def ensure_atom_elements_loaded() -> None:
+            if atom_elements:
+                return
+            for frame_path in frame_paths:
+                entry = frame_entries.get(frame_path.name)
+                if entry is None or not _frame_entry_is_processed(entry):
+                    continue
+                network = self._build_network(frame_path)
+                if not isinstance(network, ClusterNetwork):
+                    raise ValueError(
+                        "Smart Solvation Shell mode requires PDB frames."
+                    )
+                atom_elements.update(network.elements)
+                return
+
         def checkpoint_metadata(*, force: bool = False) -> None:
             nonlocal frames_since_checkpoint, last_checkpoint_time
             if not force:
@@ -2985,6 +3010,13 @@ class ExtractedFrameFolderClusterAnalyzer:
                         "Smart Solvation Shell mode requires PDB frames."
                     )
                 atom_elements.update(network.elements)
+                if active_runs and any(
+                    run.last_frame_index != frame_index - 1
+                    for run in active_runs.values()
+                ):
+                    finalize_smart_shell_runs(tuple(active_runs.values()))
+                    active_runs = {}
+
                 clusters = network.find_clusters(
                     shell_levels=shell_levels,
                     shared_shells=shared_shells,
@@ -3012,6 +3044,7 @@ class ExtractedFrameFolderClusterAnalyzer:
                 }
 
                 current_runs: dict[tuple[int, ...], _SmartShellRunState] = {}
+                continued_run_keys: set[tuple[int, ...]] = set()
                 for cluster in frame_result.clusters:
                     solute_atom_ids = cluster.solute_atom_ids
                     prior_run = active_runs.get(solute_atom_ids)
@@ -3020,6 +3053,7 @@ class ExtractedFrameFolderClusterAnalyzer:
                         and prior_run.last_frame_index == frame_index - 1
                     ):
                         run = prior_run
+                        continued_run_keys.add(solute_atom_ids)
                     else:
                         run = _SmartShellRunState(
                             solute_atom_ids=solute_atom_ids,
@@ -3038,12 +3072,12 @@ class ExtractedFrameFolderClusterAnalyzer:
                             run.shell_levels[atom_id] = shell_level
                     current_runs[solute_atom_ids] = run
 
-                for run in current_runs.values():
-                    self._apply_smart_shell_union_to_run(
-                        run,
-                        frame_entries,
-                        elements=atom_elements,
-                    )
+                closed_runs = [
+                    run
+                    for key, run in active_runs.items()
+                    if key not in continued_run_keys
+                ]
+                finalize_smart_shell_runs(closed_runs)
 
                 active_runs = current_runs
                 newly_processed_frames += 1
@@ -3057,6 +3091,11 @@ class ExtractedFrameFolderClusterAnalyzer:
                         total_frames,
                         frame_path.stem,
                     )
+
+            if active_runs:
+                ensure_atom_elements_loaded()
+                finalize_smart_shell_runs(tuple(active_runs.values()))
+                active_runs = {}
 
             metadata["state"] = "sorting"
             checkpoint_metadata(force=True)
@@ -3207,7 +3246,11 @@ class ExtractedFrameFolderClusterAnalyzer:
                     )
                 run.last_frame_index = frame_index
                 run.frame_refs.append((frame_name, cluster.cluster_id))
-                run.shell_levels = _cluster_shell_level_payload(cluster)
+                for atom_id, shell_level in _cluster_shell_level_payload(
+                    cluster
+                ).items():
+                    if atom_id not in run.shell_levels:
+                        run.shell_levels[atom_id] = shell_level
                 current_runs[solute_atom_ids] = run
             active_runs = current_runs
         return active_runs

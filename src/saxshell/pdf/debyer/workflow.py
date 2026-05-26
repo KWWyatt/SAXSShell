@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
+import os
 import shutil
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.optimize import curve_fit
 
 from saxshell.cluster.clusternetwork import (
     detect_frame_folder_mode,
@@ -29,8 +32,42 @@ TOTAL_SCATTERING_PAPER_URL = (
 SUPPORTED_DEBYER_MODES = ("PDF", "RDF", "rPDF")
 SUPPORTED_PLOT_REPRESENTATIONS = ("g(r)", "G(r)", "R(r)")
 DEFAULT_COLOR_SCHEMES = ("tab20", "tab10", "viridis", "plasma", "summer")
+GROUPED_PARTIAL_COLUMN_LABELS = (
+    "solute-solute",
+    "solute-solvent",
+    "solvent-solvent",
+)
 _COLUMN_PREFIX = "# columns:"
-_TIME_PREDICTION_UPDATE_INTERVAL_FRAMES = 5
+_DEFAULT_AVERAGE_CHECKPOINT_INTERVAL_FRAMES = 1000
+_MIN_AVERAGE_CHECKPOINT_INTERVAL_FRAMES = 100
+_RUNNING_AVERAGE_MEMORY_TARGET_BYTES = 256 * 1024 * 1024
+_MAX_PARALLEL_DEBYER_JOBS = 64
+
+
+def default_parallel_debyer_jobs(cpu_count: int | None = None) -> int:
+    available_cpus = os.cpu_count() if cpu_count is None else cpu_count
+    return max(1, min(4, int(available_cpus or 1)))
+
+
+def _coerce_parallel_debyer_jobs(value: object) -> int:
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        requested = 1
+    if requested <= 0:
+        requested = default_parallel_debyer_jobs()
+    return max(1, min(requested, _MAX_PARALLEL_DEBYER_JOBS))
+
+
+def _resolve_parallel_debyer_jobs(
+    value: object,
+    *,
+    total_frames: int,
+) -> int:
+    return min(
+        _coerce_parallel_debyer_jobs(value),
+        max(int(total_frames), 1),
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -68,6 +105,7 @@ class DebyerPDFSettings:
     atom_count: int = 0
     store_frame_outputs: bool = False
     solute_elements: tuple[str, ...] = ()
+    max_parallel_jobs: int = 1
 
 
 @dataclass(slots=True, frozen=True)
@@ -85,6 +123,32 @@ class DebyerPeakMarker:
     text_dx: float = 0.0
     text_dy: float = 0.0
     source: str = "auto"
+
+
+@dataclass(slots=True, frozen=True)
+class DebyerFitMetrics:
+    r_squared: float
+    rmse: float
+    mae: float
+    point_count: int
+    r_min: float
+    r_max: float
+
+
+@dataclass(slots=True, frozen=True)
+class DebyerCoordinationFitResult:
+    r_min: float
+    r_max: float
+    center: float
+    sigma: float
+    coordination_number: float
+    amplitude: float
+    baseline_intercept: float
+    baseline_slope: float
+    rmse: float
+    r_squared: float
+    point_count: int
+    fitted_values: np.ndarray
 
 
 @dataclass(slots=True, frozen=True)
@@ -121,6 +185,7 @@ class DebyerPDFCalculation:
     frame_output_dir: Path | None
     averaged_output_file: Path
     solute_elements: tuple[str, ...]
+    parallel_jobs: int
     r_values: np.ndarray
     total_values: np.ndarray
     partial_values: dict[str, np.ndarray]
@@ -152,12 +217,30 @@ def _normalize_solute_elements(
 ) -> tuple[str, ...]:
     if not values:
         return ()
-    normalized = {
-        _normalized_element(value)
-        for value in values
-        if _normalized_element(value)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        element = _normalized_element(value)
+        if not element or element in seen:
+            continue
+        normalized.append(element)
+        seen.add(element)
+    return tuple(normalized)
+
+
+def infer_default_solute_elements(
+    element_counts: dict[str, int] | list[str] | tuple[str, ...] | set[str],
+) -> tuple[str, ...]:
+    available = {
+        _normalized_element(element)
+        for element in element_counts
+        if _normalized_element(element)
     }
-    return tuple(sorted(normalized))
+    if {"Cs", "Pb", "I"}.issubset(available):
+        return ("Cs", "Pb", "I")
+    if {"Pb", "I"}.issubset(available):
+        return ("Pb", "I")
+    return ()
 
 
 def _sanitize_prefix(value: str) -> str:
@@ -398,17 +481,21 @@ def check_debyer_runtime(
 def inspect_frames_dir(frames_dir: str | Path) -> DebyerFrameInspection:
     resolved_frames_dir = Path(frames_dir).expanduser().resolve()
     frame_format, frame_paths = detect_frame_folder_mode(resolved_frames_dir)
+    if frame_format != "xyz":
+        raise ValueError(
+            "Debyer PDF calculations require XYZ frame files. Convert PDB "
+            "frames to XYZ before using pdfsetup."
+        )
     first_frame = frame_paths[0]
 
     detected_box_dimensions: tuple[float, float, float] | None = None
     detected_box_source: str | None = None
     detected_box_source_kind: str | None = None
-    if frame_format == "xyz":
-        detected = detect_source_box_dimensions(resolved_frames_dir)
-        if detected is not None:
-            detected_box_dimensions, source_path = detected
-            detected_box_source = source_path.name
-            detected_box_source_kind = "source_filename"
+    detected = detect_source_box_dimensions(resolved_frames_dir)
+    if detected is not None:
+        detected_box_dimensions, source_path = detected
+        detected_box_source = source_path.name
+        detected_box_source_kind = "source_filename"
 
     coordinates, elements = load_structure_file(first_frame)
     estimated_box_dimensions = estimate_box_dimensions_from_coordinates(
@@ -515,12 +602,27 @@ def _format_duration(seconds: float | None) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _time_prediction_interval(total_frames: int) -> int:
-    if total_frames <= 10:
-        return 1
-    return min(
-        _TIME_PREDICTION_UPDATE_INTERVAL_FRAMES, max(total_frames // 10, 1)
+def _average_checkpoint_interval(
+    *,
+    total_frames: int,
+    average_state_bytes: int = 0,
+) -> int:
+    resolved_total = max(int(total_frames), 1)
+    if average_state_bytes <= _RUNNING_AVERAGE_MEMORY_TARGET_BYTES:
+        return min(
+            _DEFAULT_AVERAGE_CHECKPOINT_INTERVAL_FRAMES,
+            resolved_total,
+        )
+    pressure = int(
+        math.ceil(
+            average_state_bytes / float(_RUNNING_AVERAGE_MEMORY_TARGET_BYTES)
+        )
     )
+    memory_interval = max(
+        _MIN_AVERAGE_CHECKPOINT_INTERVAL_FRAMES,
+        _DEFAULT_AVERAGE_CHECKPOINT_INTERVAL_FRAMES // max(pressure, 1),
+    )
+    return min(memory_interval, resolved_total)
 
 
 def _estimate_runtime(
@@ -550,6 +652,7 @@ def _build_averaged_output_metadata(
     elapsed_seconds: float | None,
     estimated_remaining_seconds: float | None,
     expected_total_seconds: float | None,
+    parallel_jobs: int | None = None,
 ) -> dict[str, object]:
     return {
         "calculation_id": calculation_id,
@@ -572,6 +675,11 @@ def _build_averaged_output_metadata(
         "rho0": f"{rho0:.8g}",
         "store_frame_outputs": settings.store_frame_outputs,
         "solute_elements": ", ".join(settings.solute_elements) or "None",
+        "parallel_jobs": int(
+            settings.max_parallel_jobs
+            if parallel_jobs is None
+            else parallel_jobs
+        ),
         "elapsed_seconds": (
             None
             if elapsed_seconds is None
@@ -627,6 +735,70 @@ def _average_frame_outputs(
         for key, series in stacked.items()
     }
     return reference_r, union_columns, averaged
+
+
+@dataclass(slots=True)
+class _RunningDebyerAverage:
+    reference_r: np.ndarray | None = None
+    column_order: list[str] = field(default_factory=lambda: ["sum"])
+    sums: dict[str, np.ndarray] = field(default_factory=dict)
+    processed_count: int = 0
+
+    def add_frame(
+        self,
+        r_values: np.ndarray,
+        columns: dict[str, np.ndarray],
+    ) -> None:
+        radial = np.asarray(r_values, dtype=float)
+        if self.reference_r is None:
+            self.reference_r = radial.copy()
+            self.sums = {
+                "sum": np.zeros_like(self.reference_r, dtype=float),
+            }
+        elif not np.allclose(self.reference_r, radial):
+            raise ValueError(
+                "Debyer frame outputs do not share the same radial grid."
+            )
+
+        for key in columns:
+            if key not in self.sums:
+                self.column_order.append(key)
+                self.sums[key] = np.zeros_like(self.reference_r, dtype=float)
+
+        for key, values in columns.items():
+            self.sums[key] += np.asarray(values, dtype=float)
+        self.processed_count += 1
+
+    @property
+    def memory_bytes(self) -> int:
+        total = 0
+        if self.reference_r is not None:
+            total += int(self.reference_r.nbytes)
+        total += sum(int(values.nbytes) for values in self.sums.values())
+        return total
+
+    def average(
+        self,
+    ) -> tuple[np.ndarray, list[str], dict[str, np.ndarray]]:
+        if self.reference_r is None or self.processed_count <= 0:
+            raise ValueError(
+                "No Debyer frame outputs were provided for averaging."
+            )
+        averaged = {
+            key: np.asarray(self.sums[key], dtype=float)
+            / float(self.processed_count)
+            for key in self.column_order
+        }
+        return self.reference_r.copy(), list(self.column_order), averaged
+
+
+@dataclass(slots=True, frozen=True)
+class _DebyerFrameRunResult:
+    frame_index: int
+    frame_path: Path
+    output_path: Path
+    r_values: np.ndarray
+    values: dict[str, np.ndarray]
 
 
 def _candidate_peak_indices(values: np.ndarray) -> list[int]:
@@ -768,6 +940,7 @@ def build_debyer_calculation_metadata(
         ),
         "averaged_output_file": str(calculation.averaged_output_file),
         "solute_elements": list(calculation.solute_elements),
+        "parallel_jobs": int(calculation.parallel_jobs),
         "elapsed_seconds": calculation.elapsed_seconds,
         "estimated_remaining_seconds": calculation.estimated_remaining_seconds,
         "expected_total_seconds": calculation.expected_total_seconds,
@@ -850,6 +1023,229 @@ def convert_distribution_values(
     return prefactor_r * (canonical_g - 1.0)
 
 
+def compute_experimental_fit_metrics(
+    *,
+    model_r_values: np.ndarray,
+    model_g_values: np.ndarray,
+    experimental_r_values: np.ndarray,
+    experimental_g_values: np.ndarray,
+) -> DebyerFitMetrics | None:
+    model_r = np.asarray(model_r_values, dtype=float)
+    model_g = np.asarray(model_g_values, dtype=float)
+    experimental_r = np.asarray(experimental_r_values, dtype=float)
+    experimental_g = np.asarray(experimental_g_values, dtype=float)
+    model_mask = np.isfinite(model_r) & np.isfinite(model_g)
+    experimental_mask = np.isfinite(experimental_r) & np.isfinite(
+        experimental_g
+    )
+    if model_mask.sum() < 2 or experimental_mask.sum() < 2:
+        return None
+
+    model_r = model_r[model_mask]
+    model_g = model_g[model_mask]
+    order = np.argsort(model_r)
+    model_r = model_r[order]
+    model_g = model_g[order]
+    unique_r, unique_indices = np.unique(model_r, return_index=True)
+    model_r = unique_r
+    model_g = model_g[unique_indices]
+    if model_r.size < 2:
+        return None
+
+    experimental_r = experimental_r[experimental_mask]
+    experimental_g = experimental_g[experimental_mask]
+    overlap_mask = (experimental_r >= model_r[0]) & (
+        experimental_r <= model_r[-1]
+    )
+    if overlap_mask.sum() < 2:
+        return None
+
+    overlap_r = experimental_r[overlap_mask]
+    overlap_g = experimental_g[overlap_mask]
+    interpolated_model = np.interp(overlap_r, model_r, model_g)
+    residuals = interpolated_model - overlap_g
+    sse = float(np.sum(residuals**2))
+    centered = overlap_g - float(np.mean(overlap_g))
+    sst = float(np.sum(centered**2))
+    r_squared = float("nan") if sst <= 0.0 else 1.0 - (sse / sst)
+    rmse = float(np.sqrt(np.mean(residuals**2)))
+    mae = float(np.mean(np.abs(residuals)))
+    return DebyerFitMetrics(
+        r_squared=r_squared,
+        rmse=rmse,
+        mae=mae,
+        point_count=int(overlap_r.size),
+        r_min=float(np.min(overlap_r)),
+        r_max=float(np.max(overlap_r)),
+    )
+
+
+def _coordination_gaussian_model(
+    radial: np.ndarray,
+    area: float,
+    center: float,
+    sigma: float,
+    baseline_intercept: float,
+    baseline_slope: float,
+    *,
+    baseline_pivot: float,
+) -> np.ndarray:
+    radial_values = np.asarray(radial, dtype=float)
+    bounded_sigma = max(float(sigma), 1.0e-12)
+    gaussian = (
+        float(area)
+        / (bounded_sigma * math.sqrt(2.0 * math.pi))
+        * np.exp(-0.5 * ((radial_values - center) / bounded_sigma) ** 2)
+    )
+    baseline = float(baseline_intercept) + float(baseline_slope) * (
+        radial_values - float(baseline_pivot)
+    )
+    return baseline + gaussian
+
+
+def fit_coordination_peak_from_r(
+    *,
+    r_values: np.ndarray,
+    r_distribution_values: np.ndarray,
+    r_min: float,
+    r_max: float,
+    initial_center: float | None = None,
+    initial_sigma: float | None = None,
+) -> DebyerCoordinationFitResult:
+    radial = np.asarray(r_values, dtype=float)
+    values = np.asarray(r_distribution_values, dtype=float)
+    if radial.shape != values.shape:
+        raise ValueError("R(r) fit inputs must share the same shape.")
+    if float(r_min) >= float(r_max):
+        raise ValueError("The R(r) fit minimum must be below maximum.")
+
+    mask = (
+        np.isfinite(radial)
+        & np.isfinite(values)
+        & (radial >= float(r_min))
+        & (radial <= float(r_max))
+    )
+    if mask.sum() < 5:
+        raise ValueError(
+            "At least five finite R(r) points are required inside the fit window."
+        )
+    fit_r = radial[mask]
+    fit_values = values[mask]
+    order = np.argsort(fit_r)
+    fit_r = fit_r[order]
+    fit_values = fit_values[order]
+
+    window_width = float(fit_r[-1] - fit_r[0])
+    if window_width <= 0.0:
+        raise ValueError("The R(r) fit window has zero radial width.")
+    edge_count = max(1, min(3, fit_r.size // 4))
+    left_r = float(np.mean(fit_r[:edge_count]))
+    right_r = float(np.mean(fit_r[-edge_count:]))
+    left_y = float(np.mean(fit_values[:edge_count]))
+    right_y = float(np.mean(fit_values[-edge_count:]))
+    baseline_slope = (
+        0.0
+        if abs(right_r - left_r) < 1.0e-12
+        else (right_y - left_y) / (right_r - left_r)
+    )
+    baseline_guess = left_y + baseline_slope * (fit_r - left_r)
+    residual_guess = fit_values - baseline_guess
+    center_guess = (
+        float(initial_center)
+        if initial_center is not None
+        else float(fit_r[int(np.nanargmax(residual_guess))])
+    )
+    center_guess = min(max(center_guess, float(fit_r[0])), float(fit_r[-1]))
+    sigma_guess = (
+        float(initial_sigma)
+        if initial_sigma is not None and float(initial_sigma) > 0.0
+        else max(window_width / 6.0, 1.0e-4)
+    )
+    sigma_guess = min(max(sigma_guess, 1.0e-4), window_width)
+    intercept_guess = float(left_y + baseline_slope * (center_guess - left_r))
+    positive_peak = np.maximum(residual_guess, 0.0)
+    if hasattr(np, "trapezoid"):
+        area_guess = float(np.trapezoid(positive_peak, fit_r))
+    else:
+        area_guess = float(
+            np.sum(
+                0.5 * (positive_peak[1:] + positive_peak[:-1]) * np.diff(fit_r)
+            )
+        )
+    if not np.isfinite(area_guess) or area_guess <= 0.0:
+        area_guess = (
+            max(float(np.nanmax(fit_values) - np.nanmin(fit_values)), 1.0e-6)
+            * window_width
+            / 3.0
+        )
+    baseline_pivot = center_guess
+
+    def model(
+        radial_values: np.ndarray,
+        area: float,
+        center: float,
+        sigma: float,
+        intercept: float,
+        slope: float,
+    ) -> np.ndarray:
+        return _coordination_gaussian_model(
+            radial_values,
+            area,
+            center,
+            sigma,
+            intercept,
+            slope,
+            baseline_pivot=baseline_pivot,
+        )
+
+    try:
+        params, _covariance = curve_fit(
+            model,
+            fit_r,
+            fit_values,
+            p0=[
+                area_guess,
+                center_guess,
+                sigma_guess,
+                intercept_guess,
+                baseline_slope,
+            ],
+            bounds=(
+                [0.0, float(fit_r[0]), 1.0e-6, -np.inf, -np.inf],
+                [np.inf, float(fit_r[-1]), window_width * 2.0, np.inf, np.inf],
+            ),
+            maxfev=20000,
+        )
+    except Exception as exc:
+        raise ValueError(f"R(r) coordination fit failed: {exc}") from exc
+
+    fitted_values = model(fit_r, *params)
+    residual = fit_values - fitted_values
+    rmse = float(np.sqrt(np.mean(residual**2)))
+    total_variance = float(np.sum((fit_values - np.mean(fit_values)) ** 2))
+    r_squared = (
+        float("nan")
+        if total_variance <= 1.0e-20
+        else 1.0 - float(np.sum(residual**2)) / total_variance
+    )
+    area, center, sigma, intercept, slope = [float(value) for value in params]
+    amplitude = area / (sigma * math.sqrt(2.0 * math.pi))
+    return DebyerCoordinationFitResult(
+        r_min=float(fit_r[0]),
+        r_max=float(fit_r[-1]),
+        center=center,
+        sigma=sigma,
+        coordination_number=area,
+        amplitude=float(amplitude),
+        baseline_intercept=intercept,
+        baseline_slope=slope,
+        rmse=rmse,
+        r_squared=r_squared,
+        point_count=int(fit_r.size),
+        fitted_values=np.asarray(fitted_values, dtype=float),
+    )
+
+
 def classify_partial_pair(
     pair_label: str,
     *,
@@ -869,6 +1265,20 @@ def classify_partial_pair(
     return "solute-solvent"
 
 
+def _is_grouped_partial_column(column_name: str) -> bool:
+    return str(column_name) in GROUPED_PARTIAL_COLUMN_LABELS
+
+
+def _raw_partial_values_from_output_values(
+    values: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    return {
+        key: np.asarray(value, dtype=float)
+        for key, value in values.items()
+        if not _is_grouped_partial_column(key)
+    }
+
+
 def build_grouped_partial_values(
     partial_values: dict[str, np.ndarray],
     *,
@@ -879,6 +1289,8 @@ def build_grouped_partial_values(
     normalized_solutes = set(_normalize_solute_elements(solute_elements))
     grouped: dict[str, np.ndarray] = {}
     for pair_label, values in partial_values.items():
+        if _is_grouped_partial_column(pair_label):
+            continue
         family = classify_partial_pair(
             pair_label,
             solute_elements=normalized_solutes,
@@ -891,6 +1303,137 @@ def build_grouped_partial_values(
         else:
             grouped[family] = current + np.asarray(values, dtype=float)
     return grouped
+
+
+def _output_values_with_grouped_partials(
+    *,
+    column_order: list[str],
+    values: dict[str, np.ndarray],
+    solute_elements: tuple[str, ...],
+) -> tuple[list[str], dict[str, np.ndarray]]:
+    cleaned_order = [
+        column
+        for column in column_order
+        if not _is_grouped_partial_column(column)
+    ]
+    cleaned_values = {
+        key: np.asarray(value, dtype=float)
+        for key, value in values.items()
+        if not _is_grouped_partial_column(key)
+    }
+    if not solute_elements:
+        return cleaned_order, cleaned_values
+
+    raw_partials = {
+        key: value for key, value in cleaned_values.items() if key != "sum"
+    }
+    grouped = build_grouped_partial_values(
+        raw_partials,
+        solute_elements=solute_elements,
+    )
+    output_values = dict(cleaned_values)
+    output_order = list(cleaned_order)
+    for label in GROUPED_PARTIAL_COLUMN_LABELS:
+        if label not in grouped:
+            continue
+        output_values[label] = np.asarray(grouped[label], dtype=float)
+        output_order.append(label)
+    return output_order, output_values
+
+
+def _build_averaged_output_metadata_from_calculation(
+    calculation: DebyerPDFCalculation,
+) -> dict[str, object]:
+    processed_frames = (
+        calculation.frame_count
+        if calculation.processed_frame_count is None
+        else int(calculation.processed_frame_count)
+    )
+    return {
+        "calculation_id": calculation.calculation_id,
+        "created_at": calculation.created_at,
+        "filename_prefix": calculation.filename_prefix,
+        "frames_dir": str(calculation.frames_dir),
+        "frame_format": calculation.frame_format,
+        "processed_frames": int(processed_frames),
+        "total_frames": int(calculation.frame_count),
+        "mode": calculation.mode,
+        "from_value": calculation.from_value,
+        "to_value": calculation.to_value,
+        "step_value": calculation.step_value,
+        "box_dimensions": ", ".join(
+            f"{component:.6g}" for component in calculation.box_dimensions
+        ),
+        "box_source": calculation.box_source or "estimated/manual",
+        "box_source_kind": calculation.box_source_kind or "estimate",
+        "atom_count": calculation.atom_count,
+        "rho0": f"{calculation.rho0:.8g}",
+        "store_frame_outputs": calculation.store_frame_outputs,
+        "solute_elements": (", ".join(calculation.solute_elements) or "None"),
+        "parallel_jobs": int(calculation.parallel_jobs),
+        "elapsed_seconds": (
+            None
+            if calculation.elapsed_seconds is None
+            else f"{float(calculation.elapsed_seconds):.6f}"
+        ),
+        "estimated_remaining_seconds": (
+            None
+            if calculation.estimated_remaining_seconds is None
+            else f"{float(calculation.estimated_remaining_seconds):.6f}"
+        ),
+        "expected_total_seconds": (
+            None
+            if calculation.expected_total_seconds is None
+            else f"{float(calculation.expected_total_seconds):.6f}"
+        ),
+        "elapsed_hms": _format_duration(calculation.elapsed_seconds),
+        "remaining_hms": _format_duration(
+            calculation.estimated_remaining_seconds
+        ),
+        "expected_total_hms": _format_duration(
+            calculation.expected_total_seconds
+        ),
+    }
+
+
+def rewrite_debyer_calculation_output(
+    calculation: DebyerPDFCalculation,
+) -> None:
+    column_order = ["sum"]
+    if calculation.averaged_output_file.is_file():
+        try:
+            parsed_order = _parse_columns_from_comments(
+                calculation.averaged_output_file
+            )
+        except Exception:
+            parsed_order = []
+        column_order = [
+            column
+            for column in parsed_order
+            if column == "sum" or column in calculation.partial_values
+        ] or ["sum"]
+    for pair_label in sorted(calculation.partial_values):
+        if pair_label not in column_order:
+            column_order.append(pair_label)
+    values = {
+        "sum": np.asarray(calculation.total_values, dtype=float),
+        **{
+            key: np.asarray(value, dtype=float)
+            for key, value in calculation.partial_values.items()
+        },
+    }
+    output_order, output_values = _output_values_with_grouped_partials(
+        column_order=column_order,
+        values=values,
+        solute_elements=calculation.solute_elements,
+    )
+    save_averaged_debyer_output(
+        calculation.averaged_output_file,
+        r_values=calculation.r_values,
+        column_order=output_order,
+        values=output_values,
+        metadata=_build_averaged_output_metadata_from_calculation(calculation),
+    )
 
 
 def build_display_traces(
@@ -967,10 +1510,7 @@ def load_debyer_calculation(
     averaged_output_file = Path(payload["averaged_output_file"]).resolve()
     r_values, raw_values = parse_debyer_output_file(averaged_output_file)
     total_values = np.asarray(raw_values.pop("sum"), dtype=float)
-    partial_values = {
-        key: np.asarray(value, dtype=float)
-        for key, value in raw_values.items()
-    }
+    partial_values = _raw_partial_values_from_output_values(raw_values)
     peak_finder_settings = _coerce_peak_finder_settings(
         payload.get("peak_finder_settings")
     )
@@ -1026,6 +1566,9 @@ def load_debyer_calculation(
         averaged_output_file=averaged_output_file,
         solute_elements=_normalize_solute_elements(
             payload.get("solute_elements", [])
+        ),
+        parallel_jobs=_coerce_parallel_debyer_jobs(
+            payload.get("parallel_jobs", 1)
         ),
         r_values=r_values,
         total_values=total_values,
@@ -1120,6 +1663,9 @@ class DebyerPDFWorkflow:
             solute_elements=_normalize_solute_elements(
                 settings.solute_elements
             ),
+            max_parallel_jobs=_coerce_parallel_debyer_jobs(
+                settings.max_parallel_jobs
+            ),
         )
         self.debyer_executable = (
             None
@@ -1143,6 +1689,42 @@ class DebyerPDFWorkflow:
             )
         return self._cached_inspection
 
+    def _run_debyer_frame(
+        self,
+        *,
+        frame_index: int,
+        frame_path: Path,
+        output_path: Path,
+        rho0: float,
+        executable_path: Path | None,
+    ) -> _DebyerFrameRunResult:
+        command = self._build_command(
+            input_file=frame_path,
+            output_file=output_path,
+            rho0=rho0,
+            executable_path=executable_path,
+        )
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"Debyer failed on {frame_path.name}: "
+                + (completed.stderr.strip() or completed.stdout.strip())
+            )
+        frame_r_values, frame_values = parse_debyer_output_file(output_path)
+        return _DebyerFrameRunResult(
+            frame_index=frame_index,
+            frame_path=frame_path,
+            output_path=output_path,
+            r_values=frame_r_values,
+            values=frame_values,
+        )
+
     def run(
         self,
         *,
@@ -1150,12 +1732,25 @@ class DebyerPDFWorkflow:
         log_callback: Callable[[str], None] | None = None,
         status_callback: Callable[[str], None] | None = None,
         preview_callback: Callable[[DebyerPDFCalculation], None] | None = None,
+        preview_decision_callback: (
+            Callable[[int, int, bool], bool] | None
+        ) = None,
+        cancel_callback: Callable[[], bool] | None = None,
     ) -> DebyerPDFCalculation:
         runtime_status = self.check_runtime()
         if not runtime_status.runnable:
             raise RuntimeError(runtime_status.message)
 
         inspection = self.inspect_frames()
+        if not self.settings.solute_elements:
+            inferred_solutes = infer_default_solute_elements(
+                inspection.element_counts
+            )
+            if inferred_solutes:
+                self.settings = replace(
+                    self.settings,
+                    solute_elements=inferred_solutes,
+                )
         calculation_id = _build_calculation_id(self.settings.filename_prefix)
         created_at = (
             datetime.now(timezone.utc)
@@ -1177,13 +1772,20 @@ class DebyerPDFWorkflow:
         )
         peak_finder_settings = DebyerPeakFinderSettings()
         total_frames = len(inspection.frame_paths)
-        prediction_interval = _time_prediction_interval(total_frames)
+        parallel_jobs = _resolve_parallel_debyer_jobs(
+            self.settings.max_parallel_jobs,
+            total_frames=total_frames,
+        )
         if status_callback is not None:
             status_callback("Running Debyer over trajectory frames")
         if log_callback is not None:
             log_callback(
                 "Starting Debyer "
                 f"{self.settings.mode} calculation on {total_frames} frames"
+            )
+            log_callback(
+                f"Running up to {parallel_jobs} Debyer "
+                f"{'job' if parallel_jobs == 1 else 'jobs'} in parallel"
             )
             log_callback(
                 "Bounding box: "
@@ -1194,81 +1796,127 @@ class DebyerPDFWorkflow:
                 + f" A; rho0={rho0:.6g} atoms/A^3"
             )
 
-        averaged_inputs: list[tuple[np.ndarray, dict[str, np.ndarray]]] = []
+        running_average = _RunningDebyerAverage()
         start_time = time.monotonic()
         last_verbose_log = time.monotonic()
+        checkpoint_interval = _average_checkpoint_interval(
+            total_frames=total_frames,
+        )
         latest_preview: DebyerPDFCalculation | None = None
-        for index, frame_path in enumerate(inspection.frame_paths, start=1):
+        cancelled = False
+        frame_iterator = iter(enumerate(inspection.frame_paths, start=1))
+        active_futures: dict[
+            concurrent.futures.Future[_DebyerFrameRunResult],
+            int,
+        ] = {}
+
+        def submit_next_frame(
+            executor: concurrent.futures.ThreadPoolExecutor,
+        ) -> bool:
+            try:
+                frame_index, frame_path = next(frame_iterator)
+            except StopIteration:
+                return False
             output_path = frame_output_dir / f"{frame_path.stem}.txt"
-            command = self._build_command(
-                input_file=frame_path,
-                output_file=output_path,
+            future = executor.submit(
+                self._run_debyer_frame,
+                frame_index=frame_index,
+                frame_path=frame_path,
+                output_path=output_path,
                 rho0=rho0,
                 executable_path=runtime_status.executable_path,
             )
-            completed = subprocess.run(
-                command,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+            active_futures[future] = frame_index
+            return True
+
+        def process_frame_result(
+            frame_result: _DebyerFrameRunResult,
+        ) -> None:
+            nonlocal checkpoint_interval, latest_preview, last_verbose_log
+            running_average.add_frame(
+                frame_result.r_values,
+                frame_result.values,
             )
-            if completed.returncode != 0:
-                raise RuntimeError(
-                    f"Debyer failed on {frame_path.name}: "
-                    + (completed.stderr.strip() or completed.stdout.strip())
-                )
-            averaged_inputs.append(parse_debyer_output_file(output_path))
+            processed_frames = running_average.processed_count
+            checkpoint_interval = _average_checkpoint_interval(
+                total_frames=total_frames,
+                average_state_bytes=running_average.memory_bytes,
+            )
             elapsed_seconds = time.monotonic() - start_time
             (
                 estimated_remaining_seconds,
                 expected_total_seconds,
             ) = _estimate_runtime(
-                processed_frames=index,
+                processed_frames=processed_frames,
                 total_frames=total_frames,
                 elapsed_seconds=elapsed_seconds,
             )
 
-            if not self.settings.store_frame_outputs and output_path.exists():
-                output_path.unlink()
+            if (
+                not self.settings.store_frame_outputs
+                and frame_result.output_path.exists()
+            ):
+                frame_result.output_path.unlink()
             if progress_callback is not None:
                 progress_message = (
-                    f"Processed {index}/{total_frames} frames | "
+                    f"Processed {processed_frames}/{total_frames} frames | "
                     f"elapsed {_format_duration(elapsed_seconds)} | "
                     f"remaining {_format_duration(estimated_remaining_seconds)}"
                 )
                 progress_callback(
-                    index,
+                    processed_frames,
                     total_frames,
                     progress_message,
                 )
-            should_refresh_average = (
-                index == 1
-                or index == total_frames
-                or index % prediction_interval == 0
+            checkpoint_due = (
+                processed_frames == total_frames
+                or processed_frames % checkpoint_interval == 0
             )
+            should_refresh_average = checkpoint_due
+            if (
+                preview_callback is not None
+                and preview_decision_callback is not None
+            ):
+                should_refresh_average = bool(
+                    preview_decision_callback(
+                        processed_frames,
+                        total_frames,
+                        checkpoint_due,
+                    )
+                )
             if should_refresh_average:
                 (
                     preview_r_values,
                     preview_column_order,
                     preview_values,
-                ) = _average_frame_outputs(averaged_inputs)
+                ) = running_average.average()
+                (
+                    preview_output_column_order,
+                    preview_output_values,
+                ) = _output_values_with_grouped_partials(
+                    column_order=preview_column_order,
+                    values=preview_values,
+                    solute_elements=self.settings.solute_elements,
+                )
                 save_averaged_debyer_output(
                     averaged_output_file,
                     r_values=preview_r_values,
-                    column_order=preview_column_order,
-                    values=preview_values,
+                    column_order=preview_output_column_order,
+                    values=preview_output_values,
                     metadata=_build_averaged_output_metadata(
                         calculation_id=calculation_id,
                         created_at=created_at,
                         settings=self.settings,
                         inspection=inspection,
                         rho0=rho0,
-                        processed_frames=index,
+                        processed_frames=processed_frames,
                         total_frames=total_frames,
                         elapsed_seconds=elapsed_seconds,
-                        estimated_remaining_seconds=estimated_remaining_seconds,
+                        estimated_remaining_seconds=(
+                            estimated_remaining_seconds
+                        ),
                         expected_total_seconds=expected_total_seconds,
+                        parallel_jobs=parallel_jobs,
                     ),
                 )
                 latest_preview = DebyerPDFCalculation(
@@ -1293,6 +1941,7 @@ class DebyerPDFWorkflow:
                     frame_output_dir=frame_output_dir,
                     averaged_output_file=averaged_output_file,
                     solute_elements=self.settings.solute_elements,
+                    parallel_jobs=parallel_jobs,
                     r_values=preview_r_values,
                     total_values=np.asarray(
                         preview_values["sum"],
@@ -1301,10 +1950,10 @@ class DebyerPDFWorkflow:
                     partial_values={
                         key: np.asarray(value, dtype=float)
                         for key, value in preview_values.items()
-                        if key != "sum"
+                        if key != "sum" and not _is_grouped_partial_column(key)
                     },
-                    processed_frame_count=index,
-                    is_partial_average=index < total_frames,
+                    processed_frame_count=processed_frames,
+                    is_partial_average=processed_frames < total_frames,
                     elapsed_seconds=elapsed_seconds,
                     estimated_remaining_seconds=estimated_remaining_seconds,
                     expected_total_seconds=expected_total_seconds,
@@ -1316,18 +1965,63 @@ class DebyerPDFWorkflow:
                     preview_callback(latest_preview)
             if log_callback is not None:
                 should_log = (
-                    index == 1
-                    or index == total_frames
+                    processed_frames == 1
+                    or processed_frames == total_frames
                     or (time.monotonic() - last_verbose_log) >= 5.0
                 )
                 if should_log:
+                    checkpoint_text = (
+                        f"; checkpoint every {checkpoint_interval} frames"
+                        if processed_frames == 1
+                        else ""
+                    )
                     log_callback(
-                        f"Processed {index}/{total_frames} frames "
-                        f"({frame_path.name}) | elapsed "
+                        f"Processed {processed_frames}/{total_frames} frames "
+                        f"({frame_result.frame_path.name}) | elapsed "
                         f"{_format_duration(elapsed_seconds)} | remaining "
                         f"{_format_duration(estimated_remaining_seconds)}"
+                        f"{checkpoint_text}"
                     )
                     last_verbose_log = time.monotonic()
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=parallel_jobs,
+            thread_name_prefix="debyer-pdf",
+        ) as executor:
+            for _worker_index in range(parallel_jobs):
+                if not submit_next_frame(executor):
+                    break
+            while active_futures:
+                done_futures, _pending_futures = concurrent.futures.wait(
+                    active_futures,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done_futures:
+                    active_futures.pop(future, None)
+                    process_frame_result(future.result())
+                    if (
+                        cancel_callback is not None
+                        and cancel_callback()
+                        and running_average.processed_count < total_frames
+                    ):
+                        if not cancelled:
+                            cancelled = True
+                            if log_callback is not None:
+                                active_count = len(active_futures)
+                                suffix = (
+                                    f" Waiting for {active_count} active "
+                                    "Debyer job(s) to finish."
+                                    if active_count
+                                    else ""
+                                )
+                                log_callback(
+                                    "Debyer calculation stop requested; saving "
+                                    "the current average after "
+                                    f"{running_average.processed_count}/"
+                                    f"{total_frames} frames.{suffix}"
+                                )
+                    if not cancelled:
+                        submit_next_frame(executor)
 
         if (
             not self.settings.store_frame_outputs
@@ -1339,38 +2033,46 @@ class DebyerPDFWorkflow:
         else:
             stored_frame_output_dir = frame_output_dir
 
+        processed_frame_count = running_average.processed_count
         if (
             latest_preview is None
-            or latest_preview.processed_frame_count != total_frames
+            or latest_preview.processed_frame_count != processed_frame_count
         ):
             elapsed_seconds = time.monotonic() - start_time
             (
                 estimated_remaining_seconds,
                 expected_total_seconds,
             ) = _estimate_runtime(
-                processed_frames=total_frames,
+                processed_frames=processed_frame_count,
                 total_frames=total_frames,
                 elapsed_seconds=elapsed_seconds,
             )
-            r_values, column_order, averaged_values = _average_frame_outputs(
-                averaged_inputs
+            r_values, column_order, averaged_values = running_average.average()
+            (
+                output_column_order,
+                output_values,
+            ) = _output_values_with_grouped_partials(
+                column_order=column_order,
+                values=averaged_values,
+                solute_elements=self.settings.solute_elements,
             )
             save_averaged_debyer_output(
                 averaged_output_file,
                 r_values=r_values,
-                column_order=column_order,
-                values=averaged_values,
+                column_order=output_column_order,
+                values=output_values,
                 metadata=_build_averaged_output_metadata(
                     calculation_id=calculation_id,
                     created_at=created_at,
                     settings=self.settings,
                     inspection=inspection,
                     rho0=rho0,
-                    processed_frames=total_frames,
+                    processed_frames=processed_frame_count,
                     total_frames=total_frames,
                     elapsed_seconds=elapsed_seconds,
-                    estimated_remaining_seconds=estimated_remaining_seconds,
+                    estimated_remaining_seconds=(estimated_remaining_seconds),
                     expected_total_seconds=expected_total_seconds,
+                    parallel_jobs=parallel_jobs,
                 ),
             )
         else:
@@ -1386,10 +2088,9 @@ class DebyerPDFWorkflow:
         final_total_values = np.asarray(
             final_raw_values.pop("sum"), dtype=float
         )
-        final_partial_values = {
-            key: np.asarray(value, dtype=float)
-            for key, value in final_raw_values.items()
-        }
+        final_partial_values = _raw_partial_values_from_output_values(
+            final_raw_values
+        )
         final_calculation = DebyerPDFCalculation(
             calculation_id=calculation_id,
             calculation_dir=calculation_dir,
@@ -1412,11 +2113,12 @@ class DebyerPDFWorkflow:
             frame_output_dir=stored_frame_output_dir,
             averaged_output_file=averaged_output_file,
             solute_elements=self.settings.solute_elements,
+            parallel_jobs=parallel_jobs,
             r_values=final_r_values,
             total_values=final_total_values,
             partial_values=final_partial_values,
-            processed_frame_count=total_frames,
-            is_partial_average=False,
+            processed_frame_count=processed_frame_count,
+            is_partial_average=processed_frame_count < total_frames,
             elapsed_seconds=elapsed_seconds,
             estimated_remaining_seconds=estimated_remaining_seconds,
             expected_total_seconds=expected_total_seconds,
@@ -1434,7 +2136,11 @@ class DebyerPDFWorkflow:
                 f"Saved averaged Debyer output to {averaged_output_file}"
             )
         if status_callback is not None:
-            status_callback("Debyer calculation complete")
+            status_callback(
+                "Debyer calculation stopped early"
+                if cancelled
+                else "Debyer calculation complete"
+            )
         return final_calculation
 
     def _build_command(
@@ -1471,8 +2177,11 @@ class DebyerPDFWorkflow:
 __all__ = [
     "DEBYER_DOCS_URL",
     "DEBYER_GITHUB_URL",
-    "TOTAL_SCATTERING_PAPER_URL",
     "DEFAULT_COLOR_SCHEMES",
+    "GROUPED_PARTIAL_COLUMN_LABELS",
+    "TOTAL_SCATTERING_PAPER_URL",
+    "DebyerCoordinationFitResult",
+    "DebyerFitMetrics",
     "DebyerFrameInspection",
     "DebyerPeakFinderSettings",
     "DebyerPeakMarker",
@@ -1489,13 +2198,18 @@ __all__ = [
     "calculate_number_density",
     "check_debyer_runtime",
     "classify_partial_pair",
+    "compute_experimental_fit_metrics",
     "convert_distribution_values",
+    "default_parallel_debyer_jobs",
     "estimate_partial_peak_markers",
     "find_partial_peak_markers",
+    "fit_coordination_peak_from_r",
+    "infer_default_solute_elements",
     "inspect_frames_dir",
     "list_saved_debyer_calculations",
     "load_debyer_calculation",
     "parse_debyer_output_file",
+    "rewrite_debyer_calculation_output",
     "save_averaged_debyer_output",
     "write_debyer_calculation_metadata",
 ]

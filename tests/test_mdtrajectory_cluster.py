@@ -425,6 +425,135 @@ def test_smart_solvation_shells_keep_union_across_contiguous_pdb_frames(
         } == {10, 11}
 
 
+def test_smart_solvation_shell_updates_scale_linearly_for_contiguous_runs(
+    tmp_path,
+    monkeypatch,
+):
+    frames_dir = tmp_path / "splitpdb0001"
+    frames_dir.mkdir()
+    frame_count = 12
+    for frame_index in range(frame_count):
+        if frame_index % 2 == 0:
+            residue10_y = 1.0
+            residue11_y = 4.0
+        else:
+            residue10_y = 4.0
+            residue11_y = 1.0
+        (frames_dir / f"frame_{frame_index:04d}.pdb").write_text(
+            "".join(
+                _smart_shell_frame_lines(
+                    residue10_y=residue10_y,
+                    residue11_y=residue11_y,
+                )
+            )
+        )
+
+    touched_frame_refs = 0
+    original_apply = (
+        cluster_module.ExtractedFrameFolderClusterAnalyzer._apply_smart_shell_union_to_run
+    )
+
+    def counted_apply(self, run, frame_entries, *, elements):
+        nonlocal touched_frame_refs
+        touched_frame_refs += len(run.frame_refs)
+        return original_apply(
+            self,
+            run,
+            frame_entries,
+            elements=elements,
+        )
+
+    monkeypatch.setattr(
+        cluster_module.ExtractedFrameFolderClusterAnalyzer,
+        "_apply_smart_shell_union_to_run",
+        counted_apply,
+    )
+    analyzer = ExtractedFrameFolderClusterAnalyzer(
+        frames_dir=frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoffs_def=PAIR_CUTOFFS,
+        smart_solvation_shells=True,
+    )
+
+    export = analyzer.export_cluster_pdbs(
+        tmp_path / "clusters_from_folder",
+        shell_levels=(1,),
+        include_shell_levels=(0, 1),
+    )
+
+    assert touched_frame_refs == frame_count
+    assert len(export.frame_results) == frame_count
+    for path in export.written_files:
+        structure = PDBStructure.from_file(path)
+        assert {
+            atom.residue_number
+            for atom in structure.atoms
+            if atom.residue_name == "WAT"
+        } == {10, 11}
+
+
+def test_smart_solvation_shell_resume_preserves_deferred_unions(tmp_path):
+    frames_dir = tmp_path / "splitpdb0001"
+    frames_dir.mkdir()
+    for frame_index in range(4):
+        if frame_index % 2 == 0:
+            residue10_y = 1.0
+            residue11_y = 4.0
+        else:
+            residue10_y = 4.0
+            residue11_y = 1.0
+        (frames_dir / f"frame_{frame_index:04d}.pdb").write_text(
+            "".join(
+                _smart_shell_frame_lines(
+                    residue10_y=residue10_y,
+                    residue11_y=residue11_y,
+                )
+            )
+        )
+    output_dir = tmp_path / "clusters_from_folder"
+    analyzer = ExtractedFrameFolderClusterAnalyzer(
+        frames_dir=frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoffs_def=PAIR_CUTOFFS,
+        smart_solvation_shells=True,
+    )
+
+    def stop_after_second_frame(processed, total, frame_label):
+        if processed >= 2 and frame_label != "resume":
+            raise RuntimeError("stop after two frames")
+
+    with pytest.raises(RuntimeError, match="stop after two frames"):
+        analyzer.export_cluster_files(
+            output_dir,
+            shell_levels=(1,),
+            include_shell_levels=(0, 1),
+            progress_callback=stop_after_second_frame,
+        )
+
+    interrupted = json.loads(
+        (output_dir / "cluster_extraction_metadata.json").read_text()
+    )
+    assert interrupted["state"] == "failed"
+    assert interrupted["progress"]["completed_frames"] == 2
+
+    resumed = analyzer.export_cluster_files(
+        output_dir,
+        shell_levels=(1,),
+        include_shell_levels=(0, 1),
+    )
+
+    assert resumed.resumed
+    assert resumed.previously_completed_frames == 2
+    assert resumed.newly_processed_frames == 2
+    for path in resumed.written_files:
+        structure = PDBStructure.from_file(path)
+        assert {
+            atom.residue_number
+            for atom in structure.atoms
+            if atom.residue_name == "WAT"
+        } == {10, 11}
+
+
 def test_legacy_solvation_shells_preserve_per_frame_pdb_cutoffs(tmp_path):
     frames_dir = tmp_path / "splitpdb0001"
     frames_dir.mkdir()

@@ -74,6 +74,7 @@ class InspectionWorker(QObject):
         manager: TrajectoryManager | None = None,
         summary: dict[str, object] | None = None,
         reload_trajectory: bool = True,
+        include_restart_duplicates: bool = False,
     ) -> None:
         super().__init__()
         self.trajectory_file = trajectory_file
@@ -82,6 +83,7 @@ class InspectionWorker(QObject):
         self.manager = manager
         self.summary = summary
         self.reload_trajectory = reload_trajectory
+        self.include_restart_duplicates = bool(include_restart_duplicates)
 
     @Slot()
     def run(self) -> None:
@@ -104,6 +106,9 @@ class InspectionWorker(QObject):
                     input_file=self.trajectory_file,
                     topology_file=self.topology_file,
                     backend="auto",
+                    include_restart_duplicates=(
+                        self.include_restart_duplicates
+                    ),
                 )
                 summary = manager.inspect()
                 completed_steps += 1
@@ -474,6 +479,9 @@ class MDTrajectoryMainWindow(QMainWindow):
             previous_trajectory = self.state.trajectory_file
             previous_topology = self.state.topology_file
             previous_energy = self.state.energy_file
+            previous_include_restart_duplicates = (
+                self.state.include_restart_duplicates
+            )
 
             if trajectory_file is None:
                 raise ValueError("No trajectory file selected.")
@@ -482,6 +490,8 @@ class MDTrajectoryMainWindow(QMainWindow):
                 self.manager is None
                 or trajectory_file != previous_trajectory
                 or topology_file != previous_topology
+                or self.export_panel.include_restart_duplicates()
+                != previous_include_restart_duplicates
             )
             energy_changed = energy_file != previous_energy
 
@@ -491,6 +501,9 @@ class MDTrajectoryMainWindow(QMainWindow):
             self.state.start = self.trajectory_panel.get_start()
             self.state.stop = self.trajectory_panel.get_stop()
             self.state.stride = self.trajectory_panel.get_stride()
+            self.state.include_restart_duplicates = (
+                self.export_panel.include_restart_duplicates()
+            )
             self._update_suggested_output_dir()
             registration_message = self._register_project_file_inputs()
             if registration_message is not None:
@@ -525,6 +538,9 @@ class MDTrajectoryMainWindow(QMainWindow):
                     topology_file=topology_file,
                     energy_file=energy_file,
                     reload_trajectory=True,
+                    include_restart_duplicates=(
+                        self.state.include_restart_duplicates
+                    ),
                 )
                 return
 
@@ -549,6 +565,9 @@ class MDTrajectoryMainWindow(QMainWindow):
                     manager=self.manager,
                     summary=self._last_summary,
                     reload_trajectory=False,
+                    include_restart_duplicates=(
+                        self.state.include_restart_duplicates
+                    ),
                 )
                 return
 
@@ -601,6 +620,7 @@ class MDTrajectoryMainWindow(QMainWindow):
             self._sync_state_from_controls()
             self.state.output_dir = output_dir
             min_time_fs = self._resolved_export_cutoff()
+            self._apply_restart_duplicate_mode_to_manager()
             preview = self.manager.preview_selection(
                 start=self.state.start,
                 stop=self.state.stop,
@@ -650,6 +670,9 @@ class MDTrajectoryMainWindow(QMainWindow):
         self.state.post_cutoff_stride = (
             self.export_panel.get_post_cutoff_stride()
         )
+        self.state.include_restart_duplicates = (
+            self.export_panel.include_restart_duplicates()
+        )
         self.state.selected_cutoff_fs = self.cutoff_panel.get_selected_cutoff()
         self.state.suggested_cutoff_fs = (
             self.cutoff_panel.get_suggested_cutoff()
@@ -684,6 +707,7 @@ class MDTrajectoryMainWindow(QMainWindow):
             if self.state.use_cutoff_for_export:
                 min_time_fs = self._resolved_export_cutoff()
 
+            self._apply_restart_duplicate_mode_to_manager()
             preview = self.manager.preview_selection(
                 start=self.state.start,
                 stop=self.state.stop,
@@ -719,6 +743,7 @@ class MDTrajectoryMainWindow(QMainWindow):
         manager: TrajectoryManager | None = None,
         summary: dict[str, object] | None = None,
         reload_trajectory: bool = True,
+        include_restart_duplicates: bool = False,
     ) -> None:
         self._set_operation_busy(True, "Inspecting trajectory...")
         self.export_panel.set_busy_progress("Inspection progress: starting...")
@@ -731,6 +756,7 @@ class MDTrajectoryMainWindow(QMainWindow):
             manager=manager,
             summary=summary,
             reload_trajectory=reload_trajectory,
+            include_restart_duplicates=include_restart_duplicates,
         )
         self._inspect_worker.moveToThread(self._inspect_thread)
         self._inspect_thread.started.connect(self._inspect_worker.run)
@@ -907,6 +933,8 @@ class MDTrajectoryMainWindow(QMainWindow):
             f"Start: {self.state.start}",
             f"Stop: {self.state.stop}",
             f"Stride: {self.state.stride}",
+            "Restart duplicate frames: "
+            f"{'included' if self.state.include_restart_duplicates else 'skipped'}",
         ]
         if result.applied_cutoff_fs is not None:
             lines.append(f"Applied cutoff: {result.applied_cutoff_fs:.3f} fs")
@@ -984,6 +1012,8 @@ class MDTrajectoryMainWindow(QMainWindow):
                 f"Stop: {preview.stop}",
                 f"Stride: {preview.stride}",
                 f"Time-tagged frames: {preview.time_metadata_frames}",
+                "Restart duplicate frames: "
+                f"{'included' if self.state.include_restart_duplicates else 'skipped'}",
             ]
         )
         if preview.min_time_fs is not None:
@@ -1006,6 +1036,17 @@ class MDTrajectoryMainWindow(QMainWindow):
                 f"{preview.last_time_fs:.3f} fs"
             )
         return "\n".join(lines)
+
+    def _apply_restart_duplicate_mode_to_manager(self) -> None:
+        if self.manager is None:
+            return
+        setter = getattr(
+            self.manager,
+            "set_include_restart_duplicates",
+            None,
+        )
+        if callable(setter):
+            setter(self.state.include_restart_duplicates)
 
     def _update_suggested_output_dir(
         self,

@@ -19,7 +19,7 @@ class MDTrajectoryAppState:
 
     temp_target_k: float = 300.0
     temp_tol_k: float = 1.0
-    window: int = 3
+    window: int = 2
 
     suggested_cutoff_fs: float | None = None
     selected_cutoff_fs: float | None = None
@@ -28,3 +28,4 @@ class MDTrajectoryAppState:
     use_cutoff_for_export: bool = True
     use_post_cutoff_stride: bool = False
     post_cutoff_stride: int = 1
+    include_restart_duplicates: bool = False

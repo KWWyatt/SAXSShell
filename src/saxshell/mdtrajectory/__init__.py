@@ -1,6 +1,7 @@
 """Headless and Qt interfaces for mdtrajectory workflows."""
 
 from .workflow import (
+    MDTrajectoryAssertionResult,
     MDTrajectoryExportResult,
     MDTrajectorySelectionResult,
     MDTrajectoryWorkflow,
@@ -10,6 +11,7 @@ from .workflow import (
 )
 
 __all__ = [
+    "MDTrajectoryAssertionResult",
     "MDTrajectoryExportResult",
     "MDTrajectorySelectionResult",
     "MDTrajectoryWorkflow",

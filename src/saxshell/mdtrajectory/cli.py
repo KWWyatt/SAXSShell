@@ -7,6 +7,7 @@ from pathlib import Path
 from saxshell.version import __version__
 
 from .workflow import (
+    MDTrajectoryAssertionResult,
     MDTrajectoryExportResult,
     MDTrajectorySelectionResult,
     MDTrajectoryWorkflow,
@@ -38,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Inspect the trajectory and optionally the CP2K energy file.",
     )
     _add_common_input_arguments(inspect_parser)
+    _add_restart_duplicate_argument(inspect_parser)
     inspect_parser.set_defaults(handler=_handle_inspect)
 
     suggest_parser = subparsers.add_parser(
@@ -55,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_input_arguments(preview_parser)
     _add_selection_arguments(preview_parser)
     _add_cutoff_resolution_arguments(preview_parser)
+    _add_restart_duplicate_argument(preview_parser)
     preview_parser.add_argument(
         "--output-dir",
         type=Path,
@@ -70,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_input_arguments(export_parser)
     _add_selection_arguments(export_parser)
     _add_cutoff_resolution_arguments(export_parser)
+    _add_restart_duplicate_argument(export_parser)
     export_parser.add_argument(
         "--output-dir",
         type=Path,
@@ -77,6 +81,53 @@ def build_parser() -> argparse.ArgumentParser:
         "next to the trajectory.",
     )
     export_parser.set_defaults(handler=_handle_export)
+
+    validate_parser = subparsers.add_parser(
+        "validate-export",
+        help=(
+            "Assert that exported XYZ frames map back to the source "
+            "trajectory indices and coordinates."
+        ),
+    )
+    validate_parser.add_argument(
+        "trajectory",
+        type=Path,
+        help="Path to the source trajectory file (.xyz).",
+    )
+    validate_parser.add_argument(
+        "frame_dir",
+        type=Path,
+        help="Directory containing exported frame_<index>.xyz files.",
+    )
+    validate_parser.add_argument(
+        "--coordinate-lines",
+        type=int,
+        default=3,
+        help="Number of leading coordinate lines to compare. Default: 3.",
+    )
+    validate_parser.add_argument(
+        "--coord-tol",
+        type=float,
+        default=1.0e-9,
+        help="Absolute coordinate comparison tolerance. Default: 1e-9.",
+    )
+    validate_parser.add_argument(
+        "--expect-contiguous",
+        action="store_true",
+        help="Fail if exported filename indices have gaps within their range.",
+    )
+    validate_parser.add_argument(
+        "--strict-source-duplicates",
+        action="store_true",
+        help="Fail if the source trajectory contains duplicate i = indices.",
+    )
+    validate_parser.add_argument(
+        "--max-issues",
+        type=int,
+        default=20,
+        help="Maximum number of issue examples to print. Default: 20.",
+    )
+    validate_parser.set_defaults(handler=_handle_validate_export)
 
     return parser
 
@@ -155,8 +206,11 @@ def _add_cutoff_analysis_arguments(
     parser.add_argument(
         "--window",
         type=int,
-        default=3,
-        help="Consecutive sample window used for the steady-state test.",
+        default=2,
+        help=(
+            "Consecutive sample window used for the steady-state test. "
+            "Default: 2."
+        ),
     )
 
 
@@ -180,6 +234,18 @@ def _add_cutoff_resolution_arguments(
         help="Run the cutoff analyzer and apply the suggested cutoff.",
     )
     _add_cutoff_analysis_arguments(parser, required_target=False)
+
+
+def _add_restart_duplicate_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--include-restart-duplicates",
+        action="store_true",
+        help=(
+            "Include duplicate XYZ frames from overlapping simulation "
+            "restarts. By default, earlier overlap frames are skipped and "
+            "the later continuation frame is kept."
+        ),
+    )
 
 
 def _handle_ui(_: argparse.Namespace) -> int:
@@ -206,6 +272,11 @@ def _build_workflow(args: argparse.Namespace) -> MDTrajectoryWorkflow:
         trajectory_file=args.trajectory,
         topology_file=getattr(args, "topology", None),
         energy_file=getattr(args, "energy_file", None),
+        include_restart_duplicates=getattr(
+            args,
+            "include_restart_duplicates",
+            False,
+        ),
     )
 
 
@@ -229,7 +300,7 @@ def _resolve_cli_cutoff(
         result = workflow.suggest_cutoff(
             temp_target_k=temp_target_k,
             temp_tol_k=getattr(args, "temp_tol_k", 1.0),
-            window=getattr(args, "window", 3),
+            window=getattr(args, "window", 2),
         )
         cutoff_fs = result.cutoff_time_fs
         if cutoff_fs is None:
@@ -252,6 +323,18 @@ def _handle_inspect(args: argparse.Namespace) -> int:
         f"File type: {summary['file_type']}",
         f"Frames: {summary['n_frames']}",
     ]
+    if "raw_frames" in summary:
+        include_duplicates = bool(
+            summary.get("include_restart_duplicates", False)
+        )
+        duplicate_action = "included" if include_duplicates else "skipped"
+        lines.extend(
+            [
+                f"Raw frames: {summary['raw_frames']}",
+                f"Duplicate source frames {duplicate_action}: "
+                f"{summary.get('duplicate_source_frames', 0)}",
+            ]
+        )
     if workflow.topology_file is not None:
         lines.append(f"Topology file: {workflow.topology_file}")
     if workflow.energy_file is not None:
@@ -324,6 +407,20 @@ def _handle_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_validate_export(args: argparse.Namespace) -> int:
+    workflow = _build_workflow(args)
+    result = workflow.validate_export(
+        args.frame_dir,
+        coordinate_lines=args.coordinate_lines,
+        coordinate_tolerance=args.coord_tol,
+        expect_contiguous=args.expect_contiguous,
+        strict_source_duplicates=args.strict_source_duplicates,
+        max_issues=args.max_issues,
+    )
+    print(_format_assertion_result(result))
+    return 0 if result.passed else 1
+
+
 def _format_selection_result(selection: MDTrajectorySelectionResult) -> str:
     preview = selection.preview
     lines = [
@@ -334,6 +431,8 @@ def _format_selection_result(selection: MDTrajectorySelectionResult) -> str:
         f"Stop: {preview.stop}",
         f"Stride: {preview.stride}",
         f"Time-tagged frames: {preview.time_metadata_frames}",
+        "Restart duplicate frames: "
+        f"{'included' if selection.include_restart_duplicates else 'skipped'}",
     ]
     if selection.applied_cutoff_fs is not None:
         lines.append(f"Applied cutoff: {selection.applied_cutoff_fs:.3f} fs")
@@ -362,4 +461,63 @@ def _format_export_result(result: MDTrajectoryExportResult) -> str:
     if result.written_files:
         lines.append(f"First file: {result.written_files[0]}")
         lines.append(f"Last file: {result.written_files[-1]}")
+    return "\n".join(lines)
+
+
+def _format_assertion_result(result: MDTrajectoryAssertionResult) -> str:
+    status = "passed" if result.passed else "failed"
+    lines = [
+        f"Export validation {status}.",
+        f"Trajectory file: {result.trajectory_file}",
+        f"Frame directory: {result.frame_dir}",
+        f"Coordinate lines checked: {result.coordinate_lines}",
+        f"Coordinate tolerance: {result.coordinate_tolerance:g}",
+        f"Source raw frames: {result.source_raw_frames}",
+        f"Source unique indices: {result.source_unique_indices}",
+        f"Source frames without i index: {result.source_missing_indices}",
+        f"Source duplicate i indices: {result.source_duplicate_indices}",
+        "Source duplicate coordinate conflicts: "
+        f"{result.source_duplicate_conflicts}",
+        f"Exported XYZ files: {result.exported_files}",
+        f"Validated XYZ files: {result.validated_files}",
+    ]
+    if result.filename_index_min is not None:
+        lines.append(
+            "Filename index range: "
+            f"{result.filename_index_min} to {result.filename_index_max}"
+        )
+    if result.header_index_min is not None:
+        lines.append(
+            "Header index range: "
+            f"{result.header_index_min} to {result.header_index_max}"
+        )
+    if result.filename_header_offsets:
+        offsets = ", ".join(
+            f"{offset}: {count}"
+            for offset, count in result.filename_header_offsets.items()
+        )
+        lines.append(f"Filename-header offsets: {offsets}")
+    else:
+        lines.append("Filename-header offsets: none")
+
+    if result.issue_counts:
+        lines.append("Assertion failures:")
+        lines.extend(
+            f"- {kind}: {count}" for kind, count in result.issue_counts.items()
+        )
+    else:
+        lines.append("Assertion failures: none")
+
+    if result.strict_source_duplicates and result.source_duplicate_indices:
+        lines.append(
+            "Strict source duplicate check failed: "
+            f"{result.source_duplicate_indices} duplicate source frame(s)."
+        )
+
+    if result.issues:
+        lines.append("Issue examples:")
+        for issue in result.issues:
+            location = "" if issue.path is None else f" [{issue.path}]"
+            lines.append(f"- {issue.kind}{location}: {issue.message}")
+
     return "\n".join(lines)

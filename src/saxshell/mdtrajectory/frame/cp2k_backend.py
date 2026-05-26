@@ -16,6 +16,10 @@ TIME_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+FRAME_INDEX_PATTERN = re.compile(
+    r"(?:^|[\s,;])i\s*=\s*(\d+)(?:\b|[\s,;])",
+    re.IGNORECASE,
+)
 
 
 class CP2KTrajectoryBackend(TrajectoryBackend):
@@ -32,6 +36,8 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
         self,
         input_file: str | Path,
         topology_file: str | Path | None = None,
+        *,
+        include_restart_duplicates: bool = False,
     ) -> None:
         super().__init__(input_file=input_file, topology_file=topology_file)
         suffix = self.input_file.suffix.lower()
@@ -40,14 +46,27 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                 "CP2KTrajectoryBackend supports only .xyz and .pdb files."
             )
         self.file_type = suffix.lstrip(".")
+        self.include_restart_duplicates = bool(include_restart_duplicates)
+        self._raw_frame_count: int | None = None
+        self._duplicate_source_frame_count: int = 0
 
     def inspect(self) -> dict[str, object]:
         frame_metadata = self.load_frame_metadata()
-        return {
+        summary: dict[str, object] = {
             "input_file": str(self.input_file),
             "file_type": self.file_type,
             "n_frames": len(frame_metadata),
+            "include_restart_duplicates": self.include_restart_duplicates,
         }
+        if self._raw_frame_count is not None and (
+            self._raw_frame_count != len(frame_metadata)
+            or self._duplicate_source_frame_count
+        ):
+            summary["raw_frames"] = self._raw_frame_count
+            summary["duplicate_source_frames"] = (
+                self._duplicate_source_frame_count
+            )
+        return summary
 
     def iter_frame_metadata(self) -> list[FrameMetadata]:
         if self.file_type == "xyz":
@@ -107,8 +126,11 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
         return count
 
     def _parse_xyz_frame_metadata(self) -> list[FrameMetadata]:
-        frames: list[FrameMetadata] = []
-        frame_idx = 0
+        frames_by_index: dict[int, FrameMetadata] = {}
+        frames_with_duplicates: list[FrameMetadata] = []
+        seen_source_indices: set[int] = set()
+        raw_frame_count = 0
+        duplicate_source_frame_count = 0
 
         with self.input_file.open("r") as handle:
             while True:
@@ -129,13 +151,32 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                     atom_count_text = atom_count_line.strip()
                     if not atom_count_text.isdigit():
                         continue
-                    frames.append(
-                        FrameMetadata(
-                            frame_index=frame_idx,
-                            time_fs=self._parse_time_from_header(line),
-                        )
+                    source_index = self._parse_frame_index_from_metadata(line)
+                    fallback_index = (
+                        raw_frame_count
+                        if self.include_restart_duplicates
+                        else len(frames_by_index)
                     )
-                    frame_idx += 1
+                    frame_index = self._resolve_frame_index(
+                        line,
+                        fallback_index=fallback_index,
+                    )
+                    raw_frame_count += 1
+                    if (
+                        source_index is not None
+                        and source_index in seen_source_indices
+                    ):
+                        duplicate_source_frame_count += 1
+                    if source_index is not None:
+                        seen_source_indices.add(source_index)
+                    frame = FrameMetadata(
+                        frame_index=frame_index,
+                        time_fs=self._parse_time_from_header(line),
+                    )
+                    if self.include_restart_duplicates:
+                        frames_with_duplicates.append(frame)
+                    else:
+                        frames_by_index[frame_index] = frame
                     for _ in range(int(atom_count_text)):
                         if not handle.readline():
                             break
@@ -146,106 +187,197 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
 
                 atom_count = int(stripped)
                 comment = handle.readline()
+                if not comment:
+                    break
                 time_val = (
                     None
                     if not comment
                     else self._parse_time_from_metadata(comment)
                 )
-                frames.append(
-                    FrameMetadata(
-                        frame_index=frame_idx,
-                        time_fs=time_val,
-                    )
+                source_index = self._parse_frame_index_from_metadata(comment)
+                fallback_index = (
+                    raw_frame_count
+                    if self.include_restart_duplicates
+                    else len(frames_by_index)
                 )
-                frame_idx += 1
-                if not comment:
-                    break
+                frame_index = self._resolve_frame_index(
+                    comment,
+                    fallback_index=fallback_index,
+                )
+                raw_frame_count += 1
+                if (
+                    source_index is not None
+                    and source_index in seen_source_indices
+                ):
+                    duplicate_source_frame_count += 1
+                if source_index is not None:
+                    seen_source_indices.add(source_index)
+                frame = FrameMetadata(
+                    frame_index=frame_index,
+                    time_fs=time_val,
+                )
+                if self.include_restart_duplicates:
+                    frames_with_duplicates.append(frame)
+                else:
+                    frames_by_index[frame_index] = frame
                 for _ in range(atom_count):
                     if not handle.readline():
                         break
 
-        return frames
+        self._raw_frame_count = raw_frame_count
+        self._duplicate_source_frame_count = duplicate_source_frame_count
+        if self.include_restart_duplicates:
+            return frames_with_duplicates
+        return [
+            frames_by_index[frame_index]
+            for frame_index in sorted(frames_by_index)
+        ]
 
     def _parse_xyz_frames(self) -> list[FrameRecord]:
-        lines = self.input_file.read_text().splitlines(keepends=True)
-        frames: list[FrameRecord] = []
-        frame_idx = 0
-        atom_count: int | None = None
-        buffer: list[str] = []
-        time_val: float | None = None
+        frames_by_index: dict[int, FrameRecord] = {}
+        frames_with_duplicates: list[FrameRecord] = []
+        seen_source_indices: set[int] = set()
+        raw_frame_count = 0
+        duplicate_source_frame_count = 0
 
-        i = 0
-        while i < len(lines):
-            s = lines[i].strip()
+        with self.input_file.open("r") as handle:
+            while True:
+                line = handle.readline()
+                if not line:
+                    break
 
-            is_metadata_style = (
-                s.isdigit()
-                and i + 1 < len(lines)
-                and lines[i + 1].strip().startswith("i =")
-            )
+                stripped = line.strip()
+                if not stripped:
+                    continue
 
-            if is_metadata_style:
-                if buffer and atom_count is not None:
-                    frames.append(
-                        FrameRecord(
-                            frame_index=frame_idx,
-                            file_type="xyz",
-                            atom_count=atom_count,
-                            lines=buffer.copy(),
-                            time_fs=time_val,
-                        )
+                if stripped.startswith("frame") or stripped.startswith(
+                    "NSTEP="
+                ):
+                    atom_count_line = handle.readline()
+                    if not atom_count_line:
+                        break
+                    atom_count_text = atom_count_line.strip()
+                    if not atom_count_text.isdigit():
+                        continue
+                    atom_count = int(atom_count_text)
+                    atom_lines = self._read_xyz_atom_lines(
+                        handle,
+                        atom_count,
                     )
-                    frame_idx += 1
-
-                atom_count = int(s)
-                comment = lines[i + 1]
-                time_val = self._parse_time_from_metadata(comment)
-                buffer = [comment]
-                i += 2
-                continue
-
-            if s.startswith("frame") or s.startswith("NSTEP="):
-                if buffer and atom_count is not None:
-                    frames.append(
-                        FrameRecord(
-                            frame_index=frame_idx,
-                            file_type="xyz",
-                            atom_count=atom_count,
-                            lines=buffer.copy(),
-                            time_fs=time_val,
-                        )
+                    if atom_lines is None:
+                        break
+                    source_index = self._parse_frame_index_from_metadata(line)
+                    fallback_index = (
+                        raw_frame_count
+                        if self.include_restart_duplicates
+                        else len(frames_by_index)
                     )
-                    frame_idx += 1
-                atom_count = None
-                time_val = self._parse_time_from_header(lines[i])
-                buffer = [lines[i]]
-                i += 1
-                continue
+                    frame_index = self._resolve_frame_index(
+                        line,
+                        fallback_index=fallback_index,
+                    )
+                    raw_frame_count += 1
+                    if (
+                        source_index is not None
+                        and source_index in seen_source_indices
+                    ):
+                        duplicate_source_frame_count += 1
+                    if source_index is not None:
+                        seen_source_indices.add(source_index)
+                    frame = FrameRecord(
+                        frame_index=frame_index,
+                        file_type="xyz",
+                        atom_count=atom_count,
+                        lines=[line, *atom_lines],
+                        time_fs=self._parse_time_from_header(line),
+                    )
+                    if self.include_restart_duplicates:
+                        frames_with_duplicates.append(frame)
+                    else:
+                        frames_by_index[frame_index] = frame
+                    continue
 
-            if s.isdigit():
-                atom_count = int(s)
-                if not buffer:
-                    time_val = None
-                i += 1
-                continue
+                if not stripped.isdigit():
+                    continue
 
-            if atom_count is not None:
-                buffer.append(lines[i])
-
-            i += 1
-
-        if buffer and atom_count is not None:
-            frames.append(
-                FrameRecord(
-                    frame_index=frame_idx,
+                atom_count = int(stripped)
+                comment = handle.readline()
+                if not comment:
+                    break
+                atom_lines = self._read_xyz_atom_lines(handle, atom_count)
+                if atom_lines is None:
+                    break
+                source_index = self._parse_frame_index_from_metadata(comment)
+                fallback_index = (
+                    raw_frame_count
+                    if self.include_restart_duplicates
+                    else len(frames_by_index)
+                )
+                frame_index = self._resolve_frame_index(
+                    comment,
+                    fallback_index=fallback_index,
+                )
+                raw_frame_count += 1
+                if (
+                    source_index is not None
+                    and source_index in seen_source_indices
+                ):
+                    duplicate_source_frame_count += 1
+                if source_index is not None:
+                    seen_source_indices.add(source_index)
+                frame = FrameRecord(
+                    frame_index=frame_index,
                     file_type="xyz",
                     atom_count=atom_count,
-                    lines=buffer.copy(),
-                    time_fs=time_val,
+                    lines=[comment, *atom_lines],
+                    time_fs=self._parse_time_from_metadata(comment),
                 )
-            )
+                if self.include_restart_duplicates:
+                    frames_with_duplicates.append(frame)
+                else:
+                    frames_by_index[frame_index] = frame
 
-        return frames
+        self._raw_frame_count = raw_frame_count
+        self._duplicate_source_frame_count = duplicate_source_frame_count
+        if self.include_restart_duplicates:
+            return frames_with_duplicates
+        return [
+            frames_by_index[frame_index]
+            for frame_index in sorted(frames_by_index)
+        ]
+
+    def _read_xyz_atom_lines(
+        self,
+        handle,
+        atom_count: int,
+    ) -> list[str] | None:
+        atom_lines: list[str] = []
+        for _ in range(atom_count):
+            atom_line = handle.readline()
+            if not atom_line:
+                return None
+            atom_lines.append(atom_line)
+        return atom_lines
+
+    def _resolve_frame_index(
+        self,
+        header: str,
+        *,
+        fallback_index: int,
+    ) -> int:
+        source_index = self._parse_frame_index_from_metadata(header)
+        if source_index is None:
+            return fallback_index
+        return source_index
+
+    def _parse_frame_index_from_metadata(self, line: str) -> int | None:
+        match = FRAME_INDEX_PATTERN.search(line.strip())
+        if match is None:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
 
     def _parse_time_from_metadata(self, line: str) -> float | None:
         return self._parse_time_from_header(line)

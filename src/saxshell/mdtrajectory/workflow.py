@@ -5,12 +5,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from re import sub
 
+from saxshell.mdtrajectory.frame.assertions import (
+    MDTrajectoryAssertionResult,
+    validate_xyz_export_against_source,
+)
 from saxshell.mdtrajectory.frame.cp2k_ener import CP2KEnergyData
 from saxshell.mdtrajectory.frame.cutoff_analysis import (
     CP2KEnergyAnalyzer,
     SteadyStateResult,
 )
 from saxshell.mdtrajectory.frame.manager import (
+    ExportProgressCallback,
     FrameSelectionPreview,
     TrajectoryManager,
 )
@@ -97,6 +102,7 @@ class MDTrajectorySelectionResult:
     preview: FrameSelectionPreview
     output_dir: Path
     applied_cutoff_fs: float | None
+    include_restart_duplicates: bool = False
 
     def to_dict(self) -> dict[str, object]:
         preview = self.preview
@@ -114,6 +120,7 @@ class MDTrajectorySelectionResult:
             "last_frame_index": preview.last_frame_index,
             "first_time_fs": preview.first_time_fs,
             "last_time_fs": preview.last_time_fs,
+            "include_restart_duplicates": self.include_restart_duplicates,
         }
 
 
@@ -148,6 +155,7 @@ class MDTrajectoryWorkflow:
         topology_file: str | Path | None = None,
         energy_file: str | Path | None = None,
         backend: str = "auto",
+        include_restart_duplicates: bool = False,
     ) -> None:
         self.trajectory_file = Path(trajectory_file)
         self.topology_file = (
@@ -157,10 +165,12 @@ class MDTrajectoryWorkflow:
             Path(energy_file) if energy_file is not None else None
         )
         self.backend = backend
+        self.include_restart_duplicates = bool(include_restart_duplicates)
         self.manager = TrajectoryManager(
             input_file=self.trajectory_file,
             topology_file=self.topology_file,
             backend=backend,
+            include_restart_duplicates=self.include_restart_duplicates,
         )
         self.summary: dict[str, object] | None = None
         self.energy_data: CP2KEnergyData | None = None
@@ -172,6 +182,19 @@ class MDTrajectoryWorkflow:
         if self.summary is None:
             self.summary = self.manager.inspect()
         return dict(self.summary)
+
+    def set_include_restart_duplicates(
+        self,
+        include_restart_duplicates: bool,
+    ) -> None:
+        """Choose whether restart-overlap duplicate frames are
+        exposed."""
+        include_restart_duplicates = bool(include_restart_duplicates)
+        if self.include_restart_duplicates == include_restart_duplicates:
+            return
+        self.include_restart_duplicates = include_restart_duplicates
+        self.manager.set_include_restart_duplicates(include_restart_duplicates)
+        self.summary = None
 
     def load_energy(self) -> CP2KEnergyData:
         """Load the configured CP2K energy file."""
@@ -190,7 +213,7 @@ class MDTrajectoryWorkflow:
         *,
         temp_target_k: float,
         temp_tol_k: float = 1.0,
-        window: int = 3,
+        window: int = 2,
     ) -> SteadyStateResult:
         """Suggest a steady-state cutoff from the loaded energy data."""
         analyzer = CP2KEnergyAnalyzer(self.load_energy())
@@ -232,8 +255,11 @@ class MDTrajectoryWorkflow:
         use_cutoff: bool = False,
         cutoff_fs: float | None = None,
         output_dir: str | Path | None = None,
+        include_restart_duplicates: bool | None = None,
     ) -> MDTrajectorySelectionResult:
         """Preview the selected frames and output target directory."""
+        if include_restart_duplicates is not None:
+            self.set_include_restart_duplicates(include_restart_duplicates)
         self.inspect()
         applied_cutoff_fs = self.resolve_cutoff(
             use_cutoff=use_cutoff,
@@ -259,6 +285,7 @@ class MDTrajectoryWorkflow:
             preview=preview,
             output_dir=resolved_output_dir,
             applied_cutoff_fs=applied_cutoff_fs,
+            include_restart_duplicates=self.include_restart_duplicates,
         )
 
     def export_frames(
@@ -271,6 +298,8 @@ class MDTrajectoryWorkflow:
         post_cutoff_stride: int = 1,
         use_cutoff: bool = False,
         cutoff_fs: float | None = None,
+        include_restart_duplicates: bool | None = None,
+        progress_callback: ExportProgressCallback | None = None,
     ) -> MDTrajectoryExportResult:
         """Write the current frame selection to disk."""
         selection = self.preview_selection(
@@ -281,6 +310,7 @@ class MDTrajectoryWorkflow:
             use_cutoff=use_cutoff,
             cutoff_fs=cutoff_fs,
             output_dir=output_dir,
+            include_restart_duplicates=include_restart_duplicates,
         )
         if selection.preview.selected_frames == 0:
             raise ValueError("No frames match the current selection settings.")
@@ -299,6 +329,7 @@ class MDTrajectoryWorkflow:
             stride=stride,
             min_time_fs=selection.applied_cutoff_fs,
             post_cutoff_stride=post_cutoff_stride,
+            progress_callback=progress_callback,
         )
         metadata_file = self._write_export_metadata(
             selection=selection,
@@ -310,6 +341,28 @@ class MDTrajectoryWorkflow:
             written_files=written_files,
             selection=selection,
             metadata_file=metadata_file,
+        )
+
+    def validate_export(
+        self,
+        frame_dir: str | Path,
+        *,
+        coordinate_lines: int = 3,
+        coordinate_tolerance: float = 1.0e-9,
+        expect_contiguous: bool = False,
+        strict_source_duplicates: bool = False,
+        max_issues: int = 20,
+    ) -> MDTrajectoryAssertionResult:
+        """Run export mapping assertions against the source
+        trajectory."""
+        return validate_xyz_export_against_source(
+            self.trajectory_file,
+            frame_dir,
+            coordinate_lines=coordinate_lines,
+            coordinate_tolerance=coordinate_tolerance,
+            expect_contiguous=expect_contiguous,
+            strict_source_duplicates=strict_source_duplicates,
+            max_issues=max_issues,
         )
 
     def _write_export_metadata(

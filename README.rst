@@ -60,13 +60,19 @@ Installation
 ------------
 
 SAXSShell is not pip-installable yet. The current user-facing path is to clone
-the repository and create the conda environment from the checked-in
-``requirements/saxshell-py312.yml`` file.
+the repository and create the conda environment from the checked-in environment
+file for your platform.
 
 From a terminal, run ::
 
         git clone https://github.com/kewh5868/SAXSShell.git
         cd SAXSShell
+
+macOS, Linux, and WSL
+~~~~~~~~~~~~~~~~~~~~~
+
+Create the Python 3.12 conda environment from the default environment file ::
+
         conda env create -f requirements/saxshell-py312.yml
 
 If the environment already exists, update it with ::
@@ -76,6 +82,35 @@ If the environment already exists, update it with ::
 Launch the main SAXSShell application from the repository root with ::
 
         PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
+
+Native Windows
+~~~~~~~~~~~~~~
+
+On native Windows, create the environment from the Windows-specific environment
+file ::
+
+        conda env create -f requirements\saxshell-py312-win.yml
+
+If the environment already exists, update it with ::
+
+        conda env update -n saxshell-py312 -f requirements\saxshell-py312-win.yml --prune
+
+From Anaconda Prompt, activate the environment, set ``PYTHONPATH``, and launch
+the SAXS UI ::
+
+        conda activate saxshell-py312
+        set PYTHONPATH=src
+        python -m saxshell.saxs
+
+You can also launch without activating the environment ::
+
+        set PYTHONPATH=src
+        conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
+
+From Windows PowerShell, set ``PYTHONPATH`` with PowerShell syntax ::
+
+        $env:PYTHONPATH = "src"
+        conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
 
 You can also verify that the source checkout imports inside the conda
 environment with ::
