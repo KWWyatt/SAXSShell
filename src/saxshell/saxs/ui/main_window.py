@@ -3931,6 +3931,11 @@ class SAXSMainWindow(QMainWindow):
                     f"Saved prior plot data: {build_result.prior_plot_data_path}"
                 )
             self._refresh_prior_plot()
+            try:
+                self._load_prefit_workflow()
+                self._load_dream_workflow()
+            except Exception:
+                pass
             self.project_setup_tab.finish_activity_progress(
                 "Computed-distribution creation complete."
             )

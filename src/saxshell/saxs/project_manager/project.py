@@ -2699,13 +2699,15 @@ class SAXSProjectManager:
         settings: ProjectSettings,
     ) -> ExperimentalDataSummary:
         path = self._resolve_experimental_source(settings)
-        return load_experimental_data_file(
+        summary = load_experimental_data_file(
             path,
             skiprows=settings.experimental_header_rows,
             q_column=settings.experimental_q_column,
             intensity_column=settings.experimental_intensity_column,
             error_column=settings.experimental_error_column,
         )
+        _apply_experimental_column_settings(settings, summary)
+        return summary
 
     def load_solvent_data(
         self,
@@ -2714,13 +2716,15 @@ class SAXSProjectManager:
         path = self._resolve_solvent_source(settings)
         if path is None:
             return None
-        return load_experimental_data_file(
+        summary = load_experimental_data_file(
             path,
             skiprows=settings.solvent_header_rows,
             q_column=settings.solvent_q_column,
             intensity_column=settings.solvent_intensity_column,
             error_column=settings.solvent_error_column,
         )
+        _apply_solvent_column_settings(settings, summary)
+        return summary
 
     def scan_cluster_inventory(
         self,
@@ -6197,6 +6201,10 @@ def load_experimental_data_file(
         guessed_header_rows = _guess_experimental_header_rows(file_path)
         if guessed_header_rows > effective_skiprows:
             effective_skiprows = guessed_header_rows
+            data = _load_experimental_numeric_data(
+                file_path,
+                skiprows=effective_skiprows,
+            )
         column_names = _read_experimental_column_names(
             file_path,
             effective_skiprows,
@@ -6274,6 +6282,34 @@ def read_experimental_column_names(
     )
 
 
+def _valid_column_index(index: int | None, n_columns: int) -> int | None:
+    if index is None:
+        return None
+    if index < 0 or index >= n_columns:
+        return None
+    return index
+
+
+def _apply_experimental_column_settings(
+    settings: ProjectSettings,
+    summary: ExperimentalDataSummary,
+) -> None:
+    settings.experimental_header_rows = int(summary.header_rows)
+    settings.experimental_q_column = int(summary.q_column)
+    settings.experimental_intensity_column = int(summary.intensity_column)
+    settings.experimental_error_column = summary.error_column
+
+
+def _apply_solvent_column_settings(
+    settings: ProjectSettings,
+    summary: ExperimentalDataSummary,
+) -> None:
+    settings.solvent_header_rows = int(summary.header_rows)
+    settings.solvent_q_column = int(summary.q_column)
+    settings.solvent_intensity_column = int(summary.intensity_column)
+    settings.solvent_error_column = summary.error_column
+
+
 def infer_experimental_columns(
     column_names: list[str],
 ) -> tuple[int | None, int | None, int | None]:
@@ -6335,27 +6371,18 @@ def _resolve_experimental_columns(
                 f"The selected {label} column index {index} is out of range."
             )
 
-    if error_column is not None:
-        resolved_error = error_column
-    elif inferred_e is not None:
-        resolved_error = inferred_e
-    elif n_columns >= 3:
-        candidate = 2
-        resolved_error = (
-            candidate if candidate not in {resolved_q, resolved_i} else None
-        )
-    else:
-        resolved_error = None
-
-    if resolved_error is not None:
-        if resolved_error in {resolved_q, resolved_i}:
-            raise ValueError(
-                "The error column must be different from q and intensity."
-            )
-        if resolved_error < 0 or resolved_error >= n_columns:
-            raise ValueError(
-                f"The selected error column index {resolved_error} is out of range."
-            )
+    resolved_error: int | None = None
+    for candidate in (
+        _valid_column_index(error_column, n_columns),
+        _valid_column_index(inferred_e, n_columns),
+        2 if n_columns >= 3 else None,
+    ):
+        if candidate is None:
+            continue
+        if candidate in {resolved_q, resolved_i}:
+            continue
+        resolved_error = candidate
+        break
     return resolved_q, resolved_i, resolved_error
 
 

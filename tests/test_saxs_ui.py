@@ -17289,6 +17289,47 @@ def test_load_experimental_data_file_detects_three_column_headers(
     assert np.allclose(summary.errors, [0.1, 0.2])
 
 
+def test_load_experimental_data_file_ignores_stale_error_column_index(
+    tmp_path,
+):
+    data_path = tmp_path / "exp_two_columns.txt"
+    data_path.write_text(
+        "0.05\t10.0\n"
+        "0.10\t9.5\n",
+        encoding="utf-8",
+    )
+
+    summary = load_experimental_data_file(
+        data_path,
+        error_column=2,
+    )
+
+    assert summary.error_column is None
+    assert summary.errors is None
+    assert np.allclose(summary.q_values, [0.05, 0.10])
+    assert np.allclose(summary.intensities, [10.0, 9.5])
+
+
+def test_load_experimental_data_file_reloads_after_header_detection(
+    tmp_path,
+):
+    data_path = tmp_path / "exp_header_reload.txt"
+    data_path.write_text(
+        "q_demo\tintensity_demo\terror_demo\n"
+        "0.05\t10.0\t0.1\n"
+        "0.10\t9.5\t0.2\n",
+        encoding="utf-8",
+    )
+
+    summary = load_experimental_data_file(data_path, skiprows=0)
+
+    assert summary.header_rows == 1
+    assert summary.error_column == 2
+    assert np.allclose(summary.q_values, [0.05, 0.10])
+    assert np.allclose(summary.intensities, [10.0, 9.5])
+    assert np.allclose(summary.errors, [0.1, 0.2])
+
+
 def test_experimental_overlay_window_loads_multiple_header_styles(
     qapp,
     tmp_path,
