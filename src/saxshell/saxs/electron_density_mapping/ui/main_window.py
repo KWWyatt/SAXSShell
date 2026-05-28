@@ -122,6 +122,7 @@ from saxshell.ui.window_layout import apply_preset_window_size
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
 
 # Use MathText for the inverse-Angstrom exponent so the active UI font does

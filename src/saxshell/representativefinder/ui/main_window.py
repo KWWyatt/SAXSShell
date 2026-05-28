@@ -80,6 +80,7 @@ from saxshell.ui.window_layout import apply_preset_window_size
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 
 _ALGORITHM_ITEMS = [
     (
