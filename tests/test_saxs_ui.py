@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -17257,6 +17256,28 @@ def test_experimental_data_header_dialog_recovers_header_rows(qapp, tmp_path):
         dialog.accepted_summary.intensities,
         [10.0, 9.5],
     )
+
+
+def test_load_experimental_data_file_ignores_stale_error_column_index(
+    tmp_path,
+):
+    data_path = tmp_path / "exp_two_columns.txt"
+    np.savetxt(
+        data_path,
+        np.column_stack(
+            [
+                np.asarray([0.05, 0.10], dtype=float),
+                np.asarray([10.0, 9.5], dtype=float),
+            ]
+        ),
+    )
+
+    summary = load_experimental_data_file(data_path, error_column=2)
+
+    assert summary.error_column is None
+    assert summary.errors is None
+    assert np.allclose(summary.q_values, [0.05, 0.10])
+    assert np.allclose(summary.intensities, [10.0, 9.5])
 
 
 def test_load_experimental_data_file_detects_three_column_headers(
