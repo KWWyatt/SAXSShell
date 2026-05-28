@@ -75,11 +75,11 @@ from saxshell.saxs.electron_density_mapping.workflow import (
     load_electron_density_structure,
 )
 from saxshell.saxs.ui.branding import (
-from saxshell.ui.window_layout import apply_preset_window_size
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 
 _ALGORITHM_ITEMS = [
     (

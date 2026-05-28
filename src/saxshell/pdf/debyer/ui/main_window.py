@@ -82,11 +82,11 @@ from saxshell.saxs.project_manager import (
     load_experimental_data_file,
 )
 from saxshell.saxs.ui.branding import (
-from saxshell.ui.window_layout import apply_preset_window_size
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 from saxshell.saxs.ui.experimental_data_loader import (
     ExperimentalDataHeaderDialog,
 )
