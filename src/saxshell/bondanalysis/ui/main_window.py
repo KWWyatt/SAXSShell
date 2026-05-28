@@ -70,6 +70,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
 from saxshell.saxs.ui.project_status_label import CompactProjectStatusLabel
 from saxshell.structure_distributions import (

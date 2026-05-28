@@ -182,6 +182,15 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import (
+    DEFAULT_WINDOW_PRESET_KEY,
+    WINDOW_LAYOUT_PRESET_MAP,
+    WINDOW_LAYOUT_PRESETS,
+    WindowLayoutPreset,
+    fit_window_size_to_screen,
+    recommended_window_layout_preset,
+)
+from saxshell.ui.wheel_guard import should_suppress_value_wheel_event
 from saxshell.saxs.ui.distribution_window import DistributionSetupWindow
 from saxshell.saxs.ui.dream_tab import DreamTab
 from saxshell.saxs.ui.dream_violin_export_dialog import DreamViolinExportDialog
@@ -215,7 +224,6 @@ DISTRIBUTION_LOAD_TOTAL_STEPS = (
     DISTRIBUTION_LOAD_PREP_STEPS + PROJECT_SETTINGS_APPLY_TOTAL_STEPS
 )
 PROJECT_DUPLICATE_TOTAL_STEPS = 6
-DEFAULT_WINDOW_PRESET_KEY = "laptop_14"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EQUIVALENT_SPHERE_MIX_TEMPLATE_NAMES = {
     "template_pydream_poly_lma_hs_mix_approx",
@@ -237,57 +245,6 @@ class RuntimeBundleOpener:
     stored_value: str
     launch_target: str
     launch_mode: str
-
-
-@dataclass(frozen=True, slots=True)
-class WindowLayoutPreset:
-    key: str
-    label: str
-    width: int
-    height: int
-    ui_scale: float
-
-
-WINDOW_LAYOUT_PRESETS = (
-    WindowLayoutPreset(
-        key="laptop_13",
-        label="13-inch Laptop (Compact)",
-        width=1180,
-        height=760,
-        ui_scale=0.95,
-    ),
-    WindowLayoutPreset(
-        key="laptop_14",
-        label="14-inch Laptop / MacBook Pro",
-        width=1280,
-        height=820,
-        ui_scale=1.0,
-    ),
-    WindowLayoutPreset(
-        key="laptop_16",
-        label="15-inch / 16-inch Laptop",
-        width=1440,
-        height=900,
-        ui_scale=1.05,
-    ),
-    WindowLayoutPreset(
-        key="display_1080p",
-        label="External Display (1080p)",
-        width=1500,
-        height=880,
-        ui_scale=1.0,
-    ),
-    WindowLayoutPreset(
-        key="display_1440p",
-        label="External Display (1440p / QHD)",
-        width=1680,
-        height=980,
-        ui_scale=1.1,
-    ),
-)
-WINDOW_LAYOUT_PRESET_MAP = {
-    preset.key: preset for preset in WINDOW_LAYOUT_PRESETS
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1218,7 +1175,6 @@ class SAXSMainWindow(QMainWindow):
         )
         self._dream_saved_run_poll_timer.start()
         self._build_ui()
-        self._install_value_wheel_guard()
         self._capture_scale_baselines(self)
         self._register_scale_shortcuts()
         self._apply_ui_scale(announce=False)
@@ -1233,59 +1189,12 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.plot_evaluation(None)
             self.dream_tab.clear_plots()
 
-    def _install_value_wheel_guard(self) -> None:
-        app = QApplication.instance()
-        if app is None:
-            return
-        app.installEventFilter(self)
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if self._should_suppress_value_wheel_event(watched, event):
-            event.ignore()
-            return True
-        return super().eventFilter(watched, event)
-
     def _should_suppress_value_wheel_event(
         self,
         watched: QObject,
         event: QEvent,
     ) -> bool:
-        if event.type() != QEvent.Type.Wheel or not isinstance(
-            watched, QWidget
-        ):
-            return False
-        if not self._is_widget_in_main_ui(watched):
-            return False
-        control = self._wheel_guarded_value_control(watched)
-        return control is not None and control.isEnabled()
-
-    def _is_widget_in_main_ui(self, widget: QWidget) -> bool:
-        window = widget.window()
-        if window is self:
-            return True
-        if not isinstance(window, QDialog):
-            return False
-        current: QWidget | None = window
-        while current is not None:
-            if current is self:
-                return True
-            current = current.parentWidget()
-        return False
-
-    def _wheel_guarded_value_control(self, widget: QWidget) -> QWidget | None:
-        current: QWidget | None = widget
-        while current is not None:
-            if isinstance(current, QAbstractSpinBox):
-                return current
-            if isinstance(current, QComboBox):
-                view = current.view()
-                if view is not None and view.isVisible():
-                    return None
-                return current
-            if current is self:
-                return None
-            current = current.parentWidget()
-        return None
+        return should_suppress_value_wheel_event(watched, event)
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell")
@@ -2129,27 +2038,15 @@ class SAXSMainWindow(QMainWindow):
         return screen.availableGeometry() if screen is not None else None
 
     def _fit_window_size_to_current_screen(self, size: QSize) -> QSize:
-        available = self._current_available_geometry()
-        if available is None:
-            return size
-        usable_width = max(640, available.width() - 48)
-        usable_height = max(520, available.height() - 64)
-        return QSize(
-            min(size.width(), usable_width),
-            min(size.height(), usable_height),
+        return fit_window_size_to_screen(
+            size,
+            screen=self._current_window_screen(),
         )
 
     def _recommended_window_layout_preset(self) -> WindowLayoutPreset:
-        available = self._current_available_geometry()
-        if available is None:
-            return WINDOW_LAYOUT_PRESET_MAP[DEFAULT_WINDOW_PRESET_KEY]
-        if available.width() <= 1366 or available.height() <= 820:
-            return WINDOW_LAYOUT_PRESET_MAP["laptop_13"]
-        if available.width() <= 1600 or available.height() <= 940:
-            return WINDOW_LAYOUT_PRESET_MAP["laptop_14"]
-        if available.width() <= 1920 or available.height() <= 1100:
-            return WINDOW_LAYOUT_PRESET_MAP["display_1080p"]
-        return WINDOW_LAYOUT_PRESET_MAP["display_1440p"]
+        return recommended_window_layout_preset(
+            screen=self._current_window_screen(),
+        )
 
     def _apply_auto_window_layout_preset(self) -> None:
         preset = self._recommended_window_layout_preset()

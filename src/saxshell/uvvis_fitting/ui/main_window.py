@@ -60,6 +60,7 @@ from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 from saxshell.uvvis_fitting.model import (
     DEFAULT_MONTE_CARLO_SEED,
     PEAK_COLORS,
@@ -411,7 +412,7 @@ class RangeSweepResultsDialog(QDialog):
         self._peak_label = peak_label
         self._selected_record: SweepFitRecord | None = None
         self.setWindowTitle(f"Range fit results: {peak_label} {parameter}")
-        self.resize(1200, 640)
+        apply_preset_window_size(self, "laptop_14")
 
         layout = QVBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -673,7 +674,7 @@ class MonteCarloResultsDialog(QDialog):
         self._result = result
         self._selected_record: MonteCarloFitRecord | None = result.best_record
         self.setWindowTitle("Monte Carlo results")
-        self.resize(1280, 760)
+        apply_preset_window_size(self, "laptop_14")
 
         layout = QVBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -942,7 +943,7 @@ class UVVisFitMainWindow(QMainWindow):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("SAXSShell UV-Vis Peak Fitter")
-        self.resize(1260, 860)
+        apply_preset_window_size(self, "laptop_16")
         self.dataset: UVVisDataset | None = None
         self.components: list[PeakComponent] = []
         self.last_result: FitResult | None = None

@@ -165,6 +165,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 from saxshell.ui.periodic_table import PeriodicTableElementDialog
 
 _OPEN_WINDOWS: list["RMCSetupMainWindow"] = []
@@ -434,7 +435,7 @@ class RMCSetupMainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("SAXSShell (rmcsetup)")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1080, 860)
+        apply_preset_window_size(self, "laptop_14")
         self._build_menu_bar()
 
         self.project_manager = SAXSProjectManager()

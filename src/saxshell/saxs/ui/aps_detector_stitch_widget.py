@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from saxshell.ui.window_layout import tool_window_size
 from saxshell.saxs.aps_detector_stitch import (
     APS_DETECTOR_ORDER,
     APSDetectorStitchResult,

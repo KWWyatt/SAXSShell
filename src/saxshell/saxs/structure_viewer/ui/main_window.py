@@ -42,6 +42,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 
 from .widget import StructureViewerWidget
 
@@ -63,7 +64,7 @@ class StructureViewerMainWindow(QMainWindow):
 
         self.setWindowTitle("Structure Viewer")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1380, 900)
+        apply_preset_window_size(self, "display_1080p")
         self._build_menu_bar()
         self._build_ui()
 

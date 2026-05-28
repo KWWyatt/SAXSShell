@@ -6335,27 +6335,26 @@ def _resolve_experimental_columns(
                 f"The selected {label} column index {index} is out of range."
             )
 
-    if error_column is not None:
-        resolved_error = error_column
-    elif inferred_e is not None:
-        resolved_error = inferred_e
-    elif n_columns >= 3:
-        candidate = 2
-        resolved_error = (
-            candidate if candidate not in {resolved_q, resolved_i} else None
-        )
-    else:
-        resolved_error = None
+    reserved_columns = {resolved_q, resolved_i}
 
-    if resolved_error is not None:
-        if resolved_error in {resolved_q, resolved_i}:
-            raise ValueError(
-                "The error column must be different from q and intensity."
-            )
-        if resolved_error < 0 or resolved_error >= n_columns:
-            raise ValueError(
-                f"The selected error column index {resolved_error} is out of range."
-            )
+    def _usable_error_column(index: int | None) -> int | None:
+        if index is None:
+            return None
+        if index < 0 or index >= n_columns:
+            return None
+        if index in reserved_columns:
+            return None
+        return index
+
+    resolved_error: int | None = None
+    for candidate in (
+        error_column,
+        inferred_e,
+        2 if n_columns >= 3 else None,
+    ):
+        resolved_error = _usable_error_column(candidate)
+        if resolved_error is not None:
+            break
     return resolved_q, resolved_i, resolved_error
 
 

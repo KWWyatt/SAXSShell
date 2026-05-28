@@ -36,6 +36,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 from saxshell.saxs.ui.project_status_label import CompactProjectStatusLabel
 
 
@@ -292,7 +293,7 @@ class MDTrajectoryMainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (mdtrajectory)")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1280, 780)
+        apply_preset_window_size(self, "laptop_14")
 
         central = QWidget()
         root = QVBoxLayout(central)

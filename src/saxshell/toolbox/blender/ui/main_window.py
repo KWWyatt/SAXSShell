@@ -49,6 +49,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 from saxshell.toolbox.blender.common import (
     ATOM_STYLE_LABELS,
     COVALENT_RADII,
@@ -2127,7 +2128,7 @@ class BlenderXYZRendererMainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (Blender Structure Renderer)")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1340, 960)
+        apply_preset_window_size(self, "display_1080p")
 
         central = QWidget(self)
         root_layout = QVBoxLayout(central)

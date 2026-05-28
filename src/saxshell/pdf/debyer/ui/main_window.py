@@ -86,6 +86,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 from saxshell.saxs.ui.experimental_data_loader import (
     ExperimentalDataHeaderDialog,
 )
@@ -440,7 +441,7 @@ class DebyerPDFMainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (pdfsetup)")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1460, 920)
+        apply_preset_window_size(self, "display_1080p")
 
         central = QWidget()
         root = QHBoxLayout(central)

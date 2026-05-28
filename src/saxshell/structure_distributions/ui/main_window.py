@@ -36,6 +36,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 from saxshell.structure_distributions import (
     StructureDistributionGroup,
     StructureDistributionIndex,
@@ -80,7 +81,7 @@ class StructureDistributionBrowserWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell Structure Distribution Browser")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1120, 760)
+        apply_preset_window_size(self, "laptop_14")
 
         central = QWidget()
         root = QVBoxLayout(central)

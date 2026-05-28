@@ -176,20 +176,6 @@ class DreamTab(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        self._outer_scroll_area = QScrollArea()
-        self._outer_scroll_area.setWidgetResizable(True)
-        self._outer_scroll_area.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-        self._outer_scroll_area.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(12)
-
         self._output_group = self._build_output_group()
         self._top_splitter = QSplitter()
         self._top_splitter.setOrientation(Qt.Orientation.Horizontal)
@@ -219,10 +205,7 @@ class DreamTab(QWidget):
             parent=self,
         )
         self.set_auto_snap_enabled(self._auto_snap_enabled)
-        content_layout.addWidget(self._top_splitter)
-
-        self._outer_scroll_area.setWidget(content)
-        root.addWidget(self._outer_scroll_area)
+        root.addWidget(self._top_splitter, stretch=1)
 
     def _build_settings_scroll_area(self) -> QScrollArea:
         scroll = QScrollArea()
