@@ -117,6 +117,7 @@ from saxshell.saxs.electron_density_mapping.workflow import (
 )
 from saxshell.saxs.ui._pane_snap import PaneSnapFilter
 from saxshell.saxs.ui.branding import (
+from saxshell.ui.window_layout import apply_preset_window_size
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
@@ -545,7 +546,7 @@ class _SavedOutputComparisonDialog(QDialog):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("Saved Output Comparison")
-        self.resize(1380, 980)
+        apply_preset_window_size(self, "display_1080p")
         self._entries = tuple(entries)
         self._entry_plot_widgets = self._entries
         self._show_variance_shading = bool(show_variance_shading)
@@ -1197,7 +1198,7 @@ class _DebyeScatteringComparisonDialog(QDialog):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("Debye Scattering Comparison")
-        self.resize(1320, 900)
+        apply_preset_window_size(self, "laptop_16")
         self._entries = tuple(entries)
         self._trace_colors = {
             entry.entry_id: str(entry.color) for entry in self._entries
@@ -2222,7 +2223,7 @@ class ElectronDensityMappingMainWindow(QMainWindow):
 
         self._apply_preview_mode_title()
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1520, 960)
+        apply_preset_window_size(self, "display_1080p")
         self._build_ui()
         self._load_project_debye_waller_terms()
         self._set_initial_defaults()

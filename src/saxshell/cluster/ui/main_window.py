@@ -41,6 +41,7 @@ from saxshell.saxs.project_manager import (
     build_project_paths,
 )
 from saxshell.saxs.ui.branding import (
+from saxshell.ui.window_layout import apply_preset_window_size
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
@@ -441,7 +442,7 @@ class ClusterMainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (cluster)")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1360, 860)
+        apply_preset_window_size(self, "laptop_16")
 
         central = QWidget()
         root = QVBoxLayout(central)

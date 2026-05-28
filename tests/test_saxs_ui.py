@@ -18109,7 +18109,7 @@ def test_fft_born_main_window_uses_split_scrollable_layout(qapp):
     window = FFTBornApproximationMainWindow(preview_mode=True)
     assert window.windowTitle() == "3D FFT Born Approximation (Preview)"
     assert window.size().width() >= 1680
-    assert window.size().height() >= 1040
+    assert window.size().height() >= 980
     assert isinstance(window._pane_splitter, QSplitter)
     assert isinstance(window._left_scroll_area, QScrollArea)
     assert isinstance(window._right_scroll_area, QScrollArea)

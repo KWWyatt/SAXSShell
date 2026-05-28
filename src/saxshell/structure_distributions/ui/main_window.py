@@ -32,6 +32,7 @@ from saxshell.bondanalysis.results import (
 )
 from saxshell.bondanalysis.ui.plot_window import BondAnalysisPlotWindow
 from saxshell.saxs.ui.branding import (
+from saxshell.ui.window_layout import apply_preset_window_size
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
@@ -80,7 +81,7 @@ class StructureDistributionBrowserWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell Structure Distribution Browser")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1120, 760)
+        apply_preset_window_size(self, "laptop_14")
 
         central = QWidget()
         root = QVBoxLayout(central)

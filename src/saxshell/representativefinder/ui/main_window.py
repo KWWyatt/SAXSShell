@@ -75,6 +75,7 @@ from saxshell.saxs.electron_density_mapping.workflow import (
     load_electron_density_structure,
 )
 from saxshell.saxs.ui.branding import (
+from saxshell.ui.window_layout import apply_preset_window_size
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
@@ -589,7 +590,7 @@ class RepresentativeStructureFinderMainWindow(QMainWindow):
 
         self.setWindowTitle("Representative Structures")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1380, 900)
+        apply_preset_window_size(self, "display_1080p")
         self._build_ui()
         self._refresh_analysis_mode_ui()
         self._reload_presets()

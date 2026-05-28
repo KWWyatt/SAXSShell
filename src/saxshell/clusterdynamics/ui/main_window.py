@@ -67,6 +67,7 @@ from saxshell.saxs.project_manager import (
     build_project_paths,
 )
 from saxshell.saxs.ui.branding import (
+from saxshell.ui.window_layout import apply_preset_window_size
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
@@ -752,7 +753,7 @@ class ClusterDynamicsMainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (clusterdynamics)")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1540, 920)
+        apply_preset_window_size(self, "display_1080p")
 
         central = QWidget()
         root = QHBoxLayout(central)
