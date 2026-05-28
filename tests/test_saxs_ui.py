@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -17297,8 +17296,7 @@ def test_load_experimental_data_file_ignores_stale_error_column_index(
 ):
     data_path = tmp_path / "exp_two_columns.txt"
     data_path.write_text(
-        "0.05\t10.0\n"
-        "0.10\t9.5\n",
+        "0.05\t10.0\n" "0.10\t9.5\n",
         encoding="utf-8",
     )
 

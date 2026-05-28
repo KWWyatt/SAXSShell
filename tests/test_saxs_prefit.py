@@ -2889,9 +2889,9 @@ def test_build_scattering_components_ensures_cluster_geometry_metadata(
     workflow = SAXSPrefitWorkflow(project_dir)
     assert workflow.cluster_geometry_rows()
     assert workflow.cluster_geometry_rows()[0].mapped_parameter == "w0"
-    assert workflow.cluster_geometry_rows()[0].effective_radius == pytest.approx(
-        effective_radius
-    )
+    assert workflow.cluster_geometry_rows()[
+        0
+    ].effective_radius == pytest.approx(effective_radius)
     evaluation = workflow.evaluate()
     assert np.allclose(
         evaluation.model_intensities,

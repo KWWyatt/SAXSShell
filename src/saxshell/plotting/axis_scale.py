@@ -29,7 +29,8 @@ def resolve_axis_scale(requested_log: bool, axis, *, dimension: str) -> str:
 
 
 def safe_set_axis_scale(axis, dimension: str, scale: str) -> str:
-    """Apply an axis scale, falling back to linear when log scaling is unsafe."""
+    """Apply an axis scale, falling back to linear when log scaling is
+    unsafe."""
     if scale not in {"linear", "log"}:
         scale = "linear"
     if scale == "log":
