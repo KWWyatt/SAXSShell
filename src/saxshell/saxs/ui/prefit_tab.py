@@ -280,20 +280,6 @@ class PrefitTab(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        self._scroll_area = QScrollArea()
-        self._scroll_area.setWidgetResizable(True)
-        self._scroll_area.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-        self._scroll_area.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(12)
-
         self._main_splitter = QSplitter(Qt.Orientation.Vertical)
         self._main_splitter.setChildrenCollapsible(False)
         self._main_splitter.setHandleWidth(10)
@@ -347,11 +333,7 @@ class PrefitTab(QWidget):
             parent=self,
         )
         self.set_auto_snap_enabled(self._auto_snap_enabled)
-        content_layout.addWidget(self._main_splitter, stretch=1)
-
-        self._scroll_area.setWidget(content)
-        root.addWidget(self._scroll_area)
-
+        root.addWidget(self._main_splitter, stretch=1)
     def _install_field_interaction_watchers(self) -> None:
         watched_widgets: list[QWidget] = []
         for child in self.findChildren(QWidget):

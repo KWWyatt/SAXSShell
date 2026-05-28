@@ -104,6 +104,7 @@ from saxshell.saxs.ui.branding import (
     prepare_saxshell_application_identity,
 )
 from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
+from saxshell.ui.window_layout import apply_preset_window_size
 
 AUTO_SNAP_PANES_KEY = "contrast_fft_auto_snap_panes_enabled"
 STARTUP_LOAD_TOTAL_STEPS = 3

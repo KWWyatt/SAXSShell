@@ -74,6 +74,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 from saxshell.xyz2pdb import list_reference_library
 
 from ..dataset import (
@@ -760,8 +761,6 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
     def eventFilter(self, watched: object, event: QEvent) -> bool:
         if self._handle_guarded_field_escape(watched, event):
             return True
-        if self._should_block_guarded_field_wheel(watched, event):
-            return True
         return super().eventFilter(watched, event)
 
     def _guarded_field_owner(self, watched: object) -> QWidget | None:
@@ -814,26 +813,12 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         event.accept()
         return True
 
-    def _should_block_guarded_field_wheel(
-        self,
-        watched: object,
-        event: QEvent,
-    ) -> bool:
-        if event.type() != QEvent.Type.Wheel:
-            return False
-        owner = self._guarded_field_owner(watched)
-        if owner is None:
-            return False
-        if isinstance(owner, QComboBox) and owner.view().isVisible():
-            return False
-        event.ignore()
-        return True
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (clusterdynamicsml)")
         self.setWindowIcon(load_saxshell_icon())
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.resize(1640, 960)
+        apply_preset_window_size(self, "display_1080p")
 
         central = QWidget()
         root = QHBoxLayout(central)

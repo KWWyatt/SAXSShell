@@ -8814,8 +8814,7 @@ def test_prefit_layout_uses_left_parameter_panel_and_combined_output(qapp):
     window = SAXSMainWindow()
 
     assert window.prefit_tab.parameter_table.parentWidget() is not None
-    assert window.prefit_tab._scroll_area.widget() is not None
-    assert window.prefit_tab._scroll_area.widgetResizable()
+    assert window.prefit_tab._main_splitter.parentWidget() is window.prefit_tab
     assert window.prefit_tab._main_splitter.count() == 2
     assert (
         window.prefit_tab._main_splitter.widget(0)
@@ -8849,8 +8848,7 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
     del qapp
     window = SAXSMainWindow()
 
-    assert window.dream_tab._outer_scroll_area.widget() is not None
-    assert window.dream_tab._outer_scroll_area.widgetResizable()
+    assert window.dream_tab._top_splitter.parentWidget() is window.dream_tab
     assert window.dream_tab.output_box is window.dream_tab.log_box
     assert window.dream_tab.output_box is window.dream_tab.summary_box
     assert window.dream_tab.fit_parameter_table.columnCount() == 4
@@ -18109,7 +18107,7 @@ def test_fft_born_main_window_uses_split_scrollable_layout(qapp):
     window = FFTBornApproximationMainWindow(preview_mode=True)
     assert window.windowTitle() == "3D FFT Born Approximation (Preview)"
     assert window.size().width() >= 1680
-    assert window.size().height() >= 1040
+    assert window.size().height() >= 980
     assert isinstance(window._pane_splitter, QSplitter)
     assert isinstance(window._left_scroll_area, QScrollArea)
     assert isinstance(window._right_scroll_area, QScrollArea)

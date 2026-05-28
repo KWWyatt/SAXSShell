@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from saxshell.ui.window_layout import tool_window_size
 from saxshell.fullrmc.solution_properties import (
     SolutionPropertiesSettings,
     solution_properties_mode_hint_text,

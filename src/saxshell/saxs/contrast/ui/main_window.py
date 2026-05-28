@@ -101,6 +101,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.ui.window_layout import apply_preset_window_size
 
 _OPEN_WINDOWS: list["ContrastModeMainWindow"] = []
 _TRACE_COLOR_SCHEME_OPTIONS = (
@@ -252,19 +253,14 @@ class ContrastModeMainWindow(QMainWindow):
         self._preview_refresh_timer.timeout.connect(
             self._flush_scheduled_preview_refresh
         )
-        self._app_event_filter_installed = False
         self._solvent_presets: dict[str, ContrastSolventPreset] = {}
         self._build_ui()
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
-            self._app_event_filter_installed = True
         self.apply_launch_context(self._launch_context)
 
     def _build_ui(self) -> None:
         self._apply_preview_mode_title()
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(1600, 980)
+        apply_preset_window_size(self, "display_1080p")
 
         central = QWidget(self)
         root_layout = QVBoxLayout(central)
@@ -335,8 +331,7 @@ class ContrastModeMainWindow(QMainWindow):
 
     def _build_left_pane(self) -> QScrollArea:
         content = QWidget()
-        content.setMinimumWidth(580)
-        content.setMinimumHeight(1380)
+        content.setMinimumWidth(520)
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
@@ -356,8 +351,7 @@ class ContrastModeMainWindow(QMainWindow):
 
     def _build_right_pane(self) -> QScrollArea:
         content = QWidget()
-        content.setMinimumWidth(820)
-        content.setMinimumHeight(980)
+        content.setMinimumWidth(720)
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -1475,39 +1469,6 @@ class ContrastModeMainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         super().closeEvent(event)
-
-    def eventFilter(self, watched: object, event: QEvent) -> bool:
-        if self._should_block_guarded_field_wheel(watched, event):
-            return True
-        return super().eventFilter(watched, event)
-
-    def _guarded_field_owner(self, watched: object) -> QWidget | None:
-        widget = watched if isinstance(watched, QWidget) else None
-        left_root = self.left_scroll_area.widget()
-        while widget is not None:
-            if isinstance(widget, (QAbstractSpinBox, QComboBox, QLineEdit)):
-                if left_root is not None and (
-                    widget is left_root or left_root.isAncestorOf(widget)
-                ):
-                    return widget
-                return None
-            widget = widget.parentWidget()
-        return None
-
-    def _should_block_guarded_field_wheel(
-        self,
-        watched: object,
-        event: QEvent,
-    ) -> bool:
-        if event.type() != QEvent.Type.Wheel:
-            return False
-        owner = self._guarded_field_owner(watched)
-        if owner is None:
-            return False
-        if isinstance(owner, QComboBox) and owner.view().isVisible():
-            return False
-        event.ignore()
-        return True
 
     def _set_q_range_controls(
         self,

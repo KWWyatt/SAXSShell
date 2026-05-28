@@ -279,6 +279,7 @@ def configure_saxshell_application(app: QApplication) -> None:
     app.setApplicationDisplayName(SAXSHELL_APPLICATION_NAME)
     app.setDesktopFileName(SAXSHELL_APPLICATION_NAME)
     app.setWindowIcon(load_saxshell_icon())
+    install_global_value_wheel_guard(app)
 
 
 def create_saxshell_startup_splash() -> QSplashScreen:
