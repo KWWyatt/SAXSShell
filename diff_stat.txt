@@ -1,0 +1,13 @@
+ crash_log.txt                                      |      1 -
+ docs/user-guide/cluster-dynamics-ml.md             |      4 -
+ qt_stderr.txt                                      | 527992 ------------------
+ qt_stdout.txt                                      |      0
+ saxshell_stderr.txt                                |      0
+ saxshell_stdout.txt                                |      0
+ src/saxshell/plotting/axis_scale.py                |      3 +-
+ src/saxshell/xyz2pdb/reference_library/cspbi2.json |     15 +-
+ src/saxshell/xyz2pdb/reference_library/cspbi3.json |     15 +-
+ src/saxshell/xyz2pdb/reference_library/pbi3.json   |     15 +-
+ tests/test_saxs_prefit.py                          |      6 +-
+ tests/test_saxs_ui.py                              |      4 +-
+ 12 files changed, 15 insertions(+), 528040 deletions(-)
