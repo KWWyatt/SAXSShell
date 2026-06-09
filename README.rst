@@ -607,15 +607,16 @@ new, resumed, or already complete.
 ``bondanalysis``
 ~~~~~~~~~~~~~~~~
 
-The ``bondanalysis`` application is designed for bond-pair and
-angle-triplet distribution analysis on the stoichiometry-level cluster
-folders produced by ``clusters``. A typical workflow is:
+The ``bondanalysis`` application is designed for bond-pair,
+angle-triplet, dihedral-quartet, and coordination-number distribution
+analysis on the stoichiometry-level cluster folders produced by
+``clusters``. A typical workflow is:
 
 1. Use ``mdtrajectory`` to export frames.
 2. Use ``clusters`` to sort those frames into stoichiometry folders.
 3. Open ``bondanalysis`` on the cluster-output folder.
-4. Choose the bond pairs and angle triplets to measure, along with
-   their cutoff distances.
+4. Choose the bond pairs, angle triplets, dihedral quartets, and
+   coordination rules to measure, along with their cutoff distances.
 5. Run the analysis to write CSVs, histograms, comparison plots, and a
    JSON manifest into a sibling ``bondanalysis_*`` folder.
 
@@ -632,10 +633,10 @@ To launch the Qt application from the repository root ::
 Bondanalysis UI Use
 -------------------
 
-The Qt interface focuses only on bond-pair and angle-distribution
-analysis. The legacy displacement-analysis tooling is intentionally not
-part of the new window and should be treated as deprecated until it is
-updated.
+The Qt interface focuses on bond-pair, angle, dihedral, and
+coordination-distribution analysis. The legacy displacement-analysis
+tooling is intentionally not part of the new window and should be
+treated as deprecated until it is updated.
 
 Launch the UI ::
 
@@ -661,7 +662,12 @@ Inside the window:
    distance cutoff in angstrom.
 6. Add one or more angle-triplet rows using the vertex atom, the two
    arm atoms, and the two vertex-arm cutoffs in angstrom.
-7. Click ``Analyze Bond Pairs and Angle Distributions``.
+7. Add one or more dihedral-quartet rows using four atoms and the
+   three adjacent-pair cutoffs in angstrom. For Pb-coordinated DMF,
+   ``Pb-O-C-N`` extracts the signed torsion needed for GDS constraint
+   setup.
+8. Click ``Analyze Bond, Angle, Dihedral, and Coordination
+   Distributions``.
 
 Each run writes:
 
@@ -671,8 +677,8 @@ Each run writes:
    types
    under ``all_clusters/``.
 3. Overlay comparison CSVs, NPYs, and PNG plots under ``comparisons/``.
-4. A ``bondanalysis_manifest.json`` file describing the run inputs and
-   outputs.
+4. A ``bondanalysis_results_index.json`` file describing the run inputs,
+   outputs, and GDS variable registry.
 
 Bondanalysis Terminal Use
 -------------------------
@@ -681,12 +687,24 @@ Inspect a clusters directory before running analysis ::
 
         PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis inspect clusters_splitxyz0001
 
-Run bond-pair and angle analysis headlessly on every cluster type ::
+Run bond-pair, angle, and dihedral analysis headlessly on every cluster
+type ::
 
         PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis run clusters_splitxyz0001 \
             --bond-pair Pb:I:3.50 \
             --bond-pair Pb:O:3.20 \
-            --angle-triplet Pb:I:I:3.50:3.50
+            --angle-triplet Pb:I:I:3.50:3.50 \
+            --dihedral Pb:O:C:N:3.20:2.20:2.20
+
+Each histogram CSV includes ordinary distribution statistics plus GDS-oriented
+metadata. Bond-distance histograms add ``gds_center_angstrom``,
+``gds_sigma_angstrom``, and ``gds_sigma2_angstrom_squared``. Angle and
+dihedral histograms add degree and radian forms, including
+``gds_center_degrees``, ``gds_sigma_degrees``, ``gds_center_radians``,
+``gds_sigma_radians``, and ``gds_variance_radians_squared``. The metadata also
+includes ``gds_*_variable`` names and paste-ready Artemis ``set`` rows, and
+the run's ``bondanalysis_results_index.json`` registers those variables across
+the saved cluster and aggregate distributions.
 
 Restrict the run to selected stoichiometry folders and choose an
 explicit output directory ::
@@ -710,6 +728,7 @@ inspection and execution steps used by the UI and terminal interfaces.
             AngleTripletDefinition,
             BondAnalysisWorkflow,
             BondPairDefinition,
+            DihedralQuartetDefinition,
         )
 
         workflow = BondAnalysisWorkflow(
@@ -720,6 +739,11 @@ inspection and execution steps used by the UI and terminal interfaces.
             ],
             angle_triplets=[
                 AngleTripletDefinition("Pb", "I", "I", 3.50, 3.50),
+            ],
+            dihedral_quartets=[
+                DihedralQuartetDefinition(
+                    "Pb", "O", "C", "N", 3.20, 2.20, 2.20
+                ),
             ],
         )
         summary = workflow.inspect()

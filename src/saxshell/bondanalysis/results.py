@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -15,9 +16,10 @@ from .bondanalyzer import (
     AngleTripletDefinition,
     BondPairDefinition,
     CoordinationNumberDefinition,
+    DihedralQuartetDefinition,
 )
 
-DistributionCategory = Literal["bond", "angle", "coordination"]
+DistributionCategory = Literal["bond", "angle", "dihedral", "coordination"]
 RESULTS_INDEX_FILENAME = "bondanalysis_results_index.json"
 LEGACY_RESULTS_INDEX_FILENAME = "bondanalysis_manifest.json"
 
@@ -36,7 +38,7 @@ class BondAnalysisResultLeaf:
 
 @dataclass(frozen=True, slots=True)
 class BondAnalysisResultGroup:
-    """All cluster-level leaves for one bond pair or angle triplet."""
+    """All cluster-level leaves for one computed distribution."""
 
     category: DistributionCategory
     display_label: str
@@ -76,10 +78,15 @@ class BondAnalysisResultIndex:
     cluster_type_names: tuple[str, ...]
     bond_pairs: tuple[BondPairDefinition, ...]
     angle_triplets: tuple[AngleTripletDefinition, ...]
+    dihedral_quartets: tuple[DihedralQuartetDefinition, ...]
     coordination_numbers: tuple[CoordinationNumberDefinition, ...]
     bond_groups: tuple[BondAnalysisResultGroup, ...]
     angle_groups: tuple[BondAnalysisResultGroup, ...]
+    dihedral_groups: tuple[BondAnalysisResultGroup, ...]
     coordination_groups: tuple[BondAnalysisResultGroup, ...]
+    gds_variable_registry: tuple[dict[str, object], ...]
+    analysis_signature: str | None = None
+    analysis_signature_payload: Mapping[str, object] | None = None
 
     @property
     def manifest_path(self) -> Path:
@@ -95,6 +102,8 @@ class BondAnalysisResultIndex:
             groups = self.bond_groups
         elif category == "angle":
             groups = self.angle_groups
+        elif category == "dihedral":
+            groups = self.dihedral_groups
         else:
             groups = self.coordination_groups
         for group in groups:
@@ -151,6 +160,15 @@ def draw_plot_request(
     axis.set_title(request.title)
     axis.set_xlabel(request.xlabel)
     axis.set_ylabel("Count")
+    if request.category == "coordination" and non_empty_series:
+        values = np.concatenate([series.values for series in non_empty_series])
+        first_integer = max(0, math.floor(float(np.min(values))))
+        last_integer = max(first_integer, math.ceil(float(np.max(values))))
+        axis.set_xlim(
+            left=max(0.0, first_integer - 0.5),
+            right=max(first_integer + 0.5, last_integer + 0.5),
+        )
+        axis.set_xticks(np.arange(first_integer, last_integer + 1, dtype=int))
     return len(non_empty_series)
 
 
@@ -166,8 +184,10 @@ def _histogram_bins_for_request(
     )
     if values.size == 0:
         return np.asarray([0.0, 1.0], dtype=float)
-    left = math.floor(float(np.min(values))) - 0.5
-    right = math.ceil(float(np.max(values))) + 0.5
+    first_integer = max(0, math.floor(float(np.min(values))))
+    last_integer = max(first_integer, math.ceil(float(np.max(values))))
+    left = first_integer - 0.5
+    right = last_integer + 0.5
     edges = np.arange(left, right + 1.0, 1.0, dtype=float)
     if edges.size < 2:
         return np.asarray([left, right], dtype=float)
@@ -201,6 +221,10 @@ def load_result_index(output_dir: str | Path) -> BondAnalysisResultIndex:
         AngleTripletDefinition(**entry)
         for entry in payload.get("angle_triplets", [])
     )
+    dihedral_quartets = tuple(
+        DihedralQuartetDefinition(**entry)
+        for entry in payload.get("dihedral_quartets", [])
+    )
     coordination_numbers = tuple(
         CoordinationNumberDefinition(**entry)
         for entry in payload.get("coordination_numbers", [])
@@ -212,6 +236,10 @@ def load_result_index(output_dir: str | Path) -> BondAnalysisResultIndex:
     angle_groups = tuple(
         _build_angle_group(definition, cluster_results)
         for definition in angle_triplets
+    )
+    dihedral_groups = tuple(
+        _build_dihedral_group(definition, cluster_results)
+        for definition in dihedral_quartets
     )
     coordination_groups = tuple(
         _build_coordination_group(definition, cluster_results)
@@ -231,10 +259,23 @@ def load_result_index(output_dir: str | Path) -> BondAnalysisResultIndex:
         ),
         bond_pairs=bond_pairs,
         angle_triplets=angle_triplets,
+        dihedral_quartets=dihedral_quartets,
         coordination_numbers=coordination_numbers,
         bond_groups=bond_groups,
         angle_groups=angle_groups,
+        dihedral_groups=dihedral_groups,
         coordination_groups=coordination_groups,
+        gds_variable_registry=tuple(payload.get("gds_variable_registry", [])),
+        analysis_signature=(
+            str(payload["analysis_signature"])
+            if payload.get("analysis_signature")
+            else None
+        ),
+        analysis_signature_payload=(
+            payload.get("analysis_signature_payload")
+            if isinstance(payload.get("analysis_signature_payload"), Mapping)
+            else None
+        ),
     )
 
 
@@ -459,6 +500,44 @@ def _build_coordination_group(
     )
 
 
+def _build_dihedral_group(
+    definition: DihedralQuartetDefinition,
+    cluster_results: tuple[dict[str, object], ...],
+) -> BondAnalysisResultGroup:
+    cluster_leaves = tuple(
+        BondAnalysisResultLeaf(
+            category="dihedral",
+            display_label=definition.display_label,
+            scope_name=str(cluster_result["cluster_type"]),
+            npy_path=(
+                Path(str(cluster_result["output_dir"]))
+                / f"{definition.filename_stem}_dihedrals.npy"
+            ),
+            point_count=int(
+                cluster_result.get("dihedral_value_counts", {}).get(
+                    definition.display_label,
+                    0,
+                )
+            ),
+        )
+        for cluster_result in cluster_results
+    )
+    return BondAnalysisResultGroup(
+        category="dihedral",
+        display_label=definition.display_label,
+        xlabel="Dihedral (deg)",
+        cluster_leaves=cluster_leaves,
+        all_leaf=BondAnalysisResultLeaf(
+            category="dihedral",
+            display_label=definition.display_label,
+            scope_name="all",
+            npy_path=None,
+            point_count=sum(leaf.point_count for leaf in cluster_leaves),
+            is_all=True,
+        ),
+    )
+
+
 def _load_distribution_values(leaf: BondAnalysisResultLeaf) -> np.ndarray:
     if leaf.is_all or leaf.npy_path is None or not leaf.npy_path.exists():
         return np.array([], dtype=float)
@@ -467,8 +546,21 @@ def _load_distribution_values(leaf: BondAnalysisResultLeaf) -> np.ndarray:
         getattr(payload.dtype, "names", None)
         and "value" in payload.dtype.names
     ):
-        return np.asarray(payload["value"], dtype=float)
-    return np.asarray(payload, dtype=float)
+        values = np.asarray(payload["value"], dtype=float)
+    else:
+        values = np.asarray(payload, dtype=float)
+    if leaf.category == "dihedral":
+        return _wrap_dihedral_degrees(values)
+    return values
+
+
+def _wrap_dihedral_degrees(values: np.ndarray) -> np.ndarray:
+    wrapped = (np.asarray(values, dtype=float) + 180.0) % 360.0 - 180.0
+    return np.where(
+        np.isclose(wrapped, -180.0) & (np.asarray(values, dtype=float) > 0.0),
+        180.0,
+        wrapped,
+    )
 
 
 def _slugify_filename_fragment(value: str) -> str:

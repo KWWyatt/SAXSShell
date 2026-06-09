@@ -9,6 +9,7 @@ from .bondanalyzer import (
     AngleTripletDefinition,
     BondPairDefinition,
     CoordinationNumberDefinition,
+    DihedralQuartetDefinition,
 )
 from .workflow import BondAnalysisWorkflow
 
@@ -106,6 +107,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Coordination definition as CENTER:NEIGHBOR:CUTOFF.",
     )
+    run_parser.add_argument(
+        "--dihedral",
+        "--dihedral-quartet",
+        dest="dihedral_quartet",
+        action="append",
+        default=[],
+        help=(
+            "Dihedral definition as "
+            "ATOM1:ATOM2:ATOM3:ATOM4:CUTOFF12:CUTOFF23:CUTOFF34."
+        ),
+    )
     run_parser.set_defaults(handler=_handle_run)
 
     return parser
@@ -164,6 +176,7 @@ def _handle_inspect(args: argparse.Namespace) -> int:
 def _handle_run(args: argparse.Namespace) -> int:
     bond_pairs = _parse_bond_pairs(args.bond_pair)
     angle_triplets = _parse_angle_triplets(args.angle_triplet)
+    dihedral_quartets = _parse_dihedral_quartets(args.dihedral_quartet)
     coordination_numbers = _parse_coordination_numbers(
         args.coordination_number
     )
@@ -171,6 +184,7 @@ def _handle_run(args: argparse.Namespace) -> int:
         args.clusters_dir,
         bond_pairs=bond_pairs,
         angle_triplets=angle_triplets,
+        dihedral_quartets=dihedral_quartets,
         coordination_numbers=coordination_numbers,
         output_dir=getattr(args, "output_dir", None),
         selected_cluster_types=(
@@ -185,9 +199,12 @@ def _handle_run(args: argparse.Namespace) -> int:
         f"Structure files processed: {result.total_structure_files}",
         f"Results index file: {result.results_index_path}",
     ]
+    if result.reused_existing_result:
+        lines.append("Reused stored results: yes")
     for cluster_result in result.cluster_results:
         bond_total = sum(cluster_result.bond_value_counts.values())
         angle_total = sum(cluster_result.angle_value_counts.values())
+        dihedral_total = sum(cluster_result.dihedral_value_counts.values())
         coordination_total = sum(
             cluster_result.coordination_value_counts.values()
         )
@@ -196,6 +213,7 @@ def _handle_run(args: argparse.Namespace) -> int:
             f"{cluster_result.structure_count} file(s), "
             f"{bond_total} bond values, "
             f"{angle_total} angle values, "
+            f"{dihedral_total} dihedral values, "
             f"{coordination_total} coordination values"
         )
     print("\n".join(lines))
@@ -259,6 +277,31 @@ def _parse_coordination_numbers(
                 parts[0],
                 parts[1],
                 float(parts[2]),
+            )
+        )
+    return definitions
+
+
+def _parse_dihedral_quartets(
+    values: list[str],
+) -> list[DihedralQuartetDefinition]:
+    definitions: list[DihedralQuartetDefinition] = []
+    for raw in values:
+        parts = [part.strip() for part in raw.split(":")]
+        if len(parts) != 7:
+            raise ValueError(
+                "Dihedral arguments must look like "
+                "ATOM1:ATOM2:ATOM3:ATOM4:CUTOFF12:CUTOFF23:CUTOFF34."
+            )
+        definitions.append(
+            DihedralQuartetDefinition(
+                parts[0],
+                parts[1],
+                parts[2],
+                parts[3],
+                float(parts[4]),
+                float(parts[5]),
+                float(parts[6]),
             )
         )
     return definitions
