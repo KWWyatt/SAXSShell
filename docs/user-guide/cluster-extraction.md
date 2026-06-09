@@ -81,9 +81,9 @@ The CLI help text explicitly calls out faster neighbor search modes such as
 For repeatable project runs, launch the setup window and save a run file in the
 SAXSShell project folder:
 
-From the main SAXSShell window, use **Tools > CLI Setup > Open Cluster
-Extraction CLI Setup (Beta)**. The same setup window can also be launched from
-a terminal:
+From the main SAXSShell window, use **Tools > (beta) > CLI Setup > Open Cluster
+Extraction CLI Setup (Beta)**. The same setup window can also be launched from a
+terminal:
 
 ```bash
 PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster setup-ui /path/to/saxs_project
@@ -146,6 +146,6 @@ clusters before moving on.
 - [Bond Analysis](bond-analysis.md)
 - [Debye-Waller Analysis](debye-waller-analysis.md)
 - [Project Configuration](project-configuration.md)
-- [Cluster Dynamics](cluster-dynamics.md)
-- [Cluster Dynamics ML](cluster-dynamics-ml.md)
+- [Cluster Dynamics](cluster-dynamics-ml.md)
+- [Cluster Dynamics Time-Binned](cluster-dynamics.md)
 - [SAXS Prefit](saxs-prefit.md)
