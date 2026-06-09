@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -37,6 +38,9 @@ from saxshell.cluster import (
 )
 from saxshell.structure import AtomTypeDefinitions
 from saxshell.xyz2pdb import ReferenceLibraryEntry
+
+ATOM_TYPE_COLUMN_WIDTH = 128
+ATOM_TYPE_COMBO_MIN_WIDTH = 112
 
 
 class ClusterDefinitionsPanel(QGroupBox):
@@ -87,9 +91,8 @@ class ClusterDefinitionsPanel(QGroupBox):
             | QAbstractItemView.EditTrigger.AnyKeyPressed
         )
         atom_header = self.atom_table.horizontalHeader()
-        atom_header.setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents
-        )
+        atom_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.atom_table.setColumnWidth(0, ATOM_TYPE_COLUMN_WIDTH)
         atom_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         atom_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.atom_table.itemChanged.connect(self._on_atom_table_changed)
@@ -507,12 +510,38 @@ class ClusterDefinitionsPanel(QGroupBox):
 
     def _make_atom_type_combo(self, atom_type: str) -> QComboBox:
         combo = QComboBox()
+        combo.setEditable(False)
         combo.addItems(["node", "linker", "shell"])
         if atom_type not in {"node", "linker", "shell"}:
             combo.addItem(atom_type)
         combo.blockSignals(True)
         combo.setCurrentText(atom_type)
         combo.blockSignals(False)
+        combo.setMinimumContentsLength(len("linker"))
+        combo.setMinimumWidth(ATOM_TYPE_COMBO_MIN_WIDTH)
+        combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        combo.setStyleSheet(
+            "QComboBox {"
+            "background: #ffffff;"
+            "border: 1px solid #b8cdca;"
+            "border-radius: 6px;"
+            "color: #082c34;"
+            "padding-left: 8px;"
+            "padding-right: 26px;"
+            "}"
+            "QComboBox::drop-down {"
+            "width: 24px;"
+            "}"
+            "QComboBox QAbstractItemView {"
+            "color: #082c34;"
+            "}"
+        )
         combo.setToolTip("Cluster role assigned to this element.")
         combo.currentTextChanged.connect(self._on_atom_type_combo_changed)
         return combo

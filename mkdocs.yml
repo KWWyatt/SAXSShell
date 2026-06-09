@@ -86,9 +86,7 @@ nav:
               - XYZ to PDB Conversion: user-guide/xyz2pdb-conversion.md
           - Structure Analysis:
               - Bond Analysis: user-guide/bond-analysis.md
-          - Cluster Dynamics:
-              - Cluster Dynamics: user-guide/cluster-dynamics.md
-              - Cluster Dynamics ML: user-guide/cluster-dynamics-ml.md
+              - Cluster Dynamics: user-guide/cluster-dynamics-ml.md
           - PDF:
               - PDF Calculation: user-guide/pdf-calculation.md
               - fullrmc Packmol Docker Link: user-guide/fullrmc-packmol-docker.md
@@ -102,6 +100,7 @@ nav:
               - X-ray Toolkit: user-guide/xray-toolkit.md
           - (beta):
               - Representative Structure CLI: user-guide/representative-structure-cli.md
+              - Cluster Dynamics Time-Binned: user-guide/cluster-dynamics.md
               - Debye-Waller Analysis: user-guide/debye-waller-analysis.md
   - Tutorials:
       - Example Workflow: tutorials/example-workflow.md

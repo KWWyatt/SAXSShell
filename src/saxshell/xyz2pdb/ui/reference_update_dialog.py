@@ -56,68 +56,75 @@ class MoleculePreviewWidget(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802
         del event
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#f8f6ef"))
-        preview_rect = self.rect().adjusted(12, 12, -12, -12)
-        painter.setPen(QPen(QColor("#d8d2c4"), 1.0))
-        painter.drawRoundedRect(preview_rect, 10, 10)
-        if not self._atoms:
-            painter.setPen(QColor("#6c6a63"))
-            painter.drawText(
-                preview_rect,
-                Qt.AlignmentFlag.AlignCenter,
-                "No structure",
-            )
-            return
-
-        projected_atoms = _project_atoms(self._atoms, preview_rect)
-        bond_items = []
-        for bond in _infer_direct_reference_bonds(self._atoms):
-            point1 = projected_atoms[bond.atom1_index]
-            point2 = projected_atoms[bond.atom2_index]
-            average_depth = (point1[2] + point2[2]) / 2.0
-            bond_items.append((average_depth, point1, point2))
-        for _depth, point1, point2 in sorted(
-            bond_items, key=lambda item: item[0]
-        ):
-            painter.setPen(QPen(QColor("#9ea7b3"), 3.0, Qt.PenStyle.SolidLine))
-            painter.drawLine(
-                int(round(point1[0])),
-                int(round(point1[1])),
-                int(round(point2[0])),
-                int(round(point2[1])),
-            )
-
-        atom_items = []
-        for index, atom in enumerate(self._atoms):
-            x_coord, y_coord, depth = projected_atoms[index]
-            radius = _preview_atom_radius(atom.element)
-            atom_items.append((depth, x_coord, y_coord, radius, atom))
-        for _depth, x_coord, y_coord, radius, atom in sorted(
-            atom_items,
-            key=lambda item: item[0],
-        ):
-            fill_color = QColor(_ELEMENT_COLORS.get(atom.element, "#7f8c8d"))
-            painter.setPen(QPen(QColor("#39434d"), 1.2))
-            painter.setBrush(fill_color)
-            painter.drawEllipse(
-                int(round(x_coord - radius)),
-                int(round(y_coord - radius)),
-                int(round(radius * 2.0)),
-                int(round(radius * 2.0)),
-            )
-            if radius >= 10:
-                painter.setPen(
-                    QColor("#f7f7f7" if atom.element != "H" else "#3c3c3c")
-                )
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.fillRect(self.rect(), QColor("#f8f6ef"))
+            preview_rect = self.rect().adjusted(12, 12, -12, -12)
+            painter.setPen(QPen(QColor("#d8d2c4"), 1.0))
+            painter.drawRoundedRect(preview_rect, 10, 10)
+            if not self._atoms:
+                painter.setPen(QColor("#6c6a63"))
                 painter.drawText(
+                    preview_rect,
+                    Qt.AlignmentFlag.AlignCenter,
+                    "No structure",
+                )
+                return
+
+            projected_atoms = _project_atoms(self._atoms, preview_rect)
+            bond_items = []
+            for bond in _infer_direct_reference_bonds(self._atoms):
+                point1 = projected_atoms[bond.atom1_index]
+                point2 = projected_atoms[bond.atom2_index]
+                average_depth = (point1[2] + point2[2]) / 2.0
+                bond_items.append((average_depth, point1, point2))
+            for _depth, point1, point2 in sorted(
+                bond_items, key=lambda item: item[0]
+            ):
+                painter.setPen(
+                    QPen(QColor("#9ea7b3"), 3.0, Qt.PenStyle.SolidLine)
+                )
+                painter.drawLine(
+                    int(round(point1[0])),
+                    int(round(point1[1])),
+                    int(round(point2[0])),
+                    int(round(point2[1])),
+                )
+
+            atom_items = []
+            for index, atom in enumerate(self._atoms):
+                x_coord, y_coord, depth = projected_atoms[index]
+                radius = _preview_atom_radius(atom.element)
+                atom_items.append((depth, x_coord, y_coord, radius, atom))
+            for _depth, x_coord, y_coord, radius, atom in sorted(
+                atom_items,
+                key=lambda item: item[0],
+            ):
+                fill_color = QColor(
+                    _ELEMENT_COLORS.get(atom.element, "#7f8c8d")
+                )
+                painter.setPen(QPen(QColor("#39434d"), 1.2))
+                painter.setBrush(fill_color)
+                painter.drawEllipse(
                     int(round(x_coord - radius)),
                     int(round(y_coord - radius)),
                     int(round(radius * 2.0)),
                     int(round(radius * 2.0)),
-                    int(Qt.AlignmentFlag.AlignCenter),
-                    atom.element,
                 )
+                if radius >= 10:
+                    painter.setPen(
+                        QColor("#f7f7f7" if atom.element != "H" else "#3c3c3c")
+                    )
+                    painter.drawText(
+                        int(round(x_coord - radius)),
+                        int(round(y_coord - radius)),
+                        int(round(radius * 2.0)),
+                        int(round(radius * 2.0)),
+                        int(Qt.AlignmentFlag.AlignCenter),
+                        atom.element,
+                    )
+        finally:
+            painter.end()
 
 
 class AssertionReferenceUpdateDialog(QDialog):

@@ -168,6 +168,7 @@ class DreamRunSettings:
     p_gamma_unity: float = 0.2
     history_thin: int = 10
     history_file: str | None = None
+    export_plot_data: bool = False
     model_name: str | None = None
     run_label: str = "dream"
     search_filter_preset: str = "medium"
@@ -278,6 +279,13 @@ class DreamRunSettings:
             history_thin=int(_get_first(payload, "history_thin", default=10)),
             history_file=_optional_str(
                 _get_first(payload, "history_file", default=None)
+            ),
+            export_plot_data=_coerce_bool(
+                _get_first(
+                    payload,
+                    "export_plot_data",
+                    default=False,
+                )
             ),
             model_name=(
                 str(_get_first(payload, "model_name", "Model Name"))

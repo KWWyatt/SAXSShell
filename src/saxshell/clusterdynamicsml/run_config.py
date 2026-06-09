@@ -78,6 +78,7 @@ class ClusterDynamicsMLRunConfig:
     frames_per_colormap_timestep: int = 1
     analysis_start_fs: float | None = None
     analysis_stop_fs: float | None = None
+    prediction_enabled: bool = True
     target_node_counts: tuple[int, ...] = (4, 5)
     candidates_per_size: int = 3
     prediction_population_share_threshold: float = 0.02
@@ -125,6 +126,7 @@ class ClusterDynamicsMLRunConfig:
             ),
             "analysis_start_fs": self.analysis_start_fs,
             "analysis_stop_fs": self.analysis_stop_fs,
+            "prediction_enabled": bool(self.prediction_enabled),
             "target_node_counts": [
                 int(value) for value in self.target_node_counts
             ],
@@ -191,6 +193,7 @@ class ClusterDynamicsMLRunConfig:
             ),
             analysis_start_fs=optional_float(payload.get("analysis_start_fs")),
             analysis_stop_fs=optional_float(payload.get("analysis_stop_fs")),
+            prediction_enabled=bool(payload.get("prediction_enabled", True)),
             target_node_counts=coerce_int_tuple(
                 payload.get("target_node_counts")
             )
@@ -281,6 +284,7 @@ def build_clusterdynamicsml_run_config(
     frames_per_colormap_timestep: int = 1,
     analysis_start_fs: float | None = None,
     analysis_stop_fs: float | None = None,
+    prediction_enabled: bool = True,
     target_node_counts: tuple[int, ...] = (4, 5),
     candidates_per_size: int = 3,
     prediction_population_share_threshold: float = 0.02,
@@ -339,6 +343,7 @@ def build_clusterdynamicsml_run_config(
         ),
         analysis_start_fs=analysis_start_fs,
         analysis_stop_fs=analysis_stop_fs,
+        prediction_enabled=bool(prediction_enabled),
         target_node_counts=tuple(
             sorted({int(value) for value in target_node_counts})
         )
@@ -421,6 +426,7 @@ def workflow_from_clusterdynamicsml_run_config(
             config.energy_file,
             project_dir=resolved_project_dir,
         ),
+        prediction_enabled=config.prediction_enabled,
         target_node_counts=config.target_node_counts,
         candidates_per_size=config.candidates_per_size,
         prediction_population_share_threshold=(
@@ -459,6 +465,7 @@ def preview_clusterdynamicsml_run_config(
         "total_structure_files": int(preview.total_structure_files),
         "observed_node_counts": list(preview.observed_node_counts),
         "target_node_counts": list(preview.target_node_counts),
+        "prediction_enabled": bool(preview.prediction_enabled),
         "warnings": list(preview.warnings),
     }
 

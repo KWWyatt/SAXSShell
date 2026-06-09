@@ -737,6 +737,7 @@ def test_dream_batch_run_set_creates_runtime_bundles_and_commands(tmp_path):
 
     assert commands_text.startswith("# DREAM backend run set commands")
     assert loaded.queue_items[0].label == "strict priors"
+    assert loaded.export_plot_data is False
     assert loaded.filter_sets[0].label == "top n"
     assert loaded.filter_sets[0].settings.posterior_top_n == 2
     stored_filter = manifest_payload["filter_sets"][0]
@@ -760,7 +761,289 @@ def test_dream_batch_run_set_creates_runtime_bundles_and_commands(tmp_path):
     assert "# Check current status:" in commands_text
     assert "No live DREAM batch process" in commands_text
     assert "Comparison report:" in commands_text
-    assert "Fit report PDF:" in commands_text
+    assert "PDF fit report:" in commands_text
+    assert "<YYYYMMDD_HHMMSS>_dream_batch_fit_report.pdf" in commands_text
+    assert "Plot data export: off" in commands_text
+
+
+def test_dream_batch_new_shell_script_excludes_completed_items(tmp_path):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+
+    manager = DreamBatchRunSetManager(project_dir, label="resume sweep")
+    entries = manager.workflow.create_default_parameter_map(persist=False)
+    settings = manager.workflow.load_settings()
+    settings.niterations = 3
+    settings.nseedchains = 20
+
+    completed_item = manager.add_queue_item(
+        label="completed fit",
+        settings=settings,
+        entries=entries,
+    )
+    pending_item = manager.add_queue_item(
+        label="pending fit",
+        settings=settings,
+        entries=entries,
+    )
+    completed_item.status = "completed"
+    completed_item.started_at = "2026-05-27T09:00:00-06:00"
+    completed_item.finished_at = "2026-05-27T09:05:00-06:00"
+    manager.save_manifest()
+    original_manifest_path = manager.run_set.manifest_path
+
+    script_path, _commands_path = manager.generate_shell_script(
+        new_run_set_dir=True
+    )
+
+    new_run_set = load_dream_batch_manifest(manager.run_set.manifest_path)
+    original_run_set = load_dream_batch_manifest(original_manifest_path)
+    assert script_path.is_file()
+    assert [item.label for item in new_run_set.queue_items] == ["pending fit"]
+    assert new_run_set.queue_items[0].item_id == pending_item.item_id
+    assert new_run_set.queue_items[0].status == "queued"
+    assert new_run_set.queue_items[0].started_at is None
+    assert new_run_set.queue_items[0].finished_at is None
+    assert [item.label for item in original_run_set.queue_items] == [
+        "completed fit",
+        "pending fit",
+    ]
+    assert original_run_set.queue_items[0].status == "completed"
+
+
+def test_dream_batch_new_shell_script_refuses_all_completed_items(tmp_path):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+
+    manager = DreamBatchRunSetManager(project_dir, label="finished sweep")
+    entries = manager.workflow.create_default_parameter_map(persist=False)
+    settings = manager.workflow.load_settings()
+    item = manager.add_queue_item(
+        label="completed fit",
+        settings=settings,
+        entries=entries,
+    )
+    item.status = "completed"
+    manager.save_manifest()
+    original_run_set_dir = manager.run_set.resolved_run_set_dir
+
+    with pytest.raises(ValueError, match="No unfinished DREAM queue items"):
+        manager.generate_shell_script(new_run_set_dir=True)
+
+    assert manager.run_set.resolved_run_set_dir == original_run_set_dir
+
+
+def test_dream_batch_manifest_runner_skips_completed_items(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+
+    manager = DreamBatchRunSetManager(project_dir, label="resume runner")
+    entries = manager.workflow.create_default_parameter_map(persist=False)
+    settings = manager.workflow.load_settings()
+    completed_item = manager.add_queue_item(
+        label="already done",
+        settings=settings,
+        entries=entries,
+    )
+    pending_item = manager.add_queue_item(
+        label="still pending",
+        settings=settings,
+        entries=entries,
+    )
+    completed_item.status = "completed"
+    manager.save_manifest()
+    run_dirs: list[Path] = []
+
+    def fake_run_bundle(self, bundle, **kwargs):
+        del self, kwargs
+        run_dirs.append(bundle.run_dir)
+
+    monkeypatch.setattr(
+        dream_batch_module.SAXSDreamWorkflow,
+        "run_bundle",
+        fake_run_bundle,
+    )
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_filter_reports",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_batch_plot_data_artifacts",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_batch_comparison_report",
+        lambda run_set, **kwargs: run_set.comparison_report_path,
+    )
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_batch_fit_pdf_report",
+        lambda run_set, **kwargs: run_set.fit_report_pdf_path,
+    )
+    output_lines: list[str] = []
+
+    completed = run_dream_batch_manifest(
+        manager.run_set.manifest_path,
+        output_callback=output_lines.append,
+    )
+
+    assert run_dirs == [Path(pending_item.run_dir)]
+    assert completed.queue_items[0].status == "completed"
+    assert completed.queue_items[1].status == "completed"
+    assert any(
+        line == "Skipping 1 completed DREAM queue item(s)."
+        for line in output_lines
+    )
+
+
+def test_dream_batch_plot_export_defaults_off_and_pdf_report_still_runs(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+
+    manager = DreamBatchRunSetManager(project_dir, label="no plot export")
+    entries = manager.workflow.create_default_parameter_map(persist=False)
+    settings = manager.workflow.load_settings()
+    manager.add_queue_item(
+        label="runtime item",
+        settings=settings,
+        entries=entries,
+    )
+    manager.save_manifest()
+    calls: list[str] = []
+
+    def fake_run_bundle(self, bundle, **kwargs):
+        del self, bundle, kwargs
+
+    monkeypatch.setattr(
+        dream_batch_module.SAXSDreamWorkflow,
+        "run_bundle",
+        fake_run_bundle,
+    )
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_filter_reports",
+        lambda *args, **kwargs: [],
+    )
+
+    def fail_plot_export(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("plot export should be skipped by default")
+
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_batch_plot_data_artifacts",
+        fail_plot_export,
+    )
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_batch_comparison_report",
+        lambda run_set, **kwargs: calls.append("comparison")
+        or run_set.comparison_report_path,
+    )
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_batch_fit_pdf_report",
+        lambda run_set, **kwargs: calls.append("pdf")
+        or run_set.fit_report_pdf_path,
+    )
+
+    output_lines: list[str] = []
+    completed = run_dream_batch_manifest(
+        manager.run_set.manifest_path,
+        output_callback=output_lines.append,
+    )
+
+    assert completed.export_plot_data is False
+    assert calls == ["comparison", "pdf"]
+    assert any("plot data export is off" in line for line in output_lines)
+
+
+def test_dream_batch_plot_export_failure_still_writes_pdf_report(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+
+    manager = DreamBatchRunSetManager(project_dir, label="plot export fails")
+    manager.run_set.export_plot_data = True
+    entries = manager.workflow.create_default_parameter_map(persist=False)
+    settings = manager.workflow.load_settings()
+    manager.add_queue_item(
+        label="runtime item",
+        settings=settings,
+        entries=entries,
+    )
+    manager.save_manifest()
+    calls: list[str] = []
+    captured_plot_errors: list[dict[str, str] | None] = []
+
+    def fake_run_bundle(self, bundle, **kwargs):
+        del self, bundle, kwargs
+
+    monkeypatch.setattr(
+        dream_batch_module.SAXSDreamWorkflow,
+        "run_bundle",
+        fake_run_bundle,
+    )
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_filter_reports",
+        lambda *args, **kwargs: [],
+    )
+
+    def fail_plot_export(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("too much plot data")
+
+    def fake_comparison_report(run_set, **kwargs):
+        captured_plot_errors.append(kwargs.get("plot_artifact_errors"))
+        calls.append("comparison")
+        return run_set.comparison_report_path
+
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_batch_plot_data_artifacts",
+        fail_plot_export,
+    )
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_batch_comparison_report",
+        fake_comparison_report,
+    )
+    monkeypatch.setattr(
+        dream_batch_module,
+        "_write_batch_fit_pdf_report",
+        lambda run_set, **kwargs: calls.append("pdf")
+        or run_set.fit_report_pdf_path,
+    )
+
+    output_lines: list[str] = []
+    run_dream_batch_manifest(
+        manager.run_set.manifest_path,
+        output_callback=output_lines.append,
+    )
+
+    assert calls == ["comparison", "pdf"]
+    assert captured_plot_errors == [{"batch_plot_data": "too much plot data"}]
+    assert any(
+        "continuing with comparison and PDF reports" in line
+        for line in output_lines
+    )
 
 
 def test_dream_batch_queue_item_fit_range_update_rewrites_runtime_metadata(
@@ -943,6 +1226,49 @@ def test_dream_batch_remove_queue_item_deletes_queued_runtime_bundle(tmp_path):
     )
 
 
+def test_dream_batch_clear_queue_preserves_completed_run_history(tmp_path):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+
+    manager = DreamBatchRunSetManager(project_dir, label="clear queue")
+    entries = manager.workflow.create_default_parameter_map(persist=False)
+    settings = manager.workflow.load_settings()
+    completed_item = manager.add_queue_item(
+        label="completed fit",
+        settings=settings,
+        entries=entries,
+    )
+    queued_item = manager.add_queue_item(
+        label="queued fit",
+        settings=settings,
+        entries=entries,
+    )
+    completed_item.status = "completed"
+    manager.save_manifest()
+    completed_dir = Path(completed_item.run_dir)
+    queued_dir = Path(queued_item.run_dir)
+
+    removed_items = manager.clear_queue()
+
+    assert [item.label for item in removed_items] == [
+        "completed fit",
+        "queued fit",
+    ]
+    assert manager.run_set.queue_items == []
+    assert [item.label for item in manager.run_set.completed_queue_items] == [
+        "completed fit"
+    ]
+    assert completed_dir.is_dir()
+    assert not queued_dir.exists()
+    reloaded = load_dream_batch_manifest(manager.run_set.manifest_path)
+    assert reloaded.queue_items == []
+    assert [item.label for item in reloaded.completed_queue_items] == [
+        "completed fit"
+    ]
+    assert reloaded.completed_queue_items[0].status == "completed"
+
+
 def test_dream_batch_manifest_runner_executes_queue_and_reports(
     tmp_path,
     monkeypatch,
@@ -952,6 +1278,7 @@ def test_dream_batch_manifest_runner_executes_queue_and_reports(
     prefit.save_fit(prefit.parameter_entries)
 
     manager = DreamBatchRunSetManager(project_dir, label="runner")
+    manager.run_set.export_plot_data = True
     entries = manager.workflow.create_default_parameter_map(persist=False)
     settings = manager.workflow.load_settings()
     settings.niterations = 3
@@ -1081,6 +1408,43 @@ def test_dream_batch_manifest_runner_executes_queue_and_reports(
     assert "fit_index" in comparison_text
     assert "filter_subindex" in comparison_text
     assert "1.2" in comparison_text
+    assert "Plot data and metrics:" in comparison_text
+    matrix_lines = (
+        comparison_text.split("Run/filter matrix:\n", 1)[1]
+        .split("\n\n", 1)[0]
+        .splitlines()
+    )
+    matrix_headers = matrix_lines[0].split("\t")
+    matrix_rows = [
+        dict(zip(matrix_headers, line.split("\t"), strict=False))
+        for line in matrix_lines[1:]
+        if line.strip()
+    ]
+    top_half_row = next(
+        row for row in matrix_rows if row["report_index"] == "1.2"
+    )
+    for path_key in (
+        "fit_data_path",
+        "fit_metrics_path",
+        "violin_data_path",
+        "violin_metrics_path",
+    ):
+        assert path_key in matrix_headers
+        assert Path(top_half_row[path_key]).is_file()
+    fit_data_text = Path(top_half_row["fit_data_path"]).read_text(
+        encoding="utf-8"
+    )
+    assert "q,experimental_intensity,model_intensity,residual" in fit_data_text
+    fit_metrics = json.loads(
+        Path(top_half_row["fit_metrics_path"]).read_text(encoding="utf-8")
+    )
+    assert fit_metrics["report_index"] == "1.2"
+    assert fit_metrics["fit_metrics"]["rmse"] >= 0.0
+    violin_metrics = json.loads(
+        Path(top_half_row["violin_metrics_path"]).read_text(encoding="utf-8")
+    )
+    assert violin_metrics["report_index"] == "1.2"
+    assert violin_metrics["parameter_metrics"]
     assert "Best-fit parameter guide bounds:" in comparison_text
     assert "guide_low" in comparison_text
     assert "guide_high" in comparison_text
@@ -1099,12 +1463,24 @@ def test_dream_batch_manifest_runner_executes_queue_and_reports(
     assert any(
         "DREAM batch comparison report:" in message for message in messages
     )
-    fit_report_pdf = manager.run_set.fit_report_pdf_path
+    fit_report_pdf = completed.fit_report_pdf_path
+    assert (
+        fit_report_pdf.name[15:]
+        == f"_{dream_batch_module.DREAM_BATCH_FIT_REPORT_PDF_NAME}"
+    )
+    assert fit_report_pdf.name[8] == "_"
+    assert fit_report_pdf.name[:8].isdigit()
+    assert fit_report_pdf.name[9:15].isdigit()
     assert fit_report_pdf.is_file()
     assert fit_report_pdf.read_bytes().startswith(b"%PDF")
     assert fit_report_pdf.stat().st_size > 1000
+    manifest_payload = json.loads(
+        manager.run_set.manifest_path.read_text(encoding="utf-8")
+    )
+    assert manifest_payload["fit_report_pdf_filename"] == fit_report_pdf.name
+    assert manifest_payload["fit_report_pdf_path"] == str(fit_report_pdf)
     assert any(
-        "DREAM batch fit PDF report:" in message for message in messages
+        "DREAM batch PDF fit report:" in message for message in messages
     )
     assert json.loads(manager.run_set.status_path.read_text())["status"] == (
         "completed"

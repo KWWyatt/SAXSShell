@@ -39,12 +39,15 @@ When the PDF UI opens, SAXSShell runs a quick runtime check:
 1. locate `debyer` on `PATH`
 2. attempt a short `debyer --help` subprocess call
 
-If that check fails, the UI reports the failure immediately instead of waiting
-until the full trajectory-average job is started.
+The runtime panel shows the exact Debyer executable path selected by that check.
+You can replace it with a different executable path, then click **Revalidate**
+to confirm SAXSShell can launch that Debyer binary before starting the full
+trajectory-average job. If the check fails, the UI reports the failure
+immediately instead of waiting until the calculation is started.
 
 ## Main inputs
 
-The left pane is intentionally close to the newer Cluster Dynamics ML layout.
+The left pane is intentionally close to the newer Cluster Dynamics layout.
 The important settings are:
 
 - **Project folder**

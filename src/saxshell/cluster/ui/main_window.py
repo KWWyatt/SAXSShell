@@ -35,6 +35,7 @@ from saxshell.cluster import (
 from saxshell.cluster.ui.definitions_panel import ClusterDefinitionsPanel
 from saxshell.cluster.ui.export_panel import ClusterExportPanel
 from saxshell.cluster.ui.trajectory_panel import ClusterTrajectoryPanel
+from saxshell.project_memory import build_cluster_extraction_settings_payload
 from saxshell.saxs.project_manager import (
     ProjectSettings,
     SAXSProjectManager,
@@ -44,6 +45,7 @@ from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 from saxshell.saxs.ui.project_status_label import CompactProjectStatusLabel
 from saxshell.structure import AtomTypeDefinitions
@@ -402,6 +404,7 @@ class ClusterMainWindow(QMainWindow):
         self._inspect_worker: ClusterInspectionWorker | None = None
         self._export_thread: QThread | None = None
         self._export_worker: ClusterExportWorker | None = None
+        self._active_job_config: ClusterJobConfig | None = None
         self._progress_dialog: ClusterProgressDialog | None = None
         self._export_phase = "idle"
         self._project_xyz_frames_dir: Path | None = None
@@ -620,6 +623,7 @@ class ClusterMainWindow(QMainWindow):
         frames_dir: Path | None = None,
         pdb_frames_dir: Path | None = None,
         clusters_dir: Path | None = None,
+        cluster_config: ClusterJobConfig | None = None,
     ) -> str | None:
         settings = self._load_project_settings()
         if settings is None:
@@ -637,6 +641,41 @@ class ClusterMainWindow(QMainWindow):
             if clusters_dir is not None:
                 settings.clusters_dir = str(
                     Path(clusters_dir).expanduser().resolve()
+                )
+            if cluster_config is not None:
+                settings.cluster_extraction_settings = (
+                    build_cluster_extraction_settings_payload(
+                        frames_dir=cluster_config.frames_dir,
+                        clusters_dir=cluster_config.output_dir,
+                        atom_type_definitions=(
+                            cluster_config.atom_type_definitions
+                        ),
+                        pair_cutoff_definitions=(
+                            cluster_config.pair_cutoff_definitions
+                        ),
+                        box_dimensions=cluster_config.box_dimensions,
+                        use_pbc=cluster_config.use_pbc,
+                        default_cutoff=cluster_config.default_cutoff,
+                        shell_levels=cluster_config.shell_levels,
+                        include_shell_levels=(
+                            cluster_config.include_shell_levels
+                        ),
+                        shared_shells=cluster_config.shared_shells,
+                        smart_solvation_shells=(
+                            cluster_config.smart_solvation_shells
+                        ),
+                        include_shell_atoms_in_stoichiometry=(
+                            cluster_config.include_shell_atoms_in_stoichiometry
+                        ),
+                        search_mode=cluster_config.search_mode,
+                        save_state_frequency=(
+                            cluster_config.save_state_frequency
+                        ),
+                        box_dimensions_source_kind=(
+                            self._box_dimensions_source_kind()
+                        ),
+                        box_dimensions_source=self._box_dimensions_source(),
+                    )
                 )
             self._project_manager.save_project(settings)
             self._emit_project_paths_registered(
@@ -740,6 +779,7 @@ class ClusterMainWindow(QMainWindow):
                 "Preparing cluster analysis configuration..."
             )
             self.statusBar().showMessage("Extracting clusters...")
+            self._active_job_config = config
             self._start_export_worker(config)
         except Exception as exc:
             self._handle_error(
@@ -914,6 +954,7 @@ class ClusterMainWindow(QMainWindow):
         registration_message = self._register_project_paths(
             **self._current_project_input_registration(),
             clusters_dir=result.output_dir,
+            cluster_config=self._active_job_config,
         )
         if registration_message is not None:
             self.export_panel.append_log(registration_message)
@@ -935,6 +976,7 @@ class ClusterMainWindow(QMainWindow):
     def _cleanup_export_thread(self) -> None:
         self._export_thread = None
         self._export_worker = None
+        self._active_job_config = None
         self._export_phase = "idle"
 
     def _ensure_progress_dialog(self) -> ClusterProgressDialog:
@@ -1419,7 +1461,7 @@ def launch_cluster_ui(
             else None
         ),
     )
-    _OPEN_WINDOWS.append(window)
+    track_saxshell_window(window, _OPEN_WINDOWS)
     window.show()
     if owns_app:
         return app.exec()

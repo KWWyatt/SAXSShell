@@ -54,6 +54,8 @@ _EXTERNAL_COMPONENT_BUILD_MODES = {
     COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
     COMPONENT_BUILD_MODE_CONTRAST,
 }
+PROJECT_LAYOUT_VERSION_LEGACY = 1
+PROJECT_LAYOUT_VERSION_CURRENT = 2
 
 
 def normalize_component_source_mode(value: object) -> str:
@@ -87,6 +89,7 @@ def component_source_mode_label(value: object) -> str:
 class ProjectPaths:
     project_dir: Path
     project_file: Path
+    project_layout_version: int
     analysis_dir: Path
     structure_distribution_store_dir: Path
     saved_distributions_dir: Path
@@ -105,11 +108,102 @@ class ProjectPaths:
     reports_dir: Path
 
 
-def build_project_paths(project_dir: str | Path) -> ProjectPaths:
+def normalize_project_layout_version(
+    value: object,
+    *,
+    default: int = PROJECT_LAYOUT_VERSION_CURRENT,
+) -> int:
+    try:
+        layout_version = int(value)
+    except (TypeError, ValueError):
+        layout_version = default
+    if layout_version <= PROJECT_LAYOUT_VERSION_LEGACY:
+        return PROJECT_LAYOUT_VERSION_LEGACY
+    return PROJECT_LAYOUT_VERSION_CURRENT
+
+
+def _project_layout_version_from_file(
+    project_dir: str | Path,
+) -> int | None:
+    project_file = (
+        Path(project_dir).expanduser().resolve() / "saxs_project.json"
+    )
+    if not project_file.is_file():
+        return None
+    try:
+        payload = json.loads(project_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if "project_layout_version" not in payload:
+        return PROJECT_LAYOUT_VERSION_LEGACY
+    return normalize_project_layout_version(
+        payload.get("project_layout_version"),
+        default=PROJECT_LAYOUT_VERSION_LEGACY,
+    )
+
+
+def _project_layout_version_for_dir(
+    project_dir: str | Path,
+    *,
+    default: int = PROJECT_LAYOUT_VERSION_LEGACY,
+) -> int:
+    return _project_layout_version_from_file(project_dir) or default
+
+
+def build_project_paths(
+    project_dir: str | Path,
+    *,
+    project_layout_version: int | None = None,
+) -> ProjectPaths:
     project_dir = Path(project_dir).expanduser().resolve()
+    layout_version = normalize_project_layout_version(
+        project_layout_version,
+        default=_project_layout_version_for_dir(project_dir),
+    )
+    if layout_version >= PROJECT_LAYOUT_VERSION_CURRENT:
+        analysis_dir = project_dir / "analysis"
+        inputs_dir = project_dir / "inputs"
+        outputs_dir = project_dir / "outputs"
+        prefit_dir = analysis_dir / "prefit"
+        dream_dir = analysis_dir / "dream"
+        return ProjectPaths(
+            project_dir=project_dir,
+            project_file=project_dir / "saxs_project.json",
+            project_layout_version=layout_version,
+            analysis_dir=analysis_dir,
+            structure_distribution_store_dir=(
+                analysis_dir / "structure_distributions"
+            ),
+            saved_distributions_dir=analysis_dir / "computed_distributions",
+            experimental_data_dir=inputs_dir / "experimental_data",
+            scattering_components_dir=(
+                analysis_dir / "scattering_components" / "observed"
+            ),
+            predicted_scattering_components_dir=(
+                analysis_dir / "scattering_components" / "predicted"
+            ),
+            exported_results_dir=outputs_dir,
+            exported_plots_dir=outputs_dir / "plots",
+            exported_data_dir=outputs_dir / "data",
+            plots_dir=outputs_dir / "plots",
+            prefit_dir=prefit_dir,
+            cluster_geometry_metadata_file=(
+                prefit_dir / "cluster_geometry_metadata.json"
+            ),
+            predicted_cluster_geometry_metadata_file=(
+                prefit_dir
+                / "cluster_geometry_metadata_predicted_structures.json"
+            ),
+            dream_dir=dream_dir,
+            dream_runtime_dir=dream_dir / "runtime_scripts",
+            reports_dir=outputs_dir / "reports",
+        )
     return ProjectPaths(
         project_dir=project_dir,
         project_file=project_dir / "saxs_project.json",
+        project_layout_version=layout_version,
         analysis_dir=project_dir / "analysis",
         structure_distribution_store_dir=(
             project_dir / "analysis" / "structure_distributions"
@@ -661,6 +755,7 @@ class RegisteredFileSnapshot:
 class ProjectSettings:
     project_name: str
     project_dir: str
+    project_layout_version: int = PROJECT_LAYOUT_VERSION_LEGACY
     model_only_mode: bool = False
     use_predicted_structure_weights: bool = False
     use_representative_structures: bool = False
@@ -676,6 +771,12 @@ class ProjectSettings:
     trajectory_file_snapshot: RegisteredFileSnapshot | None = None
     topology_file_snapshot: RegisteredFileSnapshot | None = None
     energy_file_snapshot: RegisteredFileSnapshot | None = None
+    cluster_extraction_settings: dict[str, object] = field(
+        default_factory=dict
+    )
+    mdtrajectory_time_axis_settings: dict[str, object] = field(
+        default_factory=dict
+    )
     experimental_data_path: str | None = None
     copied_experimental_data_file: str | None = None
     solvent_data_path: str | None = None
@@ -805,6 +906,10 @@ class ProjectSettings:
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
+        payload["project_layout_version"] = normalize_project_layout_version(
+            self.project_layout_version,
+            default=PROJECT_LAYOUT_VERSION_LEGACY,
+        )
         payload["include_elements"] = list(self.include_elements)
         payload["exclude_elements"] = list(self.exclude_elements)
         payload["cluster_inventory_rows"] = [
@@ -878,6 +983,12 @@ class ProjectSettings:
             if self.energy_file_snapshot is None
             else self.energy_file_snapshot.to_dict()
         )
+        payload["cluster_extraction_settings"] = _normalized_json_object(
+            self.cluster_extraction_settings
+        )
+        payload["mdtrajectory_time_axis_settings"] = _normalized_json_object(
+            self.mdtrajectory_time_axis_settings
+        )
         payload["powerpoint_export_settings"] = (
             self.powerpoint_export_settings.to_dict()
         )
@@ -902,6 +1013,10 @@ class ProjectSettings:
         return cls(
             project_name=str(payload.get("project_name", "SAXS Project")),
             project_dir=str(payload.get("project_dir", "")),
+            project_layout_version=normalize_project_layout_version(
+                payload.get("project_layout_version"),
+                default=PROJECT_LAYOUT_VERSION_LEGACY,
+            ),
             model_only_mode=bool(payload.get("model_only_mode", False)),
             use_predicted_structure_weights=bool(
                 payload.get("use_predicted_structure_weights", False)
@@ -932,6 +1047,12 @@ class ProjectSettings:
             ),
             energy_file_snapshot=RegisteredFileSnapshot.from_dict(
                 payload.get("energy_file_snapshot")
+            ),
+            cluster_extraction_settings=_normalized_json_object(
+                payload.get("cluster_extraction_settings", {})
+            ),
+            mdtrajectory_time_axis_settings=_normalized_json_object(
+                payload.get("mdtrajectory_time_axis_settings", {})
             ),
             experimental_data_path=_optional_str(
                 payload.get("experimental_data_path")
@@ -1348,7 +1469,14 @@ def project_artifact_paths(
     storage_mode: str = "auto",
     allow_legacy_fallback: bool = True,
 ) -> ProjectArtifactPaths:
-    paths = build_project_paths(settings.project_dir)
+    layout_version = normalize_project_layout_version(
+        getattr(settings, "project_layout_version", None),
+        default=PROJECT_LAYOUT_VERSION_LEGACY,
+    )
+    paths = build_project_paths(
+        settings.project_dir,
+        project_layout_version=layout_version,
+    )
     normalized_mode = str(storage_mode).strip().lower() or "auto"
     active_distribution_id = _optional_str(
         getattr(settings, "active_distribution_id", None)
@@ -1367,14 +1495,24 @@ def project_artifact_paths(
     if use_distribution_storage:
         if active_distribution_id is not None:
             distribution_id = active_distribution_id
-            root_dir = paths.saved_distributions_dir / active_distribution_id
+            root_dir = _preferred_saved_distribution_dir(
+                paths.project_dir,
+                active_distribution_id,
+                project_layout_version=layout_version,
+                allow_legacy_fallback=allow_legacy_fallback,
+            )
         else:
             distribution_id_candidates = (
                 _distribution_id_candidates_for_settings(settings)
             )
             desired_distribution_id = distribution_id_candidates[0]
             distribution_id = desired_distribution_id
-            root_dir = paths.saved_distributions_dir / desired_distribution_id
+            root_dir = _preferred_saved_distribution_dir(
+                paths.project_dir,
+                desired_distribution_id,
+                project_layout_version=layout_version,
+                allow_legacy_fallback=allow_legacy_fallback,
+            )
             if allow_legacy_fallback and not root_dir.exists():
                 # Legacy saved-distribution folders were keyed before template
                 # and component-build-mode became part of the signature. Keep
@@ -1382,10 +1520,13 @@ def project_artifact_paths(
                 # structure distributions live under
                 # analysis/structure_distributions/.
                 for legacy_distribution_id in distribution_id_candidates[1:]:
-                    legacy_root_dir = (
-                        paths.saved_distributions_dir / legacy_distribution_id
+                    legacy_root_dir = _find_saved_distribution_dir(
+                        paths.project_dir,
+                        legacy_distribution_id,
+                        project_layout_version=layout_version,
+                        include_legacy=True,
                     )
-                    if legacy_root_dir.exists():
+                    if legacy_root_dir is not None:
                         distribution_id = legacy_distribution_id
                         root_dir = legacy_root_dir
                         break
@@ -1394,27 +1535,46 @@ def project_artifact_paths(
     includes_predicted_structures = bool(
         settings.use_predicted_structure_weights
     )
+    use_project_root_layout = (
+        not uses_distribution_storage
+        and layout_version >= PROJECT_LAYOUT_VERSION_CURRENT
+        and root_dir == paths.project_dir
+    )
+    artifact_plots_dir = (
+        paths.plots_dir if use_project_root_layout else root_dir / "plots"
+    )
     if includes_predicted_structures:
-        component_dir = root_dir / "scattering_components_predicted_structures"
+        component_dir = (
+            paths.predicted_scattering_components_dir
+            if use_project_root_layout
+            else root_dir / "scattering_components_predicted_structures"
+        )
         component_map_file = root_dir / "md_saxs_map_predicted_structures.json"
         prior_weights_file = (
             root_dir / "md_prior_weights_predicted_structures.json"
         )
         prior_plot_data_file = (
-            root_dir
-            / "plots"
+            artifact_plots_dir
             / "prior_histogram_data_predicted_structures.json"
         )
     else:
-        component_dir = root_dir / "scattering_components"
+        component_dir = (
+            paths.scattering_components_dir
+            if use_project_root_layout
+            else root_dir / "scattering_components"
+        )
         component_map_file = root_dir / "md_saxs_map.json"
         prior_weights_file = root_dir / "md_prior_weights.json"
-        prior_plot_data_file = root_dir / "plots" / "prior_histogram_data.json"
-    prefit_dir = root_dir / "prefit"
-    dream_dir = root_dir / "dream"
+        prior_plot_data_file = artifact_plots_dir / "prior_histogram_data.json"
+    prefit_dir = (
+        paths.prefit_dir if use_project_root_layout else root_dir / "prefit"
+    )
+    dream_dir = (
+        paths.dream_dir if use_project_root_layout else root_dir / "dream"
+    )
     return ProjectArtifactPaths(
         root_dir=root_dir,
-        plots_dir=root_dir / "plots",
+        plots_dir=artifact_plots_dir,
         component_dir=component_dir,
         component_map_file=component_map_file,
         contrast_dir=root_dir / "contrast",
@@ -1573,10 +1733,100 @@ def effective_q_range_for_settings(
 
 
 def _project_has_saved_distributions(project_dir: str | Path) -> bool:
-    saved_dir = build_project_paths(project_dir).saved_distributions_dir
-    if not saved_dir.is_dir():
-        return False
-    return any(path.is_dir() for path in saved_dir.iterdir())
+    return any(
+        saved_dir.is_dir()
+        and any(path.is_dir() for path in saved_dir.iterdir())
+        for saved_dir in _saved_distribution_roots(project_dir)
+    )
+
+
+def _saved_distribution_roots(
+    project_dir: str | Path,
+    *,
+    project_layout_version: int | None = None,
+    include_legacy: bool = True,
+) -> tuple[Path, ...]:
+    project_dir = Path(project_dir).expanduser().resolve()
+    layout_version = normalize_project_layout_version(
+        project_layout_version,
+        default=_project_layout_version_for_dir(project_dir),
+    )
+    candidates = [
+        build_project_paths(
+            project_dir,
+            project_layout_version=layout_version,
+        ).saved_distributions_dir
+    ]
+    if include_legacy:
+        candidates.append(
+            build_project_paths(
+                project_dir,
+                project_layout_version=PROJECT_LAYOUT_VERSION_LEGACY,
+            ).saved_distributions_dir
+        )
+        candidates.append(
+            build_project_paths(
+                project_dir,
+                project_layout_version=PROJECT_LAYOUT_VERSION_CURRENT,
+            ).saved_distributions_dir
+        )
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+    return tuple(roots)
+
+
+def _find_saved_distribution_dir(
+    project_dir: str | Path,
+    distribution_id: str,
+    *,
+    project_layout_version: int | None = None,
+    include_legacy: bool = True,
+) -> Path | None:
+    distribution_id = str(distribution_id).strip()
+    if not distribution_id:
+        return None
+    for saved_dir in _saved_distribution_roots(
+        project_dir,
+        project_layout_version=project_layout_version,
+        include_legacy=include_legacy,
+    ):
+        candidate = saved_dir / distribution_id
+        if (candidate / "distribution.json").is_file():
+            return candidate
+    return None
+
+
+def _preferred_saved_distribution_dir(
+    project_dir: str | Path,
+    distribution_id: str,
+    *,
+    project_layout_version: int,
+    allow_legacy_fallback: bool,
+) -> Path:
+    existing = (
+        _find_saved_distribution_dir(
+            project_dir,
+            distribution_id,
+            project_layout_version=project_layout_version,
+            include_legacy=allow_legacy_fallback,
+        )
+        if allow_legacy_fallback
+        else None
+    )
+    if existing is not None:
+        return existing
+    primary_root = _saved_distribution_roots(
+        project_dir,
+        project_layout_version=project_layout_version,
+        include_legacy=False,
+    )[0]
+    return primary_root / str(distribution_id).strip()
 
 
 def _distribution_built_component_source_mode_from_payload(
@@ -2042,12 +2292,21 @@ class SAXSProjectManager:
         project_dir: str | Path,
         *,
         project_name: str | None = None,
+        project_layout_version: int | None = None,
     ) -> ProjectSettings:
-        paths = build_project_paths(project_dir)
+        layout_version = normalize_project_layout_version(
+            project_layout_version,
+            default=PROJECT_LAYOUT_VERSION_LEGACY,
+        )
+        paths = build_project_paths(
+            project_dir,
+            project_layout_version=layout_version,
+        )
         self.ensure_project_dirs(paths)
         settings = ProjectSettings(
             project_name=project_name or paths.project_dir.name,
             project_dir=str(paths.project_dir),
+            project_layout_version=layout_version,
         )
         self.save_project(
             settings,
@@ -2074,7 +2333,12 @@ class SAXSProjectManager:
             settings,
             selected_project_dir=selected_project_dir,
         )
-        self.ensure_project_dirs(build_project_paths(settings.project_dir))
+        self.ensure_project_dirs(
+            build_project_paths(
+                settings.project_dir,
+                project_layout_version=settings.project_layout_version,
+            )
+        )
         return settings
 
     def _normalize_loaded_project_settings(
@@ -2103,15 +2367,15 @@ class SAXSProjectManager:
         self,
         settings: ProjectSettings,
     ) -> None:
-        saved_dir = build_project_paths(
-            settings.project_dir
-        ).saved_distributions_dir
         active_distribution_id = _optional_str(settings.active_distribution_id)
         if active_distribution_id is not None:
-            metadata_path = (
-                saved_dir / active_distribution_id / "distribution.json"
+            distribution_dir = _find_saved_distribution_dir(
+                settings.project_dir,
+                active_distribution_id,
+                project_layout_version=settings.project_layout_version,
+                include_legacy=True,
             )
-            if metadata_path.is_file():
+            if distribution_dir is not None:
                 return
             settings.active_distribution_id = None
 
@@ -2347,7 +2611,10 @@ class SAXSProjectManager:
         *,
         refresh_registered_paths: bool = True,
     ) -> Path:
-        paths = build_project_paths(settings.project_dir)
+        paths = build_project_paths(
+            settings.project_dir,
+            project_layout_version=settings.project_layout_version,
+        )
         self.ensure_project_dirs(paths)
         if refresh_registered_paths:
             _refresh_registered_folder_snapshots(settings)
@@ -2540,18 +2807,34 @@ class SAXSProjectManager:
         settings: ProjectSettings,
         project_dir: Path,
     ) -> None:
-        experimental_dir = (project_dir / "experimental_data").resolve()
+        experimental_dirs = tuple(
+            path.experimental_data_dir.resolve()
+            for path in (
+                build_project_paths(
+                    project_dir,
+                    project_layout_version=settings.project_layout_version,
+                ),
+                build_project_paths(
+                    project_dir,
+                    project_layout_version=PROJECT_LAYOUT_VERSION_LEGACY,
+                ),
+                build_project_paths(
+                    project_dir,
+                    project_layout_version=PROJECT_LAYOUT_VERSION_CURRENT,
+                ),
+            )
+        )
         cls._restore_internal_staged_file(
             settings,
             copied_attribute="copied_experimental_data_file",
             source_attribute="experimental_data_path",
-            experimental_dir=experimental_dir,
+            experimental_dirs=experimental_dirs,
         )
         cls._restore_internal_staged_file(
             settings,
             copied_attribute="copied_solvent_data_file",
             source_attribute="solvent_data_path",
-            experimental_dir=experimental_dir,
+            experimental_dirs=experimental_dirs,
         )
 
     @classmethod
@@ -2561,7 +2844,7 @@ class SAXSProjectManager:
         *,
         copied_attribute: str,
         source_attribute: str,
-        experimental_dir: Path,
+        experimental_dirs: tuple[Path, ...],
     ) -> None:
         copied_value = _optional_str(getattr(settings, copied_attribute))
         source_value = _optional_str(getattr(settings, source_attribute))
@@ -2571,17 +2854,25 @@ class SAXSProjectManager:
             filename = cls._portable_path_name(path_text)
             if not filename:
                 continue
-            candidate = experimental_dir / filename
-            if candidate.is_file():
-                setattr(settings, copied_attribute, str(candidate.resolve()))
-                return
+            for experimental_dir in experimental_dirs:
+                candidate = experimental_dir / filename
+                if candidate.is_file():
+                    setattr(
+                        settings,
+                        copied_attribute,
+                        str(candidate.resolve()),
+                    )
+                    return
         if copied_value or not source_value:
             return
         try:
             source_path = Path(source_value).expanduser().resolve()
         except Exception:
             return
-        if experimental_dir in source_path.parents and source_path.is_file():
+        if source_path.is_file() and any(
+            experimental_dir in source_path.parents
+            for experimental_dir in experimental_dirs
+        ):
             setattr(settings, copied_attribute, str(source_path))
 
     @staticmethod
@@ -2670,7 +2961,10 @@ class SAXSProjectManager:
         settings: ProjectSettings,
     ) -> Path:
         source = self._resolve_experimental_source(settings)
-        paths = build_project_paths(settings.project_dir)
+        paths = build_project_paths(
+            settings.project_dir,
+            project_layout_version=settings.project_layout_version,
+        )
         self.ensure_project_dirs(paths)
         destination = paths.experimental_data_dir / source.name
         if source.resolve() != destination.resolve():
@@ -2686,7 +2980,10 @@ class SAXSProjectManager:
         if source is None:
             settings.copied_solvent_data_file = None
             return None
-        paths = build_project_paths(settings.project_dir)
+        paths = build_project_paths(
+            settings.project_dir,
+            project_layout_version=settings.project_layout_version,
+        )
         self.ensure_project_dirs(paths)
         destination = paths.experimental_data_dir / source.name
         if source.resolve() != destination.resolve():
@@ -3077,27 +3374,34 @@ class SAXSProjectManager:
         self,
         project_dir: str | Path,
     ) -> list[SavedDistributionRecord]:
-        saved_dir = build_project_paths(project_dir).saved_distributions_dir
-        if not saved_dir.is_dir():
-            return []
         records: list[SavedDistributionRecord] = []
-        for distribution_dir in saved_dir.iterdir():
-            if not distribution_dir.is_dir():
+        seen: set[Path] = set()
+        for saved_dir in _saved_distribution_roots(project_dir):
+            if not saved_dir.is_dir():
                 continue
-            metadata_path = distribution_dir / "distribution.json"
-            if not metadata_path.is_file():
-                continue
-            try:
-                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            record = _distribution_metadata_from_payload(
-                distribution_dir,
-                metadata_path,
-                payload,
-            )
-            if record is not None:
-                records.append(record)
+            for distribution_dir in saved_dir.iterdir():
+                if not distribution_dir.is_dir():
+                    continue
+                resolved_distribution_dir = distribution_dir.resolve()
+                if resolved_distribution_dir in seen:
+                    continue
+                seen.add(resolved_distribution_dir)
+                metadata_path = distribution_dir / "distribution.json"
+                if not metadata_path.is_file():
+                    continue
+                try:
+                    payload = json.loads(
+                        metadata_path.read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    continue
+                record = _distribution_metadata_from_payload(
+                    distribution_dir,
+                    metadata_path,
+                    payload,
+                )
+                if record is not None:
+                    records.append(record)
         records.sort(
             key=lambda record: (
                 record.updated_at or "",
@@ -3113,10 +3417,15 @@ class SAXSProjectManager:
         project_dir: str | Path,
         distribution_id: str,
     ) -> SavedDistributionRecord:
-        distribution_dir = (
-            build_project_paths(project_dir).saved_distributions_dir
-            / str(distribution_id).strip()
+        distribution_dir = _find_saved_distribution_dir(
+            project_dir,
+            distribution_id,
         )
+        if distribution_dir is None:
+            distribution_dir = (
+                build_project_paths(project_dir).saved_distributions_dir
+                / str(distribution_id).strip()
+            )
         metadata_path = distribution_dir / "distribution.json"
         if not metadata_path.is_file():
             raise FileNotFoundError(
@@ -3143,15 +3452,23 @@ class SAXSProjectManager:
         distribution_id = str(distribution_id).strip()
         if not distribution_id:
             raise ValueError("Select a computed distribution to delete.")
-        saved_dir = build_project_paths(project_dir).saved_distributions_dir
-        distribution_dir = saved_dir / distribution_id
+        distribution_dir = _find_saved_distribution_dir(
+            project_dir,
+            distribution_id,
+        )
+        if distribution_dir is None:
+            raise FileNotFoundError(
+                f"No saved distribution folder was found for {distribution_id}."
+            )
         try:
-            saved_root = saved_dir.resolve()
             resolved_distribution_dir = distribution_dir.resolve()
         except FileNotFoundError:
             resolved_distribution_dir = distribution_dir
-            saved_root = saved_dir.resolve()
-        if saved_root not in resolved_distribution_dir.parents:
+        saved_roots = _saved_distribution_roots(project_dir)
+        if not any(
+            saved_root == resolved_distribution_dir.parent
+            for saved_root in saved_roots
+        ):
             raise ValueError("The computed distribution path is invalid.")
         if not distribution_dir.is_dir():
             raise FileNotFoundError(
@@ -3165,13 +3482,16 @@ class SAXSProjectManager:
     ) -> ProjectSettings:
         working_settings = ProjectSettings.from_dict(settings.to_dict())
         base_distribution_id = distribution_id_for_settings(working_settings)
-        saved_dir = build_project_paths(
-            working_settings.project_dir
-        ).saved_distributions_dir
+        saved_dir = _saved_distribution_roots(
+            working_settings.project_dir,
+            project_layout_version=working_settings.project_layout_version,
+            include_legacy=False,
+        )[0]
         created_at = datetime.now()
         attempt_index = self._next_distribution_attempt_index(
             saved_dir,
             base_distribution_id,
+            project_dir=working_settings.project_dir,
         )
         while True:
             distribution_id = _distribution_attempt_id(
@@ -3274,10 +3594,19 @@ class SAXSProjectManager:
         self,
         saved_dir: Path,
         base_distribution_id: str,
+        *,
+        project_dir: str | Path | None = None,
     ) -> int:
         max_index = 0
         if saved_dir.is_dir():
-            for record in self.list_saved_distributions(saved_dir.parent):
+            distribution_project_dir = (
+                saved_dir.parent
+                if project_dir is None
+                else Path(project_dir).expanduser().resolve()
+            )
+            for record in self.list_saved_distributions(
+                distribution_project_dir
+            ):
                 if record.base_distribution_id == base_distribution_id:
                     max_index = max(max_index, int(record.attempt_index or 0))
             for distribution_dir in saved_dir.iterdir():
@@ -3424,7 +3753,7 @@ class SAXSProjectManager:
                 raise FileNotFoundError(
                     "Predicted Structures mode is enabled, but the XYZ file "
                     f"for predicted structure {structure}/{motif} could not "
-                    "be found in this project. Re-run Cluster Dynamics ML "
+                    "be found in this project. Re-run Cluster Dynamics "
                     "or rebuild the prediction bundle before computing "
                     "cluster geometry metadata."
                 )
@@ -3584,7 +3913,10 @@ class SAXSProjectManager:
         *,
         progress_callback: ProgressCallback | None = None,
     ) -> ProjectBuildResult:
-        paths = build_project_paths(settings.project_dir)
+        paths = build_project_paths(
+            settings.project_dir,
+            project_layout_version=settings.project_layout_version,
+        )
         self.ensure_project_dirs(paths)
         staged_data_path: Path | None = None
         experimental_data: ExperimentalDataSummary | None = None
@@ -3962,7 +4294,10 @@ class SAXSProjectManager:
         *,
         progress_callback: ProgressCallback | None = None,
     ) -> ProjectBuildResult:
-        paths = build_project_paths(settings.project_dir)
+        paths = build_project_paths(
+            settings.project_dir,
+            project_layout_version=settings.project_layout_version,
+        )
         self.ensure_project_dirs(paths)
         staged_data_path: Path | None = None
         experimental_data: ExperimentalDataSummary | None = None
@@ -5578,7 +5913,7 @@ class SAXSProjectManager:
         )
         if combined_total <= 0.0:
             raise ValueError(
-                "The latest Cluster Dynamics ML result did not produce any "
+                "The latest Cluster Dynamics result did not produce any "
                 "positive observed or predicted structure weights."
             )
         observed_label_weights: dict[str, float] = {}
@@ -5650,7 +5985,7 @@ class SAXSProjectManager:
         if not predicted_payloads:
             raise ValueError(
                 "Predicted Structures mode is enabled, but the latest "
-                "Cluster Dynamics ML result does not contain any non-zero "
+                "Cluster Dynamics result does not contain any non-zero "
                 "predicted structure weights to include."
             )
         return (
@@ -5787,9 +6122,9 @@ class SAXSProjectManager:
         if dataset_file is None:
             raise FileNotFoundError(
                 "Use Predicted Structure Weights is enabled, but no "
-                "Cluster Dynamics ML prediction bundle was found in this "
-                "project. Open Tools > Cluster Dynamics > Open Cluster "
-                "Dynamics (ML), run a prediction, then rebuild the SAXS "
+                "Cluster Dynamics prediction bundle was found in this "
+                "project. Open Tools > Structure Analysis > Open Cluster "
+                "Dynamics, run a prediction, then rebuild the SAXS "
                 "components or prior weights."
             )
         from saxshell.clusterdynamicsml import load_cluster_dynamicsai_dataset
@@ -5797,7 +6132,7 @@ class SAXSProjectManager:
         loaded = load_cluster_dynamicsai_dataset(dataset_file)
         if not loaded.result.predictions:
             raise ValueError(
-                "The latest Cluster Dynamics ML result bundle does not "
+                "The latest Cluster Dynamics result bundle does not "
                 "contain any predicted structures."
             )
         return loaded
@@ -6403,9 +6738,7 @@ def _read_experimental_column_names(
     ).splitlines()
     if header_rows > 0 and header_rows <= len(lines):
         header_line = lines[header_rows - 1].strip()
-        header_tokens = _split_experimental_line(
-            _strip_comment_prefix(header_line)
-        )
+        header_tokens = _experimental_header_label_tokens(header_line)
         if (
             header_tokens
             and not _tokens_look_numeric(header_tokens)
@@ -6444,12 +6777,46 @@ def _is_comment_metadata_line(line: str) -> bool:
     candidate = _strip_comment_prefix(line)
     if not candidate:
         return True
-    tokens = _split_experimental_line(candidate)
+    tokens = _experimental_header_label_tokens(candidate)
     if len(tokens) >= 2 and _tokens_look_numeric(tokens):
         return False
     if ":" in candidate and not _tokens_look_like_column_labels(tokens):
         return True
     return not _tokens_look_like_column_labels(tokens)
+
+
+def _experimental_header_label_tokens(line: str) -> list[str]:
+    candidate = _strip_comment_prefix(line)
+    if ":" in candidate:
+        prefix, rest = candidate.split(":", 1)
+        normalized_prefix = re.sub(r"[^a-z0-9]+", "", prefix.lower())
+        if normalized_prefix in {
+            "column",
+            "columns",
+            "col",
+            "cols",
+            "field",
+            "fields",
+            "header",
+            "headers",
+        }:
+            candidate = rest.strip()
+    tokens = _split_experimental_line(candidate)
+    if not tokens:
+        return tokens
+    normalized_first = re.sub(r"[^a-z0-9]+", "", tokens[0].lower())
+    if normalized_first in {
+        "column",
+        "columns",
+        "col",
+        "cols",
+        "field",
+        "fields",
+        "header",
+        "headers",
+    }:
+        return tokens[1:]
+    return tokens
 
 
 def _tokens_look_like_column_labels(tokens: list[str]) -> bool:

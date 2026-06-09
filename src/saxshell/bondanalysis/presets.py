@@ -9,6 +9,7 @@ from .bondanalyzer import (
     AngleTripletDefinition,
     BondPairDefinition,
     CoordinationNumberDefinition,
+    DihedralQuartetDefinition,
 )
 
 
@@ -21,6 +22,7 @@ class BondAnalysisPreset:
     angle_triplets: tuple[AngleTripletDefinition, ...]
     builtin: bool = False
     coordination_numbers: tuple[CoordinationNumberDefinition, ...] = ()
+    dihedral_quartets: tuple[DihedralQuartetDefinition, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -29,6 +31,9 @@ class BondAnalysisPreset:
             ],
             "angle_triplets": [
                 definition.to_dict() for definition in self.angle_triplets
+            ],
+            "dihedral_quartets": [
+                definition.to_dict() for definition in self.dihedral_quartets
             ],
             "coordination_numbers": [
                 definition.to_dict()
@@ -62,6 +67,19 @@ class BondAnalysisPreset:
             )
             for entry in list(payload.get("angle_triplets", []))
         )
+        dihedral_quartets = tuple(
+            DihedralQuartetDefinition(
+                str(entry["atom1"]),
+                str(entry["atom2"]),
+                str(entry["atom3"]),
+                str(entry["atom4"]),
+                float(entry["cutoff12_angstrom"]),
+                float(entry["cutoff23_angstrom"]),
+                float(entry["cutoff34_angstrom"]),
+                branch_label=str(entry.get("branch_label", "")),
+            )
+            for entry in list(payload.get("dihedral_quartets", []))
+        )
         coordination_numbers = tuple(
             CoordinationNumberDefinition(
                 str(entry["center_atom"]),
@@ -74,6 +92,7 @@ class BondAnalysisPreset:
             name=name,
             bond_pairs=bond_pairs,
             angle_triplets=angle_triplets,
+            dihedral_quartets=dihedral_quartets,
             builtin=builtin,
             coordination_numbers=coordination_numbers,
         )
@@ -109,6 +128,9 @@ def default_presets() -> dict[str, BondAnalysisPreset]:
                 AngleTripletDefinition("S", "O", "C", 2.2, 2.2),
                 AngleTripletDefinition("S", "C", "C", 2.2, 2.2),
             ),
+            dihedral_quartets=(
+                DihedralQuartetDefinition("Pb", "O", "S", "C", 4.0, 2.2, 2.2),
+            ),
             coordination_numbers=(
                 CoordinationNumberDefinition("Pb", "I", 4.0),
                 CoordinationNumberDefinition("Pb", "O", 4.0),
@@ -133,6 +155,10 @@ def default_presets() -> dict[str, BondAnalysisPreset]:
                 AngleTripletDefinition("O", "Pb", "C", 4.0, 2.2),
                 AngleTripletDefinition("O", "Pb", "N", 4.0, 3.0),
                 AngleTripletDefinition("N", "C", "C", 2.2, 2.2),
+            ),
+            dihedral_quartets=(
+                DihedralQuartetDefinition("Pb", "O", "C", "N", 4.0, 2.2, 2.2),
+                DihedralQuartetDefinition("O", "C", "N", "C", 2.2, 2.2, 2.2),
             ),
             coordination_numbers=(
                 CoordinationNumberDefinition("Pb", "I", 4.0),

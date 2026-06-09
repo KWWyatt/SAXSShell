@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from matplotlib import colors as mcolors
 from PySide6.QtWidgets import QApplication
 
 import saxshell.clusterdynamics.cli as clusterdynamics_cli_module
@@ -22,8 +23,15 @@ from saxshell.clusterdynamics import (
     save_cluster_dynamics_dataset,
     save_clusterdynamics_run_config,
 )
-from saxshell.clusterdynamics.ui.main_window import ClusterDynamicsMainWindow
-from saxshell.clusterdynamics.ui.plot_panel import ClusterDynamicsPlotPanel
+from saxshell.clusterdynamics.ui.main_window import (
+    CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
+    ClusterDynamicsMainWindow,
+)
+from saxshell.clusterdynamics.ui.plot_panel import (
+    ClusterDynamicsPlotPanel,
+    _RichStoichiometryDelegate,
+    _stoichiometry_mathtext_to_html,
+)
 from saxshell.clusterdynamics.ui.run_file_window import (
     ClusterDynamicsRunFileWindow,
 )
@@ -31,6 +39,10 @@ from saxshell.plotting import (
     igor_inline_to_mathtext,
     load_pickled_plot_figure,
     prepare_igor_inline_segments,
+)
+from saxshell.project_memory import (
+    build_cluster_extraction_settings_payload,
+    build_mdtrajectory_time_axis_settings_payload,
 )
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
@@ -96,6 +108,18 @@ def _build_frames_dir(tmp_path: Path) -> Path:
     for index, content in enumerate(sequence):
         (frames_dir / f"frame_{index:04d}.xyz").write_text(content)
     return frames_dir
+
+
+def test_stoichiometry_mathtext_to_html_formats_scripts():
+    assert _stoichiometry_mathtext_to_html("PbI$_{2}$") == "PbI<sub>2</sub>"
+    assert (
+        _stoichiometry_mathtext_to_html("Pb$^{2}$I$_{3}$")
+        == "Pb<sup>2</sup>I<sub>3</sub>"
+    )
+    assert (
+        _stoichiometry_mathtext_to_html("A < B$_{2}$")
+        == "A &lt; B<sub>2</sub>"
+    )
 
 
 def _build_offset_frames_dir(tmp_path: Path) -> Path:
@@ -540,6 +564,110 @@ def test_cluster_dynamics_run_file_window_builds_project_config(
     window.close()
 
 
+def test_cluster_dynamics_main_window_loads_project_extraction_and_time_memory(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    frames_dir = _build_frames_dir(tmp_path)
+    energy_file = _write_energy_file(tmp_path)
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "project"
+    settings = manager.create_project(project_dir)
+    settings.frames_dir = str(frames_dir)
+    settings.energy_file = str(energy_file)
+    settings.cluster_extraction_settings = (
+        build_cluster_extraction_settings_payload(
+            frames_dir=frames_dir,
+            clusters_dir=tmp_path / "clusters_splitxyz0001",
+            atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+            pair_cutoff_definitions=PAIR_CUTOFFS,
+            box_dimensions=(31.0, 32.0, 33.0),
+            use_pbc=True,
+            default_cutoff=4.25,
+            shell_levels=(1, 2),
+            include_shell_levels=(0, 1, 2),
+            shared_shells=False,
+            smart_solvation_shells=True,
+            include_shell_atoms_in_stoichiometry=True,
+            search_mode="vectorized",
+            save_state_frequency=500,
+        )
+    )
+    settings.mdtrajectory_time_axis_settings = (
+        build_mdtrajectory_time_axis_settings_payload(
+            trajectory_file=tmp_path / "traj.xyz",
+            topology_file=None,
+            energy_file=energy_file,
+            start=10,
+            stop=200,
+            stride=2,
+            frame_timestep_fs=2.5,
+            use_manual_frame_timestep=True,
+            use_cutoff_for_export=True,
+            selected_cutoff_fs=125.0,
+            suggested_cutoff_fs=120.0,
+            use_post_cutoff_stride=True,
+            post_cutoff_stride=4,
+            include_restart_duplicates=True,
+            output_dir=frames_dir,
+            applied_cutoff_fs=126.5,
+        )
+    )
+    manager.save_project(settings)
+
+    window = ClusterDynamicsMainWindow(initial_project_dir=project_dir)
+
+    assert window.trajectory_panel.get_frames_dir() == frames_dir
+    assert window.run_panel.energy_file() == energy_file
+    assert window.definitions_panel.atom_type_definitions() == (
+        ATOM_TYPE_DEFINITIONS
+    )
+    assert window.definitions_panel.pair_cutoff_definitions() == PAIR_CUTOFFS
+    assert window.definitions_panel.box_dimensions() == (31.0, 32.0, 33.0)
+    assert window.definitions_panel.use_pbc()
+    assert window.definitions_panel.default_cutoff() == pytest.approx(4.25)
+    assert window.definitions_panel.shell_growth_levels() == (1, 2)
+    assert not window.definitions_panel.shared_shells()
+    assert window.definitions_panel.smart_solvation_shells()
+    assert window.definitions_panel.include_shell_atoms_in_stoichiometry()
+    assert window.definitions_panel.search_mode() == "vectorized"
+    assert window.definitions_panel.save_state_frequency() == 500
+    assert window.time_panel.frame_timestep_fs() == pytest.approx(2.5)
+    assert window.time_panel.folder_start_time_fs() == pytest.approx(126.5)
+    window.close()
+
+
+def test_cluster_dynamics_main_window_reports_startup_loader_progress(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    frames_dir = _build_frames_dir(tmp_path)
+
+    window = ClusterDynamicsMainWindow(initial_frames_dir=frames_dir)
+
+    dialog = window._startup_progress_dialog
+    assert dialog is not None
+    assert not dialog.isVisible()
+    assert dialog.windowTitle() == "Opening Cluster Dynamics"
+    assert (
+        dialog.progress_bar.maximum()
+        == CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS
+    )
+    assert (
+        dialog.progress_bar.value() == CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS
+    )
+    output = dialog.output_box.toPlainText()
+    assert "Preparing Cluster Dynamics window." in output
+    assert "Loading Cluster Dynamics controls, plots, and editors." in output
+    assert "Applying initial Cluster Dynamics inputs:" in output
+    assert str(frames_dir) in output
+    assert "Synchronizing project defaults and selection preview." in output
+    assert "Cluster Dynamics window is ready." in output
+    window.close()
+
+
 def test_cluster_dynamics_main_window_updates_preview_for_xyz_frames(
     qapp,
     tmp_path,
@@ -658,8 +786,8 @@ def test_cluster_dynamics_main_window_exports_colormap_and_lifetime_csv(
         lambda *args, **kwargs: (next(selected_paths), "CSV Files (*.csv)"),
     )
 
-    window.save_colormap_data()
-    window.save_lifetime_table()
+    window.plot_panel.save_colormap_button.click()
+    window.plot_panel.save_lifetime_button.click()
 
     with colormap_path.open(newline="", encoding="utf-8") as handle:
         colormap_rows = list(csv.DictReader(handle))
@@ -671,12 +799,21 @@ def test_cluster_dynamics_main_window_exports_colormap_and_lifetime_csv(
     )
 
     assert (
-        window.dataset_panel.save_colormap_button.text()
-        == "Save Colormap Data"
+        window.plot_panel.save_colormap_button.text() == "Save Colormap Data"
     )
     assert (
-        window.dataset_panel.save_lifetime_button.text()
-        == "Save Lifetime Table"
+        window.plot_panel.save_lifetime_button.text() == "Save Lifetime Table"
+    )
+    assert window.plot_panel.plot_editor_button is not None
+    assert window.plot_panel.plot_editor_button.text() == "Open Plot Editor"
+    assert (
+        window.plot_panel.lifetime_plot_editor_button.text()
+        == "Open Plot Editor"
+    )
+    assert window.plot_panel.lifetime_plot_editor_button.isEnabled()
+    assert (
+        window.plot_panel.lifetime_histogram_plot_editor_button.text()
+        == "Open Plot Editor"
     )
     assert len(colormap_rows) == len(result.cluster_labels) * result.bin_count
     assert colormap_rows[0]["display_mode"] == "mean_count"
@@ -707,6 +844,9 @@ def test_cluster_dynamics_plot_panel_applies_heatmap_editor_settings(
     qapp.processEvents()
 
     assert panel.plot_editor_button is not None
+    assert panel.tabs.count() == 4
+    assert panel.tabs.tabText(3) == "Plot Editor"
+    assert panel.plot_editor_tabs.count() == 3
     assert len(result.cluster_labels) > 1
 
     axis = panel.figure.axes[0]
@@ -725,6 +865,8 @@ def test_cluster_dynamics_plot_panel_applies_heatmap_editor_settings(
 
     assert panel._plot_editor_window is not None
     assert panel._plot_editor_controls is not None
+    assert panel.tabs.tabText(panel.tabs.currentIndex()) == "Plot Editor"
+    assert panel.plot_editor_tabs.currentWidget() is panel._plot_editor_window
 
     controls = panel._plot_editor_controls
     assert controls.x_axis_unit_combo.currentData() == "fs"
@@ -820,6 +962,306 @@ def test_cluster_dynamics_plot_panel_applies_heatmap_editor_settings(
     assert not controls.reset_color_limits_button.isEnabled()
 
     panel._plot_editor_window.close()
+    panel.close()
+
+
+def test_cluster_dynamics_plot_panel_renders_lifetime_distribution_tab(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    result = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=2,
+    ).analyze()
+
+    panel = ClusterDynamicsPlotPanel()
+    panel.set_result(result)
+    panel.show()
+    qapp.processEvents()
+    panel.histogram_canvas.draw()
+
+    assert panel.tabs.count() == 3
+    assert panel.tabs.tabText(0) == "Cluster Heatmap"
+    assert panel.tabs.tabText(1) == "Lifetime Distribution"
+    assert panel.tabs.tabText(2) == "Lifetime Histogram"
+    assert panel.lifetime_sample_combo.currentData() == "completed"
+    assert panel.lifetime_unit_combo.currentData() == "ps"
+    assert panel.figure.axes[0].images
+
+    axis = panel.histogram_figure.axes[0]
+    assert axis.get_title() == "Lifetime Distribution by Stoichiometry"
+    assert axis.get_xlabel() == "Stoichiometry"
+    assert axis.get_ylabel() == "Lifetime (ps)"
+    assert axis.get_yscale() == "log"
+    assert [label.get_text() for label in axis.get_xticklabels()] == [
+        format_stoich_for_axis(label) for label in result.cluster_labels
+    ]
+    assert axis.patches
+
+    plotted_lifetime_values: list[float] = []
+    for collection in axis.collections:
+        offsets = np.asarray(collection.get_offsets())
+        if offsets.size:
+            plotted_lifetime_values.extend(offsets[:, 1].tolist())
+    assert plotted_lifetime_values
+    assert any(
+        value == pytest.approx(0.01) for value in plotted_lifetime_values
+    )
+    assert any(
+        value == pytest.approx(0.02) for value in plotted_lifetime_values
+    )
+
+    panel.close()
+
+
+def test_cluster_dynamics_lifetime_histogram_tab_selects_stoichiometry(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    result = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=2,
+    ).analyze()
+
+    panel = ClusterDynamicsPlotPanel()
+    panel.set_result(result)
+    panel.show()
+    qapp.processEvents()
+
+    table = panel.lifetime_histogram_table
+    assert isinstance(
+        table.itemDelegateForColumn(0),
+        _RichStoichiometryDelegate,
+    )
+    assert panel.lifetime_histogram_bins_spin.value() == 20
+    target_label = "Pb2I"
+    target_display = format_stoich_for_axis(target_label)
+    target_row = next(
+        row
+        for row in range(table.rowCount())
+        if table.item(row, 0).text() == target_display
+    )
+    table.selectRow(target_row)
+    qapp.processEvents()
+    panel.lifetime_histogram_canvas.draw()
+
+    samples = panel._lifetime_samples_by_label((target_label,))[0]
+    axis = panel.lifetime_histogram_figure.axes[0]
+    bar_count = sum(patch.get_height() for patch in axis.patches)
+
+    assert table.item(target_row, 1).text() == str(samples.size)
+    assert axis.get_title() == f"Lifetime Histogram: {target_display}"
+    assert axis.get_xlabel() == "Lifetime (ps)"
+    assert axis.get_ylabel() == "Count"
+    assert bar_count == pytest.approx(float(samples.size))
+
+    panel.close()
+
+
+def test_cluster_dynamics_lifetime_distribution_plot_editor_updates_plot(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    result = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=2,
+    ).analyze()
+
+    panel = ClusterDynamicsPlotPanel(enable_plot_editor=True)
+    panel.set_result(result)
+    panel.show()
+    qapp.processEvents()
+
+    assert panel.lifetime_plot_editor_button is not None
+    panel.lifetime_plot_editor_button.click()
+    qapp.processEvents()
+
+    assert panel._lifetime_distribution_plot_editor_window is not None
+    assert panel._lifetime_distribution_plot_editor_controls is not None
+    assert panel.tabs.tabText(panel.tabs.currentIndex()) == "Plot Editor"
+    assert (
+        panel.plot_editor_tabs.currentWidget()
+        is panel._lifetime_distribution_plot_editor_window
+    )
+    controls = panel._lifetime_distribution_plot_editor_controls
+
+    controls.title_edit.setText("Edited Lifetime Distribution")
+    controls.x_label_edit.setText("Species")
+    controls.y_label_edit.setText("Lifetime $^{2}$")
+    controls.title_position_x_spin.setValue(0.42)
+    controls.title_position_y_spin.setValue(1.08)
+    controls.axis_label_font_spin.setValue(13.0)
+    controls.tick_label_font_spin.setValue(14.0)
+    controls.x_tick_rotation_spin.setValue(25)
+    controls.y_tick_rotation_spin.setValue(10)
+    controls.max_x_ticks_spin.setValue(3)
+    controls.max_y_ticks_spin.setValue(4)
+    controls.show_grid_checkbox.setChecked(False)
+    controls.bar_color_edit.setText("#d65f5f")
+    controls.edge_color_edit.setText("#111111")
+    controls.bar_alpha_spin.setValue(0.45)
+    qapp.processEvents()
+    panel.histogram_canvas.draw()
+
+    axis = panel.histogram_figure.axes[0]
+    face_rgba = mcolors.to_rgba("#d65f5f", alpha=0.45)
+
+    assert axis.get_title() == "Edited Lifetime Distribution"
+    assert axis.title.get_position()[0] == pytest.approx(0.42)
+    assert axis.title.get_position()[1] == pytest.approx(1.08)
+    assert axis.get_xlabel() == "Species"
+    assert axis.get_ylabel() == "Lifetime $^{2}$"
+    assert axis.get_xticklabels()[0].get_rotation() == pytest.approx(25.0)
+    assert axis.get_yticklabels()[0].get_rotation() == pytest.approx(10.0)
+    assert axis.get_xticklabels()[0].get_fontsize() == pytest.approx(14.0)
+    assert axis.xaxis.label.get_fontsize() == pytest.approx(13.0)
+    assert not any(line.get_visible() for line in axis.get_ygridlines())
+    assert axis.patches
+    assert axis.patches[0].get_facecolor() == pytest.approx(face_rgba)
+
+    panel._lifetime_distribution_plot_editor_window.close()
+    panel.close()
+
+
+def test_cluster_dynamics_lifetime_histogram_plot_editor_updates_plot(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    result = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=2,
+    ).analyze()
+
+    panel = ClusterDynamicsPlotPanel(enable_plot_editor=True)
+    panel.set_result(result)
+    panel.show()
+    qapp.processEvents()
+
+    table = panel.lifetime_histogram_table
+    target_label = "Pb2I"
+    target_display = format_stoich_for_axis(target_label)
+    target_row = next(
+        row
+        for row in range(table.rowCount())
+        if table.item(row, 0).text() == target_display
+    )
+    table.selectRow(target_row)
+    qapp.processEvents()
+
+    assert panel.lifetime_histogram_plot_editor_button is not None
+    panel.lifetime_histogram_plot_editor_button.click()
+    qapp.processEvents()
+
+    assert panel._lifetime_histogram_plot_editor_window is not None
+    assert panel._lifetime_histogram_plot_editor_controls is not None
+    assert panel.tabs.tabText(panel.tabs.currentIndex()) == "Plot Editor"
+    assert (
+        panel.plot_editor_tabs.currentWidget()
+        is panel._lifetime_histogram_plot_editor_window
+    )
+    controls = panel._lifetime_histogram_plot_editor_controls
+
+    controls.title_edit.setText("Edited Lifetime Histogram")
+    controls.x_label_edit.setText("Lifetime $^{2}$")
+    controls.y_label_edit.setText("Events")
+    controls.title_position_x_spin.setValue(0.31)
+    controls.title_position_y_spin.setValue(1.12)
+    controls.axis_label_font_spin.setValue(13.0)
+    controls.tick_label_font_spin.setValue(14.0)
+    controls.x_tick_rotation_spin.setValue(25)
+    controls.y_tick_rotation_spin.setValue(10)
+    controls.max_x_ticks_spin.setValue(3)
+    controls.max_y_ticks_spin.setValue(4)
+    controls.show_grid_checkbox.setChecked(False)
+    controls.bar_color_edit.setText("#d65f5f")
+    controls.edge_color_edit.setText("#111111")
+    controls.bar_alpha_spin.setValue(0.45)
+    qapp.processEvents()
+    panel.lifetime_histogram_canvas.draw()
+
+    axis = panel.lifetime_histogram_figure.axes[0]
+    face_rgba = mcolors.to_rgba("#d65f5f", alpha=0.45)
+
+    assert axis.get_title() == "Edited Lifetime Histogram"
+    assert axis.title.get_position()[0] == pytest.approx(0.31)
+    assert axis.title.get_position()[1] == pytest.approx(1.12)
+    assert axis.get_xlabel() == "Lifetime $^{2}$"
+    assert axis.get_ylabel() == "Events"
+    assert axis.get_xticklabels()[0].get_rotation() == pytest.approx(25.0)
+    assert axis.get_yticklabels()[0].get_rotation() == pytest.approx(10.0)
+    assert axis.get_xticklabels()[0].get_fontsize() == pytest.approx(14.0)
+    assert axis.xaxis.label.get_fontsize() == pytest.approx(13.0)
+    assert not any(line.get_visible() for line in axis.get_ygridlines())
+    assert axis.patches
+    assert axis.patches[0].get_facecolor() == pytest.approx(face_rgba)
+
+    panel._lifetime_histogram_plot_editor_window.close()
+    panel.close()
+
+
+def test_cluster_dynamics_lifetime_distribution_uses_custom_x_axis_order(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    result = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=2,
+    ).analyze()
+
+    panel = ClusterDynamicsPlotPanel()
+    panel.set_result(result)
+    panel._lifetime_x_axis_custom_order = [
+        ("Pb2I", "Custom Pb$_{2}$I"),
+        ("I", "Custom I"),
+    ]
+    panel.lifetime_x_axis_order_combo.setCurrentIndex(
+        panel.lifetime_x_axis_order_combo.findData("custom")
+    )
+    panel.show()
+    qapp.processEvents()
+    panel.histogram_canvas.draw()
+
+    axis = panel.histogram_figure.axes[0]
+    assert panel.edit_lifetime_x_axis_button.isEnabled()
+    assert [label.get_text() for label in axis.get_xticklabels()] == [
+        "Custom Pb$_{2}$I",
+        "Custom I",
+        format_stoich_for_axis("Pb"),
+    ]
+    assert [
+        panel.lifetime_histogram_table.item(row, 0).text()
+        for row in range(panel.lifetime_histogram_table.rowCount())
+    ] == [
+        "Custom Pb$_{2}$I",
+        "Custom I",
+        format_stoich_for_axis("Pb"),
+    ]
+
     panel.close()
 
 

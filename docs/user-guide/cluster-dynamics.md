@@ -1,4 +1,4 @@
-# Cluster Dynamics
+# Cluster Dynamics Time-Binned
 
 `clusterdynamics` is the time-resolved companion to `clusters`. It analyzes the
 same extracted XYZ or PDB frame folders from `mdtrajectory`, reuses the same
@@ -80,8 +80,8 @@ directory automatically.
 
 ## Project-Backed CLI Setup
 
-For longer cluster-dynamics runs, use **Tools > CLI Setup > Open Cluster
-Dynamics CLI Setup (Beta)**. The setup window writes
+For longer cluster-dynamics runs, use **Tools > (beta) > CLI Setup > Open
+Cluster Dynamics CLI Setup (Beta)**. The setup window writes
 `cluster_dynamics_cli_run.json` in the active project folder and shows the
 terminal commands to run later:
 
@@ -214,6 +214,6 @@ time basis explicit so the heatmap and lifetime interpretation stay transparent.
 ## Related pages
 
 - [Cluster Extraction](cluster-extraction.md)
-- [Cluster Dynamics ML](cluster-dynamics-ml.md)
+- [Cluster Dynamics](cluster-dynamics-ml.md)
 - [Project Configuration](project-configuration.md)
 - [Results and Export](results-and-export.md)

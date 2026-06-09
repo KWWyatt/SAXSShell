@@ -9,6 +9,7 @@ from saxshell.bondanalysis import (
     AngleTripletDefinition,
     BondPairDefinition,
     CoordinationNumberDefinition,
+    DihedralQuartetDefinition,
 )
 from saxshell.structure_distributions import (
     StructureDistributionStore,
@@ -37,29 +38,36 @@ def test_structure_distribution_store_reuses_warm_bond_angle_cache(
             ("Pb", 0.0, 0.0, 0.0),
             ("I", 2.0, 0.0, 0.0),
             ("I", 0.0, 2.0, 0.0),
+            ("O", 1.0, 0.0, 0.0),
+            ("C", 1.0, 1.0, 0.0),
+            ("N", 1.0, 1.0, 1.0),
         ],
     )
     store = StructureDistributionStore(tmp_path / "store")
     bond = BondPairDefinition("Pb", "I", 3.0)
     angle = AngleTripletDefinition("Pb", "I", "I", 3.0, 3.0)
+    dihedral = DihedralQuartetDefinition("Pb", "O", "C", "N", 1.5, 1.5, 1.5)
     coordination = CoordinationNumberDefinition("Pb", "I", 3.0)
 
     first = store.measure_structure_file(
         structure_path,
         bond_pairs=(bond,),
         angle_triplets=(angle,),
+        dihedral_quartets=(dihedral,),
         coordination_numbers=(coordination,),
     )
     assert not first.from_cache
     assert first.bond_values[bond] == pytest.approx([2.0, 2.0])
     assert first.angle_values[angle] == pytest.approx([90.0])
+    assert first.dihedral_values[dihedral] == pytest.approx([90.0])
     assert first.coordination_values[coordination] == pytest.approx([2.0])
 
     def fail_measurement(*_args, **_kwargs):
         raise AssertionError("warm cache should avoid measuring again")
 
     monkeypatch.setattr(
-        "saxshell.bondanalysis.bondanalyzer." "BondAnalyzer.measure_structure",
+        "saxshell.bondanalysis.bondanalyzer."
+        "BondAnalyzer.measure_structure_with_coordination_and_dihedrals",
         fail_measurement,
     )
     second = StructureDistributionStore(
@@ -68,12 +76,16 @@ def test_structure_distribution_store_reuses_warm_bond_angle_cache(
         structure_path,
         bond_pairs=(bond,),
         angle_triplets=(angle,),
+        dihedral_quartets=(dihedral,),
         coordination_numbers=(coordination,),
     )
     assert second.from_cache
     assert second.bond_values[bond] == pytest.approx(first.bond_values[bond])
     assert second.angle_values[angle] == pytest.approx(
         first.angle_values[angle]
+    )
+    assert second.dihedral_values[dihedral] == pytest.approx(
+        first.dihedral_values[dihedral]
     )
     assert second.coordination_values[coordination] == pytest.approx(
         first.coordination_values[coordination]
@@ -153,6 +165,7 @@ def test_structure_distribution_index_aggregates_cluster_scopes(tmp_path):
     store = StructureDistributionStore(root_dir / "bondanalysis")
     bond = BondPairDefinition("Pb", "I", 3.0)
     angle = AngleTripletDefinition("Pb", "I", "I", 3.0, 3.0)
+    dihedral = DihedralQuartetDefinition("Pb", "O", "C", "N", 1.5, 1.5, 1.5)
     coordination = CoordinationNumberDefinition("Pb", "I", 3.0)
     cluster_a = tmp_path / "a.xyz"
     cluster_b = tmp_path / "b.xyz"
@@ -162,6 +175,9 @@ def test_structure_distribution_index_aggregates_cluster_scopes(tmp_path):
             ("Pb", 0.0, 0.0, 0.0),
             ("I", 2.0, 0.0, 0.0),
             ("I", 0.0, 2.0, 0.0),
+            ("O", 1.0, 0.0, 0.0),
+            ("C", 1.0, 1.0, 0.0),
+            ("N", 1.0, 1.0, 1.0),
         ],
     )
     _write_xyz(
@@ -172,6 +188,7 @@ def test_structure_distribution_index_aggregates_cluster_scopes(tmp_path):
         cluster_a,
         bond_pairs=(bond,),
         angle_triplets=(angle,),
+        dihedral_quartets=(dihedral,),
         coordination_numbers=(coordination,),
         cluster_label="PbI2",
     )
@@ -179,6 +196,7 @@ def test_structure_distribution_index_aggregates_cluster_scopes(tmp_path):
         cluster_b,
         bond_pairs=(bond,),
         angle_triplets=(angle,),
+        dihedral_quartets=(dihedral,),
         coordination_numbers=(coordination,),
         cluster_label="PbI",
     )
@@ -189,6 +207,9 @@ def test_structure_distribution_index_aggregates_cluster_scopes(tmp_path):
     )
     angle_group = next(
         group for group in index.groups if group.category == "angle"
+    )
+    dihedral_group = next(
+        group for group in index.groups if group.category == "dihedral"
     )
     coordination_group = next(
         group for group in index.groups if group.category == "coordination"
@@ -207,6 +228,8 @@ def test_structure_distribution_index_aggregates_cluster_scopes(tmp_path):
     }
     assert angle_group.display_label == "I-Pb-I <= 3/3 A"
     assert angle_group.all_leaf.values.tolist() == pytest.approx([90.0])
+    assert dihedral_group.display_label == "Pb-O-C-N <= 1.5/1.5/1.5 A"
+    assert dihedral_group.all_leaf.values.tolist() == pytest.approx([90.0])
     assert coordination_group.display_label == "CN Pb-I <= 3 A"
     assert coordination_group.all_leaf.values.tolist() == pytest.approx(
         [1.0, 2.0]

@@ -80,7 +80,7 @@ class _LorentzianFit:
 
 class ClusterDynamicsMLHistogramPanel(QWidget):
     """Plot Project Setup-style stoichiometry histograms for Cluster
-    Dynamics ML results."""
+    Cluster Dynamics prediction results."""
 
     def __init__(
         self,

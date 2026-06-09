@@ -5,7 +5,7 @@ import re
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Mapping
 
 import numpy as np
 
@@ -19,7 +19,10 @@ from saxshell.cluster import (
     detect_frame_folder_mode,
     normalize_search_mode,
 )
-from saxshell.cluster.clusternetwork import stoichiometry_label
+from saxshell.cluster.clusternetwork import (
+    CLUSTER_METADATA_FILENAME,
+    stoichiometry_label,
+)
 from saxshell.cluster.workflow import ClusterWorkflow
 from saxshell.mdtrajectory.frame.cp2k_ener import CP2KEnergyData
 from saxshell.mdtrajectory.workflow import EXPORT_METADATA_FILENAME
@@ -330,6 +333,7 @@ class ClusterDynamicsWorkflow:
         analysis_start_fs: float | None = None,
         analysis_stop_fs: float | None = None,
         energy_file: str | Path | None = None,
+        precomputed_clusters_dir: str | Path | None = None,
     ) -> None:
         self.frames_dir = Path(frames_dir)
         self.atom_type_definitions = atom_type_definitions
@@ -371,6 +375,11 @@ class ClusterDynamicsWorkflow:
             None if analysis_stop_fs is None else float(analysis_stop_fs)
         )
         self.energy_file = None if energy_file is None else Path(energy_file)
+        self.precomputed_clusters_dir = (
+            None
+            if precomputed_clusters_dir is None
+            else Path(precomputed_clusters_dir).expanduser().resolve()
+        )
         self._cluster_workflow = ClusterWorkflow(
             frames_dir=self.frames_dir,
             atom_type_definitions=self.atom_type_definitions,
@@ -503,44 +512,58 @@ class ClusterDynamicsWorkflow:
         label_sizes: dict[str, int] = {}
         total_frames = len(selected_paths)
 
-        for processed, (frame_index, frame_path, time_fs) in enumerate(
-            zip(
-                preview.selected_frame_indices,
-                selected_paths,
-                selected_times,
-                strict=False,
-            ),
-            start=1,
-        ):
-            network = self._build_network(
-                frame_format=str(frame_format),
-                frame_path=frame_path,
-                resolved_box_dimensions=preview.resolved_box_dimensions,
-            )
-            clusters = network.find_clusters(
-                shell_levels=self.shell_levels,
-                shared_shells=self.shared_shells,
-            )
-            frame_results.append(
-                FrameClusterResult(
-                    frame_index=int(frame_index),
-                    time_fs=float(time_fs),
-                    clusters=clusters,
+        precomputed_results = self._load_precomputed_frame_results(
+            preview=preview,
+            selected_paths=selected_paths,
+            selected_times_fs=selected_times,
+        )
+        if precomputed_results is not None:
+            for frame_result in precomputed_results:
+                frame_results.append(frame_result)
+                counts, sizes = _counts_and_sizes_from_clusters(
+                    frame_result.clusters
                 )
-            )
-            counts = Counter[str]()
-            for cluster in clusters:
-                label = stoichiometry_label(cluster.stoichiometry)
-                counts[label] += 1
-                label_sizes[label] = max(
-                    label_sizes.get(label, 0),
-                    sum(
-                        int(value) for value in cluster.stoichiometry.values()
-                    ),
-                )
-            per_frame_counts.append(counts)
+                per_frame_counts.append(counts)
+                for label, size in sizes.items():
+                    label_sizes[label] = max(label_sizes.get(label, 0), size)
             if progress_callback is not None:
-                progress_callback(processed, total_frames, frame_path.name)
+                for processed, frame_path in enumerate(
+                    selected_paths,
+                    start=1,
+                ):
+                    progress_callback(processed, total_frames, frame_path.name)
+        else:
+            for processed, (frame_index, frame_path, time_fs) in enumerate(
+                zip(
+                    preview.selected_frame_indices,
+                    selected_paths,
+                    selected_times,
+                    strict=False,
+                ),
+                start=1,
+            ):
+                network = self._build_network(
+                    frame_format=str(frame_format),
+                    frame_path=frame_path,
+                    resolved_box_dimensions=preview.resolved_box_dimensions,
+                )
+                clusters = network.find_clusters(
+                    shell_levels=self.shell_levels,
+                    shared_shells=self.shared_shells,
+                )
+                frame_results.append(
+                    FrameClusterResult(
+                        frame_index=int(frame_index),
+                        time_fs=float(time_fs),
+                        clusters=clusters,
+                    )
+                )
+                counts, sizes = _counts_and_sizes_from_clusters(clusters)
+                per_frame_counts.append(counts)
+                for label, size in sizes.items():
+                    label_sizes[label] = max(label_sizes.get(label, 0), size)
+                if progress_callback is not None:
+                    progress_callback(processed, total_frames, frame_path.name)
 
         cluster_labels = tuple(
             sorted(label_sizes, key=lambda label: (label_sizes[label], label))
@@ -642,6 +665,65 @@ class ClusterDynamicsWorkflow:
             lifetime_by_size=lifetime_by_size,
             energy_data=energy_data,
         )
+
+    def _load_precomputed_frame_results(
+        self,
+        *,
+        preview: ClusterDynamicsSelectionPreview,
+        selected_paths: list[Path],
+        selected_times_fs: np.ndarray,
+    ) -> list[FrameClusterResult] | None:
+        if self.precomputed_clusters_dir is None:
+            return None
+        metadata_path = (
+            self.precomputed_clusters_dir / CLUSTER_METADATA_FILENAME
+        )
+        if not metadata_path.is_file():
+            return None
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        frame_entries = [
+            dict(entry)
+            for entry in metadata.get("frames", [])
+            if isinstance(entry, Mapping)
+            and isinstance(
+                entry.get("result"),
+                Mapping,
+            )
+        ]
+        if not frame_entries:
+            return None
+
+        entry_lookup = _precomputed_frame_entry_lookup(frame_entries)
+        resolved_results: list[FrameClusterResult] = []
+        for selected_position, (frame_index, frame_path, time_fs) in enumerate(
+            zip(
+                preview.selected_frame_indices,
+                selected_paths,
+                selected_times_fs,
+                strict=False,
+            )
+        ):
+            entry = _lookup_precomputed_frame_entry(
+                entry_lookup,
+                frame_path,
+                frame_index=int(frame_index),
+                selected_position=selected_position,
+            )
+            if entry is None:
+                return None
+            result_payload = dict(entry["result"])
+            frame_result = FrameClusterResult.from_dict(result_payload)
+            resolved_results.append(
+                FrameClusterResult(
+                    frame_index=int(frame_index),
+                    time_fs=float(time_fs),
+                    clusters=frame_result.clusters,
+                )
+            )
+        return resolved_results
 
     def _build_network(
         self,
@@ -754,6 +836,61 @@ class ClusterDynamicsWorkflow:
             mean_lifetime_fs=metrics.mean_lifetime_fs,
             std_lifetime_fs=metrics.std_lifetime_fs,
         )
+
+
+def _counts_and_sizes_from_clusters(
+    clusters,
+) -> tuple[Counter[str], dict[str, int]]:
+    counts = Counter[str]()
+    label_sizes: dict[str, int] = {}
+    for cluster in clusters:
+        label = stoichiometry_label(cluster.stoichiometry)
+        counts[label] += 1
+        label_sizes[label] = max(
+            label_sizes.get(label, 0),
+            sum(int(value) for value in cluster.stoichiometry.values()),
+        )
+    return counts, label_sizes
+
+
+def _precomputed_frame_entry_lookup(
+    entries: list[dict[str, object]],
+) -> dict[tuple[str, object], dict[str, object]]:
+    lookup: dict[tuple[str, object], dict[str, object]] = {}
+    for position, entry in enumerate(entries):
+        lookup.setdefault(("position", position), entry)
+        if "frame_index" in entry:
+            lookup.setdefault(("index", int(entry["frame_index"])), entry)
+        frame_name = entry.get("frame_name")
+        if frame_name:
+            name = str(frame_name)
+            lookup.setdefault(("name", name), entry)
+            lookup.setdefault(("stem", Path(name).stem), entry)
+        frame_label = entry.get("frame_label")
+        if frame_label:
+            lookup.setdefault(("label", str(frame_label)), entry)
+    return lookup
+
+
+def _lookup_precomputed_frame_entry(
+    lookup: dict[tuple[str, object], dict[str, object]],
+    frame_path: Path,
+    *,
+    frame_index: int,
+    selected_position: int,
+) -> dict[str, object] | None:
+    candidates: tuple[tuple[str, object], ...] = (
+        ("name", frame_path.name),
+        ("stem", frame_path.stem),
+        ("label", frame_path.stem),
+        ("index", frame_index),
+        ("position", selected_position),
+    )
+    for key in candidates:
+        entry = lookup.get(key)
+        if entry is not None:
+            return entry
+    return None
 
 
 def _validate_positive_number(value: float, *, label: str) -> float:

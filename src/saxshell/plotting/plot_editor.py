@@ -331,6 +331,152 @@ class HeatmapPlotSettings:
                 }
 
 
+@dataclass(slots=True)
+class LifetimeHistogramPlotDefaults:
+    title: str
+    x_label: str
+    y_label: str
+    title_position_x: float = 0.5
+    title_position_y: float = 1.0
+
+
+@dataclass(slots=True)
+class LifetimeHistogramPlotSettings:
+    title: str | None = None
+    x_label: str | None = None
+    y_label: str | None = None
+    title_position_x: float | None = None
+    title_position_y: float | None = None
+    font_family: str = ""
+    title_font_size: float = 12.0
+    axis_label_font_size: float = 11.0
+    tick_label_font_size: float = 9.0
+    max_x_ticks: int = 8
+    max_y_ticks: int = 8
+    x_tick_rotation: int = 0
+    y_tick_rotation: int = 0
+    show_minor_x_ticks: bool = False
+    show_minor_y_ticks: bool = False
+    show_grid: bool = True
+    bar_color: str = "#219ebc"
+    edge_color: str = "#184e63"
+    bar_alpha: float = 0.72
+
+    def resolve_title(
+        self,
+        defaults: LifetimeHistogramPlotDefaults,
+    ) -> str:
+        return defaults.title if self.title is None else self.title
+
+    def resolve_x_label(
+        self,
+        defaults: LifetimeHistogramPlotDefaults,
+    ) -> str:
+        return defaults.x_label if self.x_label is None else self.x_label
+
+    def resolve_y_label(
+        self,
+        defaults: LifetimeHistogramPlotDefaults,
+    ) -> str:
+        return defaults.y_label if self.y_label is None else self.y_label
+
+    def resolve_title_position_x(
+        self,
+        defaults: LifetimeHistogramPlotDefaults,
+    ) -> float:
+        return (
+            defaults.title_position_x
+            if self.title_position_x is None
+            else self.title_position_x
+        )
+
+    def resolve_title_position_y(
+        self,
+        defaults: LifetimeHistogramPlotDefaults,
+    ) -> float:
+        return (
+            defaults.title_position_y
+            if self.title_position_y is None
+            else self.title_position_y
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "title": self.title,
+            "x_label": self.x_label,
+            "y_label": self.y_label,
+            "title_position_x": self.title_position_x,
+            "title_position_y": self.title_position_y,
+            "font_family": self.font_family,
+            "title_font_size": self.title_font_size,
+            "axis_label_font_size": self.axis_label_font_size,
+            "tick_label_font_size": self.tick_label_font_size,
+            "max_x_ticks": self.max_x_ticks,
+            "max_y_ticks": self.max_y_ticks,
+            "x_tick_rotation": self.x_tick_rotation,
+            "y_tick_rotation": self.y_tick_rotation,
+            "show_minor_x_ticks": self.show_minor_x_ticks,
+            "show_minor_y_ticks": self.show_minor_y_ticks,
+            "show_grid": self.show_grid,
+            "bar_color": self.bar_color,
+            "edge_color": self.edge_color,
+            "bar_alpha": self.bar_alpha,
+        }
+
+    def update_from_dict(self, payload: Mapping[str, object]) -> None:
+        for field_name in (
+            "title",
+            "x_label",
+            "y_label",
+            "title_position_x",
+            "title_position_y",
+        ):
+            if field_name in payload:
+                setattr(self, field_name, payload[field_name])
+        if "font_family" in payload:
+            self.font_family = str(payload["font_family"] or "")
+        for field_name in (
+            "title_font_size",
+            "axis_label_font_size",
+            "tick_label_font_size",
+            "bar_alpha",
+        ):
+            if field_name in payload:
+                setattr(self, field_name, float(payload[field_name]))
+        for field_name in (
+            "max_x_ticks",
+            "max_y_ticks",
+            "x_tick_rotation",
+            "y_tick_rotation",
+        ):
+            if field_name in payload:
+                setattr(self, field_name, int(payload[field_name]))
+        for field_name in (
+            "show_minor_x_ticks",
+            "show_minor_y_ticks",
+            "show_grid",
+        ):
+            if field_name in payload:
+                setattr(self, field_name, bool(payload[field_name]))
+        for field_name in ("bar_color", "edge_color"):
+            if field_name in payload:
+                setattr(self, field_name, str(payload[field_name] or ""))
+
+
+@dataclass(slots=True)
+class LifetimeDistributionPlotDefaults(LifetimeHistogramPlotDefaults):
+    pass
+
+
+@dataclass(slots=True)
+class LifetimeDistributionPlotSettings(LifetimeHistogramPlotSettings):
+    x_tick_rotation: int = 55
+    max_x_ticks: int = 12
+    bar_color: str = "#8ecae6"
+    edge_color: str = "#2b6f8a"
+    bar_alpha: float = 0.58
+
+
 class PlotEditorWindow(QWidget):
     """Reusable popup shell for plot editors with a live Matplotlib
     preview."""
@@ -350,12 +496,15 @@ class PlotEditorWindow(QWidget):
         apply_loaded_pickle_state: (
             Callable[[Mapping[str, object]], bool] | None
         ) = None,
+        embedded: bool = False,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent, Qt.WindowType.Window)
+        flags = Qt.WindowType.Widget if embedded else Qt.WindowType.Window
+        super().__init__(parent, flags)
         self._render_preview = render_preview
         self._pickle_state_provider = pickle_state_provider
         self._apply_loaded_pickle_state = apply_loaded_pickle_state
+        self._embedded = bool(embedded)
         self._showing_pickled_plot = False
         self._last_pickle_path: Path | None = None
         self._pickle_default_name = (
@@ -366,9 +515,13 @@ class PlotEditorWindow(QWidget):
         self._preview_toolbar: NavigationToolbar | None = None
         self.canvas: FigureCanvas | None = None
         self.figure = Figure(figsize=(7.8, 6.2))
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        if not self._embedded:
+            self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle(window_title)
-        self.resize(1260, 760)
+        if self._embedded:
+            self.setMinimumHeight(420)
+        else:
+            self.resize(1260, 760)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
@@ -533,7 +686,8 @@ class PlotEditorWindow(QWidget):
         self.refresh_preview(force=True)
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        self.closed.emit()
+        if not self._embedded:
+            self.closed.emit()
         super().closeEvent(event)
 
 
@@ -1753,10 +1907,353 @@ class StackedHistogramPlotEditorControls(QWidget):
         self._emit_settings_changed()
 
 
+class LifetimeHistogramPlotEditorControls(QWidget):
+    """Editable controls for a single lifetime histogram plot."""
+
+    settings_changed = Signal()
+
+    def __init__(
+        self,
+        *,
+        settings: LifetimeHistogramPlotSettings,
+        defaults: LifetimeHistogramPlotDefaults,
+        plot_description: str = "lifetime histogram",
+        fill_color_label: str = "Bar Color",
+        edge_color_label: str = "Edge Color",
+        fill_alpha_label: str = "Bar Opacity",
+        appearance_description: str = "bar appearance",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._settings = settings
+        self._defaults = defaults
+        self._plot_description = plot_description
+        self._fill_color_label = fill_color_label
+        self._edge_color_label = edge_color_label
+        self._fill_alpha_label = fill_alpha_label
+        self._appearance_description = appearance_description
+        self._last_synced_defaults: LifetimeHistogramPlotDefaults | None = None
+        self._syncing = False
+        self._build_ui()
+        self.sync_defaults(defaults)
+
+    def needs_default_sync(
+        self,
+        defaults: LifetimeHistogramPlotDefaults,
+    ) -> bool:
+        return self._last_synced_defaults != defaults
+
+    def sync_defaults(
+        self,
+        defaults: LifetimeHistogramPlotDefaults,
+    ) -> None:
+        self._defaults = defaults
+        self._syncing = True
+        try:
+            self.title_edit.setText(self._settings.resolve_title(defaults))
+            self.x_label_edit.setText(self._settings.resolve_x_label(defaults))
+            self.y_label_edit.setText(self._settings.resolve_y_label(defaults))
+            self.title_position_x_spin.setValue(
+                self._settings.resolve_title_position_x(defaults)
+            )
+            self.title_position_y_spin.setValue(
+                self._settings.resolve_title_position_y(defaults)
+            )
+            if self._settings.font_family:
+                self.font_combo.setCurrentFont(
+                    QFont(self._settings.font_family)
+                )
+            self.title_font_spin.setValue(self._settings.title_font_size)
+            self.axis_label_font_spin.setValue(
+                self._settings.axis_label_font_size
+            )
+            self.tick_label_font_spin.setValue(
+                self._settings.tick_label_font_size
+            )
+            self.max_x_ticks_spin.setValue(self._settings.max_x_ticks)
+            self.max_y_ticks_spin.setValue(self._settings.max_y_ticks)
+            self.x_tick_rotation_spin.setValue(self._settings.x_tick_rotation)
+            self.y_tick_rotation_spin.setValue(self._settings.y_tick_rotation)
+            self.minor_x_ticks_checkbox.setChecked(
+                self._settings.show_minor_x_ticks
+            )
+            self.minor_y_ticks_checkbox.setChecked(
+                self._settings.show_minor_y_ticks
+            )
+            self.show_grid_checkbox.setChecked(self._settings.show_grid)
+            self.bar_color_edit.setText(self._settings.bar_color)
+            self.edge_color_edit.setText(self._settings.edge_color)
+            self.bar_alpha_spin.setValue(self._settings.bar_alpha)
+        finally:
+            self._last_synced_defaults = defaults
+            self._syncing = False
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        note = QLabel(
+            f"Edit the {self._plot_description} title, labels, font, tick "
+            f"styling, grid, and {self._appearance_description}. Use $_{{n}}$ "
+            "for subscript and $^{n}$ for superscript (matplotlib mathtext). "
+            "Igor-style inline text is also supported: \\f01 bold, \\f02 "
+            "italics, \\f00 reset, and \\Z<NN> inline font size."
+        )
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        text_group = QGroupBox("Text")
+        text_form = QFormLayout(text_group)
+        self.title_edit = QLineEdit()
+        self.title_edit.textChanged.connect(self._on_title_changed)
+        text_form.addRow("Title", self.title_edit)
+        self.x_label_edit = QLineEdit()
+        self.x_label_edit.textChanged.connect(self._on_x_label_changed)
+        text_form.addRow("X Label", self.x_label_edit)
+        self.y_label_edit = QLineEdit()
+        self.y_label_edit.textChanged.connect(self._on_y_label_changed)
+        text_form.addRow("Y Label", self.y_label_edit)
+        self.reset_text_button = QPushButton("Reset Text Defaults")
+        self.reset_text_button.clicked.connect(self._reset_text_defaults)
+        text_form.addRow(self.reset_text_button)
+        root.addWidget(text_group)
+
+        style_group = QGroupBox("Style")
+        style_form = QFormLayout(style_group)
+        self.font_combo = QFontComboBox()
+        self.font_combo.currentFontChanged.connect(self._on_font_changed)
+        style_form.addRow("Font", self.font_combo)
+        self.title_font_spin = HeatmapPlotEditorControls._build_font_spin()
+        self.title_font_spin.valueChanged.connect(
+            self._on_title_font_size_changed
+        )
+        style_form.addRow("Title Size", self.title_font_spin)
+        self.title_position_x_spin = (
+            HeatmapPlotEditorControls._build_position_spin()
+        )
+        self.title_position_x_spin.valueChanged.connect(
+            self._on_title_position_x_changed
+        )
+        style_form.addRow("Title X", self.title_position_x_spin)
+        self.title_position_y_spin = (
+            HeatmapPlotEditorControls._build_position_spin()
+        )
+        self.title_position_y_spin.valueChanged.connect(
+            self._on_title_position_y_changed
+        )
+        style_form.addRow("Title Y", self.title_position_y_spin)
+        self.axis_label_font_spin = (
+            HeatmapPlotEditorControls._build_font_spin()
+        )
+        self.axis_label_font_spin.valueChanged.connect(
+            self._on_axis_label_font_size_changed
+        )
+        style_form.addRow("Axis Label Size", self.axis_label_font_spin)
+        self.tick_label_font_spin = (
+            HeatmapPlotEditorControls._build_font_spin()
+        )
+        self.tick_label_font_spin.valueChanged.connect(
+            self._on_tick_label_font_size_changed
+        )
+        style_form.addRow("Tick Label Size", self.tick_label_font_spin)
+        self.bar_color_edit = QLineEdit()
+        self.bar_color_edit.textChanged.connect(self._on_bar_color_changed)
+        style_form.addRow(self._fill_color_label, self.bar_color_edit)
+        self.edge_color_edit = QLineEdit()
+        self.edge_color_edit.textChanged.connect(self._on_edge_color_changed)
+        style_form.addRow(self._edge_color_label, self.edge_color_edit)
+        self.bar_alpha_spin = QDoubleSpinBox()
+        self.bar_alpha_spin.setDecimals(2)
+        self.bar_alpha_spin.setRange(0.0, 1.0)
+        self.bar_alpha_spin.setSingleStep(0.05)
+        self.bar_alpha_spin.valueChanged.connect(self._on_bar_alpha_changed)
+        style_form.addRow(self._fill_alpha_label, self.bar_alpha_spin)
+        root.addWidget(style_group)
+
+        display_group = QGroupBox("Display")
+        display_form = QFormLayout(display_group)
+        self.show_grid_checkbox = QCheckBox("Show Y Grid")
+        self.show_grid_checkbox.toggled.connect(self._on_show_grid_changed)
+        display_form.addRow(self.show_grid_checkbox)
+        root.addWidget(display_group)
+
+        ticks_group = QGroupBox("Ticks")
+        ticks_form = QFormLayout(ticks_group)
+        self.max_x_ticks_spin = QSpinBox()
+        self.max_x_ticks_spin.setRange(2, 30)
+        self.max_x_ticks_spin.valueChanged.connect(
+            self._on_max_x_ticks_changed
+        )
+        ticks_form.addRow("Max X Ticks", self.max_x_ticks_spin)
+        self.max_y_ticks_spin = QSpinBox()
+        self.max_y_ticks_spin.setRange(2, 30)
+        self.max_y_ticks_spin.valueChanged.connect(
+            self._on_max_y_ticks_changed
+        )
+        ticks_form.addRow("Max Y Ticks", self.max_y_ticks_spin)
+        self.x_tick_rotation_spin = QSpinBox()
+        self.x_tick_rotation_spin.setRange(-180, 180)
+        self.x_tick_rotation_spin.valueChanged.connect(
+            self._on_x_tick_rotation_changed
+        )
+        ticks_form.addRow("X Tick Rotation", self.x_tick_rotation_spin)
+        self.y_tick_rotation_spin = QSpinBox()
+        self.y_tick_rotation_spin.setRange(-180, 180)
+        self.y_tick_rotation_spin.valueChanged.connect(
+            self._on_y_tick_rotation_changed
+        )
+        ticks_form.addRow("Y Tick Rotation", self.y_tick_rotation_spin)
+        self.minor_x_ticks_checkbox = QCheckBox("Show X Minor Ticks")
+        self.minor_x_ticks_checkbox.toggled.connect(
+            self._on_minor_x_ticks_changed
+        )
+        ticks_form.addRow(self.minor_x_ticks_checkbox)
+        self.minor_y_ticks_checkbox = QCheckBox("Show Y Minor Ticks")
+        self.minor_y_ticks_checkbox.toggled.connect(
+            self._on_minor_y_ticks_changed
+        )
+        ticks_form.addRow(self.minor_y_ticks_checkbox)
+        root.addWidget(ticks_group)
+        root.addStretch(1)
+
+    def _emit_settings_changed(self) -> None:
+        if not self._syncing:
+            self.settings_changed.emit()
+
+    def _on_title_changed(self, text: str) -> None:
+        if self._syncing:
+            return
+        self._settings.title = text
+        self._emit_settings_changed()
+
+    def _on_x_label_changed(self, text: str) -> None:
+        if self._syncing:
+            return
+        self._settings.x_label = text
+        self._emit_settings_changed()
+
+    def _on_y_label_changed(self, text: str) -> None:
+        if self._syncing:
+            return
+        self._settings.y_label = text
+        self._emit_settings_changed()
+
+    def _on_font_changed(self, font: QFont) -> None:
+        if self._syncing:
+            return
+        self._settings.font_family = font.family()
+        self._emit_settings_changed()
+
+    def _on_title_font_size_changed(self, value: float) -> None:
+        if self._syncing:
+            return
+        self._settings.title_font_size = float(value)
+        self._emit_settings_changed()
+
+    def _on_title_position_x_changed(self, value: float) -> None:
+        if self._syncing:
+            return
+        self._settings.title_position_x = float(value)
+        self._emit_settings_changed()
+
+    def _on_title_position_y_changed(self, value: float) -> None:
+        if self._syncing:
+            return
+        self._settings.title_position_y = float(value)
+        self._emit_settings_changed()
+
+    def _on_axis_label_font_size_changed(self, value: float) -> None:
+        if self._syncing:
+            return
+        self._settings.axis_label_font_size = float(value)
+        self._emit_settings_changed()
+
+    def _on_tick_label_font_size_changed(self, value: float) -> None:
+        if self._syncing:
+            return
+        self._settings.tick_label_font_size = float(value)
+        self._emit_settings_changed()
+
+    def _on_bar_color_changed(self, text: str) -> None:
+        if self._syncing:
+            return
+        self._settings.bar_color = text
+        self._emit_settings_changed()
+
+    def _on_edge_color_changed(self, text: str) -> None:
+        if self._syncing:
+            return
+        self._settings.edge_color = text
+        self._emit_settings_changed()
+
+    def _on_bar_alpha_changed(self, value: float) -> None:
+        if self._syncing:
+            return
+        self._settings.bar_alpha = float(value)
+        self._emit_settings_changed()
+
+    def _on_show_grid_changed(self, checked: bool) -> None:
+        if self._syncing:
+            return
+        self._settings.show_grid = bool(checked)
+        self._emit_settings_changed()
+
+    def _on_max_x_ticks_changed(self, value: int) -> None:
+        if self._syncing:
+            return
+        self._settings.max_x_ticks = int(value)
+        self._emit_settings_changed()
+
+    def _on_max_y_ticks_changed(self, value: int) -> None:
+        if self._syncing:
+            return
+        self._settings.max_y_ticks = int(value)
+        self._emit_settings_changed()
+
+    def _on_x_tick_rotation_changed(self, value: int) -> None:
+        if self._syncing:
+            return
+        self._settings.x_tick_rotation = int(value)
+        self._emit_settings_changed()
+
+    def _on_y_tick_rotation_changed(self, value: int) -> None:
+        if self._syncing:
+            return
+        self._settings.y_tick_rotation = int(value)
+        self._emit_settings_changed()
+
+    def _on_minor_x_ticks_changed(self, checked: bool) -> None:
+        if self._syncing:
+            return
+        self._settings.show_minor_x_ticks = bool(checked)
+        self._emit_settings_changed()
+
+    def _on_minor_y_ticks_changed(self, checked: bool) -> None:
+        if self._syncing:
+            return
+        self._settings.show_minor_y_ticks = bool(checked)
+        self._emit_settings_changed()
+
+    def _reset_text_defaults(self) -> None:
+        self._settings.title = None
+        self._settings.x_label = None
+        self._settings.y_label = None
+        self._settings.title_position_x = None
+        self._settings.title_position_y = None
+        self.sync_defaults(self._defaults)
+        self._emit_settings_changed()
+
+
 __all__ = [
     "HeatmapPlotDefaults",
     "HeatmapPlotEditorControls",
     "HeatmapPlotSettings",
+    "LifetimeDistributionPlotDefaults",
+    "LifetimeDistributionPlotSettings",
+    "LifetimeHistogramPlotDefaults",
+    "LifetimeHistogramPlotEditorControls",
+    "LifetimeHistogramPlotSettings",
     "PlotEditorWindow",
     "StackedHistogramPlotDefaults",
     "StackedHistogramPlotEditorControls",

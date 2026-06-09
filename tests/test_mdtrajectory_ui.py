@@ -28,6 +28,9 @@ from saxshell.mdtrajectory.ui.main_window import (
     InspectionResult,
     MDTrajectoryMainWindow,
 )
+from saxshell.project_memory import (
+    build_mdtrajectory_time_axis_settings_payload,
+)
 from saxshell.saxs.project_manager import SAXSProjectManager
 
 
@@ -471,6 +474,12 @@ def test_mdtrajectory_inspect_registers_project_file_references(
     window.trajectory_panel.trajectory_edit.setText(str(trajectory_file))
     window.trajectory_panel.topology_edit.setText(str(topology_file))
     window.trajectory_panel.energy_edit.setText(str(energy_file))
+    window.trajectory_panel.start_spin.setValue(2)
+    window.trajectory_panel.stop_spin.setValue(8)
+    window.trajectory_panel.stride_spin.setValue(2)
+    window.trajectory_panel.set_frame_timestep_fs(2.5)
+    window.trajectory_panel.auto_timestep_box.setChecked(False)
+    window.export_panel.include_restart_duplicates_box.setChecked(True)
 
     monkeypatch.setattr(
         window,
@@ -487,6 +496,14 @@ def test_mdtrajectory_inspect_registers_project_file_references(
     assert saved_settings.trajectory_file_snapshot is not None
     assert saved_settings.topology_file_snapshot is not None
     assert saved_settings.energy_file_snapshot is not None
+    time_axis = saved_settings.mdtrajectory_time_axis_settings
+    assert time_axis["energy_file"] == str(energy_file.resolve())
+    assert time_axis["start"] == 2
+    assert time_axis["stop"] == 8
+    assert time_axis["stride"] == 2
+    assert time_axis["frame_timestep_fs"] == pytest.approx(2.5)
+    assert time_axis["use_manual_frame_timestep"]
+    assert time_axis["include_restart_duplicates"]
     window.close()
 
 
@@ -521,6 +538,12 @@ def test_mdtrajectory_export_registers_frames_dir_with_project(
     window = MDTrajectoryMainWindow(initial_project_dir=project_dir)
     window.manager = FakeManager()
     window.export_panel.output_dir_edit.setText(str(output_dir))
+    window.trajectory_panel.stride_spin.setValue(2)
+    window.trajectory_panel.set_frame_timestep_fs(5.0)
+    window.trajectory_panel.auto_timestep_box.setChecked(False)
+    window.cutoff_panel._set_cutoff_value(5.0, emit_signals=False)
+    window.export_panel.post_cutoff_stride_box.setChecked(True)
+    window.export_panel.post_cutoff_stride_spin.setValue(3)
     updates = []
     window.project_paths_registered.connect(updates.append)
 
@@ -550,6 +573,13 @@ def test_mdtrajectory_export_registers_frames_dir_with_project(
     saved_settings = manager.load_project(project_dir)
     assert saved_settings.resolved_frames_dir == output_dir.resolve()
     assert saved_settings.frames_dir_snapshot is not None
+    time_axis = saved_settings.mdtrajectory_time_axis_settings
+    assert time_axis["output_dir"] == str(output_dir.resolve())
+    assert time_axis["applied_cutoff_fs"] == pytest.approx(5.0)
+    assert time_axis["selected_cutoff_fs"] == pytest.approx(5.0)
+    assert time_axis["use_post_cutoff_stride"]
+    assert time_axis["post_cutoff_stride"] == 3
+    assert time_axis["frame_timestep_fs"] == pytest.approx(5.0)
     assert updates == [
         {
             "project_dir": project_dir.resolve(),
@@ -585,6 +615,45 @@ def test_mdtrajectory_batch_queue_prefills_current_project_defaults(
     )
     assert widget.auto_timestep_box.isChecked()
     assert not widget.include_restart_duplicates_box.isChecked()
+    window.close()
+
+
+def test_mdtrajectory_batch_queue_prefills_project_time_axis_memory(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, trajectory_file, energy_file = (
+        _create_mdtrajectory_batch_project(tmp_path, "project_time_axis")
+    )
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.mdtrajectory_time_axis_settings = (
+        build_mdtrajectory_time_axis_settings_payload(
+            trajectory_file=trajectory_file,
+            topology_file=None,
+            energy_file=energy_file,
+            start=None,
+            stop=None,
+            stride=1,
+            frame_timestep_fs=7.5,
+            use_manual_frame_timestep=True,
+            use_cutoff_for_export=True,
+            selected_cutoff_fs=100.0,
+            suggested_cutoff_fs=90.0,
+            use_post_cutoff_stride=False,
+            post_cutoff_stride=1,
+            include_restart_duplicates=True,
+        )
+    )
+    manager.save_project(settings)
+
+    window = MDTrajectoryBatchQueueWindow(initial_project_dir=project_dir)
+
+    widget = next(iter(window._widgets_by_id.values()))
+    assert widget.timestep_spin.value() == pytest.approx(7.5)
+    assert not widget.auto_timestep_box.isChecked()
+    assert widget.include_restart_duplicates_box.isChecked()
     window.close()
 
 

@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
 from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 from saxshell.uvvis_fitting.model import (
     DEFAULT_MONTE_CARLO_SEED,
@@ -118,17 +119,27 @@ class ParameterGroupHeader(QHeaderView):
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         painter = QPainter(self.viewport())
-        pen = QPen(QColor(SECTION_DIVIDER_COLOR))
-        pen.setWidth(3)
-        painter.setPen(pen)
-        for col in sorted(self._section_dividers):
-            if self.isSectionHidden(col):
-                continue
-            x_pos = (
-                self.sectionViewportPosition(col) + self.sectionSize(col) - 1
-            )
-            if -2 <= x_pos <= self.viewport().width() + 2:
-                painter.drawLine(x_pos, 0, x_pos, self.viewport().height())
+        try:
+            pen = QPen(QColor(SECTION_DIVIDER_COLOR))
+            pen.setWidth(3)
+            painter.setPen(pen)
+            for col in sorted(self._section_dividers):
+                if self.isSectionHidden(col):
+                    continue
+                x_pos = (
+                    self.sectionViewportPosition(col)
+                    + self.sectionSize(col)
+                    - 1
+                )
+                if -2 <= x_pos <= self.viewport().width() + 2:
+                    painter.drawLine(
+                        x_pos,
+                        0,
+                        x_pos,
+                        self.viewport().height(),
+                    )
+        finally:
+            painter.end()
 
 
 class ParameterGroupTableWidget(QTableWidget):
@@ -149,17 +160,27 @@ class ParameterGroupTableWidget(QTableWidget):
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         painter = QPainter(self.viewport())
-        pen = QPen(QColor(SECTION_DIVIDER_COLOR))
-        pen.setWidth(3)
-        painter.setPen(pen)
-        for col in sorted(self._section_dividers):
-            if self.isColumnHidden(col):
-                continue
-            x_pos = (
-                self.columnViewportPosition(col) + self.columnWidth(col) - 1
-            )
-            if -2 <= x_pos <= self.viewport().width() + 2:
-                painter.drawLine(x_pos, 0, x_pos, self.viewport().height())
+        try:
+            pen = QPen(QColor(SECTION_DIVIDER_COLOR))
+            pen.setWidth(3)
+            painter.setPen(pen)
+            for col in sorted(self._section_dividers):
+                if self.isColumnHidden(col):
+                    continue
+                x_pos = (
+                    self.columnViewportPosition(col)
+                    + self.columnWidth(col)
+                    - 1
+                )
+                if -2 <= x_pos <= self.viewport().width() + 2:
+                    painter.drawLine(
+                        x_pos,
+                        0,
+                        x_pos,
+                        self.viewport().height(),
+                    )
+        finally:
+            painter.end()
 
 
 class ConstraintCellDelegate(QStyledItemDelegate):
@@ -204,10 +225,12 @@ class ConstraintCellDelegate(QStyledItemDelegate):
             widget,
         )
         painter.save()
-        painter.translate(rect.topLeft())
-        doc.setTextWidth(rect.width())
-        doc.drawContents(painter)
-        painter.restore()
+        try:
+            painter.translate(rect.topLeft())
+            doc.setTextWidth(rect.width())
+            doc.drawContents(painter)
+        finally:
+            painter.restore()
 
 
 DEFAULT_UVVIS_DIR = Path(
@@ -2441,7 +2464,7 @@ def launch_uvvis_fitting_ui(
     window = UVVisFitMainWindow(initial_input_path=initial_input_path)
     window.show()
     window.raise_()
-    _OPEN_WINDOWS.append(window)
+    track_saxshell_window(window, _OPEN_WINDOWS)
     return window
 
 

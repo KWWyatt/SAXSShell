@@ -13,8 +13,8 @@ from matplotlib.backends.backend_qtagg import (
 )
 from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
-from PySide6.QtCore import QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QTextCursor
+from PySide6.QtCore import QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -195,7 +196,7 @@ HISTOGRAM_COLORMAP_NAMES = [
     "magma",
 ]
 COMPONENT_PLOT_MIN_HEIGHT = 320
-PRIOR_PLOT_MIN_HEIGHT = 240
+PRIOR_PLOT_MIN_HEIGHT = 300
 RECENT_PROJECTS_KEY = "recent_project_dirs"
 
 
@@ -249,6 +250,9 @@ class ProjectSetupTab(QWidget):
         self._recognized_cluster_rows: list[dict[str, object]] = []
         self._legend_line_map: dict[object, object] = {}
         self._component_legend_lookup: dict[str, object] = {}
+        self._component_legend_line_lookup: dict[str, object] = {}
+        self._component_legend_row_lookup: dict[str, int] = {}
+        self._component_auxiliary_visibility: dict[str, bool] = {}
         self._component_line_lookup: dict[str, object] = {}
         self._component_color_lookup: dict[str, str] = {}
         self._component_color_overrides: dict[str, str] = {}
@@ -444,7 +448,7 @@ class ProjectSetupTab(QWidget):
         )
         self.use_predicted_structure_weights_checkbox.setChecked(False)
         self.use_predicted_structure_weights_checkbox.setToolTip(
-            "Include Cluster Dynamics ML Predicted Structures in the SAXS "
+            "Include Cluster Dynamics predicted structures in the SAXS "
             "component build, prior weights, Prefit, and DREAM workflows. "
             "When disabled, the project uses observed structures only."
         )
@@ -525,7 +529,7 @@ class ProjectSetupTab(QWidget):
         layout.addWidget(self.predicted_structure_ready_indicator)
         self.predict_structures_button = QPushButton("Predict Structures")
         self.predict_structures_button.setToolTip(
-            "Open Cluster Dynamics (ML) to compute predicted structures "
+            "Open Cluster Dynamics to compute predicted structures "
             "for this project."
         )
         self.predict_structures_button.clicked.connect(
@@ -1012,7 +1016,29 @@ class ProjectSetupTab(QWidget):
         )
         layout = QVBoxLayout(group)
 
-        controls = QHBoxLayout()
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(12)
+        controls_panel = QWidget()
+        controls_panel.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        controls = QGridLayout(controls_panel)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setHorizontalSpacing(8)
+        controls.setVerticalSpacing(7)
+
+        def configure_compact_control(
+            control: QWidget,
+            maximum_width: int,
+        ) -> None:
+            control.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Fixed,
+            )
+            control.setMinimumWidth(0)
+            control.setMaximumWidth(maximum_width)
+
         self.component_log_x_checkbox = QCheckBox("Log X")
         self.component_log_x_checkbox.setChecked(True)
         self.component_log_x_checkbox.toggled.connect(
@@ -1026,33 +1052,36 @@ class ProjectSetupTab(QWidget):
         self.component_legend_toggle_button = QPushButton("Legend")
         self.component_legend_toggle_button.setCheckable(True)
         self.component_legend_toggle_button.setChecked(True)
+        configure_compact_control(self.component_legend_toggle_button, 96)
         self.component_legend_toggle_button.toggled.connect(
             self._redraw_saxs_preview
         )
-        self.component_model_range_button = QPushButton(
-            "Autoscale to Model Range"
-        )
+        self.component_model_range_button = QPushButton("Autoscale")
         self.component_model_range_button.setCheckable(True)
+        configure_compact_control(self.component_model_range_button, 130)
         self.component_model_range_button.toggled.connect(
             self._redraw_saxs_preview
         )
-        self.component_all_traces_button = QPushButton("Hide Computed Traces")
+        self.component_all_traces_button = QPushButton("Hide Computed")
+        configure_compact_control(self.component_all_traces_button, 150)
         self.component_all_traces_button.clicked.connect(
             self._toggle_all_component_traces
         )
-        self.component_observed_traces_button = QPushButton(
-            "Hide Observed Traces"
-        )
+        self.component_observed_traces_button = QPushButton("Hide Observed")
+        configure_compact_control(self.component_observed_traces_button, 145)
         self.component_observed_traces_button.clicked.connect(
             self._toggle_observed_component_traces
         )
-        self.component_predicted_traces_button = QPushButton(
-            "Hide Predicted Traces"
-        )
+        self.component_predicted_traces_button = QPushButton("Hide Predicted")
+        configure_compact_control(self.component_predicted_traces_button, 145)
         self.component_predicted_traces_button.clicked.connect(
             self._toggle_predicted_component_traces
         )
         self.component_trace_color_scheme_combo = QComboBox()
+        configure_compact_control(
+            self.component_trace_color_scheme_combo,
+            180,
+        )
         self.component_trace_color_scheme_combo.addItem(
             "Current",
             userData="default",
@@ -1065,29 +1094,106 @@ class ProjectSetupTab(QWidget):
         self.component_trace_color_scheme_combo.currentIndexChanged.connect(
             self._on_component_trace_color_scheme_changed
         )
-        self.save_component_plot_data_button = QPushButton("Export Plot Data")
+        self.save_component_plot_data_button = QPushButton("Export Data")
+        configure_compact_control(self.save_component_plot_data_button, 125)
         self.save_component_plot_data_button.clicked.connect(
             self.save_component_plot_data_requested.emit
         )
-        self.open_component_plot_editor_button = QPushButton(
-            "Open Plot Editor"
+        self.open_component_plot_editor_button = QPushButton("Plot Editor")
+        configure_compact_control(
+            self.open_component_plot_editor_button,
+            120,
         )
         self.open_component_plot_editor_button.clicked.connect(
             self.open_component_plot_editor
         )
-        controls.addWidget(self.component_log_x_checkbox)
-        controls.addWidget(self.component_log_y_checkbox)
-        controls.addWidget(self.component_legend_toggle_button)
-        controls.addWidget(self.component_model_range_button)
-        controls.addWidget(self.component_all_traces_button)
-        controls.addWidget(self.component_observed_traces_button)
-        controls.addWidget(self.component_predicted_traces_button)
-        controls.addWidget(QLabel("Trace Colors"))
-        controls.addWidget(self.component_trace_color_scheme_combo)
-        controls.addWidget(self.open_component_plot_editor_button)
-        controls.addWidget(self.save_component_plot_data_button)
-        controls.addStretch(1)
-        layout.addLayout(controls)
+        axis_widget = QWidget()
+        axis_layout = QHBoxLayout(axis_widget)
+        axis_layout.setContentsMargins(0, 0, 0, 0)
+        axis_layout.setSpacing(6)
+        axis_layout.addWidget(self.component_log_x_checkbox)
+        axis_layout.addWidget(self.component_log_y_checkbox)
+        axis_layout.addWidget(self.component_legend_toggle_button)
+        axis_layout.addStretch(1)
+
+        action_widget = QWidget()
+        action_layout = QHBoxLayout(action_widget)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(6)
+        action_layout.addWidget(self.open_component_plot_editor_button)
+        action_layout.addWidget(self.save_component_plot_data_button)
+        action_layout.addStretch(1)
+
+        controls.addWidget(QLabel("Axes"), 0, 0)
+        controls.addWidget(axis_widget, 0, 1)
+        controls.addWidget(QLabel("Range"), 1, 0)
+        controls.addWidget(self.component_model_range_button, 1, 1)
+        controls.addWidget(QLabel("Computed"), 2, 0)
+        controls.addWidget(self.component_all_traces_button, 2, 1)
+        controls.addWidget(QLabel("Observed"), 3, 0)
+        controls.addWidget(self.component_observed_traces_button, 3, 1)
+        controls.addWidget(QLabel("Predicted"), 4, 0)
+        controls.addWidget(self.component_predicted_traces_button, 4, 1)
+        controls.addWidget(QLabel("Colors"), 5, 0)
+        controls.addWidget(
+            self.component_trace_color_scheme_combo,
+            5,
+            1,
+        )
+        controls.addWidget(QLabel("Actions"), 6, 0)
+        controls.addWidget(action_widget, 6, 1)
+        controls.setColumnStretch(1, 1)
+        controls_row.addWidget(controls_panel, stretch=1)
+
+        self.component_legend_panel = QWidget()
+        self.component_legend_panel.setMinimumWidth(300)
+        self.component_legend_panel.setMaximumWidth(420)
+        self.component_legend_panel.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
+        legend_layout = QVBoxLayout(self.component_legend_panel)
+        legend_layout.setContentsMargins(0, 0, 0, 0)
+        legend_layout.setSpacing(4)
+        self.component_legend_title = QLabel("Legend")
+        legend_layout.addWidget(self.component_legend_title)
+        self.component_legend_table = QTableWidget(0, 3)
+        self.component_legend_table.setHorizontalHeaderLabels(
+            ["Show", "", "Trace"]
+        )
+        self.component_legend_table.verticalHeader().setVisible(False)
+        self.component_legend_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.component_legend_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.component_legend_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.component_legend_table.setMinimumWidth(300)
+        self.component_legend_table.setMaximumWidth(420)
+        self.component_legend_table.setMinimumHeight(150)
+        self.component_legend_table.setMaximumHeight(240)
+        self.component_legend_table.horizontalHeader().setSectionResizeMode(
+            0,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.component_legend_table.horizontalHeader().setSectionResizeMode(
+            1,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.component_legend_table.horizontalHeader().setSectionResizeMode(
+            2,
+            QHeaderView.ResizeMode.Stretch,
+        )
+        self.component_legend_table.itemChanged.connect(
+            self._on_component_legend_item_changed
+        )
+        legend_layout.addWidget(self.component_legend_table)
+        self.component_legend_panel.setVisible(False)
+        controls_row.addWidget(self.component_legend_panel, stretch=0)
+        layout.addLayout(controls_row)
 
         self.component_figure = Figure(figsize=(6.8, 5.2))
         self.component_canvas = FigureCanvasQTAgg(self.component_figure)
@@ -1099,6 +1205,20 @@ class ProjectSetupTab(QWidget):
             self.component_canvas,
             self,
         )
+        component_toolbar_icon_size = QSize(24, 24)
+        component_toolbar_button_size = QSize(40, 40)
+        self.component_toolbar.setIconSize(component_toolbar_icon_size)
+        self.component_toolbar.setMinimumHeight(44)
+        self.component_toolbar.setMaximumHeight(48)
+        self.component_toolbar.setContentsMargins(0, 0, 0, 0)
+        for button in self.component_toolbar.findChildren(QToolButton):
+            button.setIconSize(component_toolbar_icon_size)
+            button.setMinimumSize(component_toolbar_button_size)
+            button.setMaximumSize(component_toolbar_button_size)
+            button.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Fixed,
+            )
         self.component_canvas.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
@@ -1115,8 +1235,8 @@ class ProjectSetupTab(QWidget):
             QSizePolicy.Policy.Expanding,
         )
         layout = QVBoxLayout(group)
-
-        controls = QHBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
         self.prior_mode_combo = QComboBox()
         self.prior_mode_combo.addItem(
             "Structure Fraction",
@@ -1180,24 +1300,80 @@ class ProjectSetupTab(QWidget):
         self.open_prior_plot_editor_button.clicked.connect(
             self.open_prior_plot_editor
         )
-        controls.addWidget(QLabel("Mode"))
-        controls.addWidget(self.prior_mode_combo)
-        controls.addWidget(QLabel("X-Axis Ordering"))
-        controls.addWidget(self.prior_x_axis_order_combo)
-        controls.addWidget(self.edit_prior_x_axis_button)
-        controls.addWidget(self.open_prior_plot_editor_button)
-        controls.addWidget(self.secondary_filter_label)
-        controls.addWidget(self.secondary_filter_combo)
-        controls.addWidget(self.generate_prior_plot_button)
-        controls.addWidget(QLabel("Color"))
-        controls.addWidget(self.prior_color_combo)
-        controls.addWidget(self.prior_match_trace_colors_checkbox)
-        controls.addWidget(self.save_prior_png_button)
-        controls.addWidget(self.save_prior_plot_data_button)
-        controls.addStretch(1)
-        layout.addLayout(controls)
+        for combo in (
+            self.prior_mode_combo,
+            self.prior_x_axis_order_combo,
+            self.secondary_filter_combo,
+            self.prior_color_combo,
+        ):
+            combo.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+            combo.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            )
 
-        self.prior_figure = Figure(figsize=(6.8, 3.4))
+        self.prior_controls_panel = QWidget()
+        self.prior_controls_panel.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        controls = QGridLayout(self.prior_controls_panel)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setHorizontalSpacing(6)
+        controls.setVerticalSpacing(6)
+
+        x_order_widget = QWidget()
+        x_order_layout = QHBoxLayout(x_order_widget)
+        x_order_layout.setContentsMargins(0, 0, 0, 0)
+        x_order_layout.setSpacing(6)
+        x_order_layout.addWidget(self.prior_x_axis_order_combo)
+        x_order_layout.addWidget(self.edit_prior_x_axis_button)
+
+        color_widget = QWidget()
+        color_layout = QHBoxLayout(color_widget)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.setSpacing(6)
+        color_layout.addWidget(self.prior_color_combo)
+        color_layout.addWidget(self.prior_match_trace_colors_checkbox)
+        color_layout.addStretch(1)
+
+        prior_action_buttons = QWidget()
+        prior_action_buttons.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        prior_action_layout = QHBoxLayout(prior_action_buttons)
+        prior_action_layout.setContentsMargins(0, 0, 0, 0)
+        prior_action_layout.setSpacing(6)
+        for button in (
+            self.open_prior_plot_editor_button,
+            self.generate_prior_plot_button,
+            self.save_prior_png_button,
+            self.save_prior_plot_data_button,
+        ):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Fixed,
+            )
+            prior_action_layout.addWidget(button, stretch=1)
+
+        controls.addWidget(QLabel("Mode"), 0, 0)
+        controls.addWidget(self.prior_mode_combo, 0, 1)
+        controls.addWidget(QLabel("X Order"), 0, 2)
+        controls.addWidget(x_order_widget, 0, 3)
+        controls.addWidget(QLabel("Color"), 1, 0)
+        controls.addWidget(color_widget, 1, 1)
+        controls.addWidget(self.secondary_filter_label, 1, 2)
+        controls.addWidget(self.secondary_filter_combo, 1, 3)
+        controls.addWidget(prior_action_buttons, 2, 0, 1, 4)
+        controls.setColumnStretch(1, 1)
+        controls.setColumnStretch(3, 1)
+        layout.addWidget(self.prior_controls_panel)
+
+        self.prior_figure = Figure(figsize=(6.8, 4.2))
         self.prior_canvas = FigureCanvasQTAgg(self.prior_figure)
         self.prior_canvas.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -2041,14 +2217,14 @@ class ProjectSetupTab(QWidget):
         )
         if self._predicted_structures_available:
             self.use_predicted_structure_weights_checkbox.setToolTip(
-                "Include Cluster Dynamics ML Predicted Structures in the "
+                "Include Cluster Dynamics predicted structures in the "
                 "SAXS component build, prior weights, Prefit, and DREAM "
                 "workflows. When disabled, the project uses observed "
                 "structures only."
             )
         else:
             self.use_predicted_structure_weights_checkbox.setToolTip(
-                "Run Cluster Dynamics (ML) to compute predicted structures "
+                "Run Cluster Dynamics to compute predicted structures "
                 "for this project before enabling this option."
             )
         self.predict_structures_button.setEnabled(self._project_selected)
@@ -2669,7 +2845,7 @@ class ProjectSetupTab(QWidget):
                 self.prior_secondary_element(),
             ),
             x_label="Structure",
-            y_label=prior_histogram_default_y_label(self.prior_mode()),
+            y_label=self._prior_preview_y_label(self.prior_mode()),
             legend_title=prior_histogram_default_legend_title(
                 self.prior_mode(),
                 self.prior_secondary_element(),
@@ -2679,6 +2855,11 @@ class ProjectSetupTab(QWidget):
             raw_category_labels=raw_labels,
             default_label_entries=default_label_entries,
         )
+
+    @staticmethod
+    def _prior_preview_y_label(mode: str) -> str:
+        label = prior_histogram_default_y_label(mode)
+        return label.replace("Percentage of Total ", "Percentage of Total\n")
 
     def _apply_prior_plot_label_state(
         self,
@@ -3339,6 +3520,7 @@ class ProjectSetupTab(QWidget):
             )
             axis.set_axis_off()
             if interactive:
+                self._clear_component_legend_table()
                 self._refresh_component_plot_editor_controls()
                 self._update_component_table_visuals()
                 self._update_component_trace_control_state()
@@ -3462,35 +3644,39 @@ class ProjectSetupTab(QWidget):
             )
 
         anchor_axis = experimental_axis or component_axis
-        if (
-            anchor_axis is not None
-            and plotted_lines
+        legend_enabled = bool(
+            plotted_lines
             and self.component_legend_toggle_button.isChecked()
             and self._component_plot_settings.resolve_show_legend(defaults)
-        ):
+        )
+        if interactive:
+            if legend_enabled:
+                self._build_interactive_legend(
+                    anchor_axis,
+                    plotted_lines,
+                    location=self._component_plot_settings.resolve_legend_location(
+                        defaults
+                    ),
+                    font_size=self._component_plot_settings.legend_font_size,
+                    font_family=font_family,
+                )
+            else:
+                self._clear_component_legend_table()
+        elif anchor_axis is not None and legend_enabled:
             legend_location = (
                 self._component_plot_settings.resolve_legend_location(defaults)
             )
             legend_font_size = self._component_plot_settings.legend_font_size
-            if interactive:
-                self._build_interactive_legend(
-                    anchor_axis,
-                    plotted_lines,
-                    location=legend_location,
-                    font_size=legend_font_size,
-                    font_family=font_family,
-                )
-            else:
-                preview_legend = anchor_axis.legend(
-                    plotted_lines,
-                    [line.get_label() for line in plotted_lines],
-                    loc=legend_location,
-                    fontsize=legend_font_size,
-                    framealpha=0.9,
-                )
-                if preview_legend is not None and font_family:
-                    for text in preview_legend.get_texts():
-                        text.set_fontfamily(font_family)
+            preview_legend = anchor_axis.legend(
+                plotted_lines,
+                [line.get_label() for line in plotted_lines],
+                loc=legend_location,
+                fontsize=legend_font_size,
+                framealpha=0.9,
+            )
+            if preview_legend is not None and font_family:
+                for text in preview_legend.get_texts():
+                    text.set_fontfamily(font_family)
 
         for axis in figure.axes:
             axis.xaxis.label.set_fontsize(x_axis_label_font_size)
@@ -4669,6 +4855,13 @@ class ProjectSetupTab(QWidget):
                 linewidth=1.3,
                 label=experimental_label,
             )
+            full_line.set_gid("experimental_data")
+            full_line.set_visible(
+                self._component_auxiliary_visibility.get(
+                    "experimental_data",
+                    True,
+                )
+            )
             lines.append(full_line)
 
             selected_mask = self._selected_q_mask(q_values)
@@ -4686,6 +4879,13 @@ class ProjectSetupTab(QWidget):
                         color=exp_color,
                         linewidth=1.8,
                         label=selected_label,
+                    )
+                    selected_line.set_gid("selected_q_range")
+                    selected_line.set_visible(
+                        self._component_auxiliary_visibility.get(
+                            "selected_q_range",
+                            True,
+                        )
                     )
                     lines.append(selected_line)
                 else:
@@ -4725,6 +4925,13 @@ class ProjectSetupTab(QWidget):
                 linewidth=1.3,
                 label=solvent_label,
             )
+            solvent_line.set_gid("solvent_data")
+            solvent_line.set_visible(
+                self._component_auxiliary_visibility.get(
+                    "solvent_data",
+                    True,
+                )
+            )
             lines.append(solvent_line)
 
             solvent_selected_mask = self._selected_q_mask(solvent_q_values)
@@ -4744,6 +4951,13 @@ class ProjectSetupTab(QWidget):
                         color=solvent_color,
                         linewidth=1.8,
                         label=selected_solvent_label,
+                    )
+                    selected_solvent_line.set_gid("selected_solvent_q_range")
+                    selected_solvent_line.set_visible(
+                        self._component_auxiliary_visibility.get(
+                            "selected_solvent_q_range",
+                            True,
+                        )
                     )
                     lines.append(selected_solvent_line)
                 else:
@@ -4915,54 +5129,156 @@ class ProjectSetupTab(QWidget):
         font_size: float = 9.0,
         font_family: str = "",
     ) -> None:
-        legend_columns = max(1, int(np.ceil(len(lines) / 5.0)))
-        legend_kwargs: dict[str, object] = {
-            "fontsize": font_size,
-            "loc": location,
-            "borderaxespad": 0.3,
-            "framealpha": 0.9,
-            "ncols": legend_columns,
-            "columnspacing": 0.9,
-            "handlelength": 1.5,
-        }
-        if location == "upper right":
-            legend_kwargs["bbox_to_anchor"] = (0.985, 0.985)
-        legend = axis.legend(
-            lines,
-            [line.get_label() for line in lines],
-            **legend_kwargs,
-        )
-        if legend is None:
-            return
-        if font_family:
-            for text in legend.get_texts():
-                text.set_fontfamily(font_family)
+        del axis, location, font_size, font_family
         self._legend_line_map.clear()
         self._component_legend_lookup.clear()
-        legend_handles = getattr(legend, "legend_handles", None)
-        if legend_handles is None:
-            legend_handles = getattr(legend, "legendHandles", [])
-        for legend_line, original_line in zip(legend_handles, lines):
-            if hasattr(legend_line, "set_picker"):
-                legend_line.set_picker(True)
-                legend_line.set_pickradius(6)
-            legend_line.set_alpha(1.0 if original_line.get_visible() else 0.25)
-            self._legend_line_map[legend_line] = original_line
-            line_key = str(original_line.get_gid() or "").strip()
-            if line_key:
-                self._component_legend_lookup[line_key] = legend_line
+        self._component_legend_line_lookup.clear()
+        self._component_legend_row_lookup.clear()
+        show_legend = self.component_legend_toggle_button.isChecked()
+        self.component_legend_panel.setVisible(show_legend)
+        self.component_legend_table.setVisible(show_legend)
+        self.component_legend_table.blockSignals(True)
+        try:
+            self.component_legend_table.setRowCount(len(lines))
+            for row, line in enumerate(lines):
+                line_key = str(line.get_gid() or line.get_label()).strip()
+                if not line_key:
+                    line_key = f"trace_{row}"
+                self._component_legend_line_lookup[line_key] = line
+                self._component_legend_row_lookup[line_key] = row
+                self._component_legend_lookup[line_key] = line
+
+                visible_item = QTableWidgetItem()
+                visible_item.setData(Qt.ItemDataRole.UserRole, line_key)
+                visible_item.setFlags(
+                    Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                visible_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                visible_item.setCheckState(
+                    Qt.CheckState.Checked
+                    if line.get_visible()
+                    else Qt.CheckState.Unchecked
+                )
+
+                color_item = QTableWidgetItem("")
+                color_item.setData(Qt.ItemDataRole.UserRole, line_key)
+                color_item.setFlags(
+                    Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+                )
+                color_item.setBackground(QColor(str(line.get_color())))
+
+                label_item = QTableWidgetItem(str(line.get_label()))
+                label_item.setData(Qt.ItemDataRole.UserRole, line_key)
+                label_item.setFlags(
+                    Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+                )
+                label_item.setToolTip(str(line.get_label()))
+
+                self.component_legend_table.setItem(row, 0, visible_item)
+                self.component_legend_table.setItem(row, 1, color_item)
+                self.component_legend_table.setItem(row, 2, label_item)
+                self.component_legend_table.setRowHeight(row, 22)
+        finally:
+            self.component_legend_table.blockSignals(False)
+        self._update_component_legend_table_visuals()
+
+    def _clear_component_legend_table(self) -> None:
+        self._legend_line_map.clear()
+        self._component_legend_lookup.clear()
+        self._component_legend_line_lookup.clear()
+        self._component_legend_row_lookup.clear()
+        self.component_legend_table.blockSignals(True)
+        try:
+            self.component_legend_table.setRowCount(0)
+            self.component_legend_panel.setVisible(False)
+            self.component_legend_table.setVisible(False)
+        finally:
+            self.component_legend_table.blockSignals(False)
+
+    def _on_component_legend_item_changed(
+        self,
+        item: QTableWidgetItem,
+    ) -> None:
+        if item.column() != 0:
+            return
+        line_key = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not line_key:
+            return
+        self._set_component_plot_trace_visible(
+            line_key,
+            item.checkState() == Qt.CheckState.Checked,
+        )
+        self._update_component_table_visuals()
+        self._update_component_trace_control_state()
+        self._refresh_component_axes()
+        self.component_canvas.draw_idle()
+
+    def _set_component_plot_trace_visible(
+        self,
+        line_key: str,
+        visible: bool,
+    ) -> None:
+        line_key = str(line_key)
+        if (
+            line_key in self._component_line_lookup
+            or self._has_component_trace(line_key)
+        ):
+            self._component_visibility[line_key] = visible
+        else:
+            self._component_auxiliary_visibility[line_key] = visible
+
+        line = self._component_legend_line_lookup.get(
+            line_key,
+        ) or self._component_line_lookup.get(line_key)
+        if line is not None:
+            line.set_visible(visible)
+        self._update_component_legend_table_visuals()
+
+    def _update_component_legend_table_visuals(self) -> None:
+        if not hasattr(self, "component_legend_table"):
+            return
+        show_legend = self.component_legend_toggle_button.isChecked() and bool(
+            self._component_legend_row_lookup
+        )
+        self.component_legend_panel.setVisible(show_legend)
+        self.component_legend_table.setVisible(show_legend)
+        self.component_legend_table.blockSignals(True)
+        try:
+            for line_key, row in self._component_legend_row_lookup.items():
+                line = self._component_legend_line_lookup.get(line_key)
+                visible = True if line is None else bool(line.get_visible())
+                visible_item = self.component_legend_table.item(row, 0)
+                color_item = self.component_legend_table.item(row, 1)
+                label_item = self.component_legend_table.item(row, 2)
+                if visible_item is not None:
+                    visible_item.setCheckState(
+                        Qt.CheckState.Checked
+                        if visible
+                        else Qt.CheckState.Unchecked
+                    )
+                foreground = QBrush(
+                    QColor("#10292d" if visible else "#7a8a8a")
+                )
+                for table_item in (color_item, label_item):
+                    if table_item is not None:
+                        table_item.setForeground(foreground)
+                if color_item is not None and line is not None:
+                    color_item.setBackground(QColor(str(line.get_color())))
+        finally:
+            self.component_legend_table.blockSignals(False)
 
     def _handle_component_legend_pick(self, event) -> None:
         original_line = self._legend_line_map.get(event.artist)
         if original_line is None:
             return
         is_visible = not original_line.get_visible()
-        original_line.set_visible(is_visible)
         line_key = str(original_line.get_gid() or "").strip()
         if line_key:
-            self._component_visibility[line_key] = is_visible
-        if hasattr(event.artist, "set_alpha"):
-            event.artist.set_alpha(1.0 if is_visible else 0.25)
+            self._set_component_plot_trace_visible(line_key, is_visible)
+        else:
+            original_line.set_visible(is_visible)
         self._update_component_table_visuals()
         self._update_component_trace_control_state()
         self._refresh_component_axes()
@@ -4980,13 +5296,7 @@ class ProjectSetupTab(QWidget):
         if component_key not in self._component_visibility:
             return
         visible = item.checkState() == Qt.CheckState.Checked
-        self._component_visibility[str(component_key)] = visible
-        line = self._component_line_lookup.get(str(component_key))
-        if line is not None:
-            line.set_visible(visible)
-        legend_line = self._component_legend_lookup.get(str(component_key))
-        if legend_line is not None and hasattr(legend_line, "set_alpha"):
-            legend_line.set_alpha(1.0 if visible else 0.25)
+        self._set_component_plot_trace_visible(str(component_key), visible)
         self._update_component_trace_control_state()
         self._refresh_component_axes()
         self.component_canvas.draw_idle()
@@ -5025,11 +5335,12 @@ class ProjectSetupTab(QWidget):
         line = self._component_line_lookup.get(component_key)
         if line is not None:
             line.set_color(color)
-        self._component_color_lookup[component_key] = color
-        legend_line = self._component_legend_lookup.get(component_key)
+        legend_line = self._component_legend_line_lookup.get(component_key)
         if legend_line is not None and hasattr(legend_line, "set_color"):
             legend_line.set_color(color)
+        self._component_color_lookup[component_key] = color
         self._update_component_table_visuals()
+        self._update_component_legend_table_visuals()
         self.component_canvas.draw_idle()
         self._redraw_prior_preview_if_needed()
 
@@ -5071,13 +5382,10 @@ class ProjectSetupTab(QWidget):
         )
         target_visible = not any_visible
         for component_key in component_keys:
-            self._component_visibility[component_key] = target_visible
-            line = self._component_line_lookup.get(component_key)
-            if line is not None:
-                line.set_visible(target_visible)
-            legend_line = self._component_legend_lookup.get(component_key)
-            if legend_line is not None and hasattr(legend_line, "set_alpha"):
-                legend_line.set_alpha(1.0 if target_visible else 0.25)
+            self._set_component_plot_trace_visible(
+                component_key,
+                target_visible,
+            )
 
     def _update_component_trace_control_state(self) -> None:
         has_components = bool(self._component_paths)
@@ -5104,7 +5412,7 @@ class ProjectSetupTab(QWidget):
         self.component_all_traces_button.setEnabled(has_components)
         self.component_trace_color_scheme_combo.setEnabled(has_components)
         self.component_all_traces_button.setText(
-            "Hide Computed Traces" if any_visible else "Show Computed Traces"
+            "Hide Computed" if any_visible else "Show Computed"
         )
         self.component_observed_traces_button.setVisible(predicted_mode)
         self.component_predicted_traces_button.setVisible(predicted_mode)
@@ -5115,14 +5423,10 @@ class ProjectSetupTab(QWidget):
             predicted_mode and has_predicted_components
         )
         self.component_observed_traces_button.setText(
-            "Hide Observed Traces"
-            if observed_visible
-            else "Show Observed Traces"
+            "Hide Observed" if observed_visible else "Show Observed"
         )
         self.component_predicted_traces_button.setText(
-            "Hide Predicted Traces"
-            if predicted_visible
-            else "Show Predicted Traces"
+            "Hide Predicted" if predicted_visible else "Show Predicted"
         )
         self._update_prior_control_state()
 

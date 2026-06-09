@@ -2520,7 +2520,7 @@ def _build_optional_predicted_representatives(
     except Exception as exc:
         notes.append(
             "Predicted optimized representative skipped because the Cluster "
-            f"Dynamics ML scaffold builder was unavailable: {exc}"
+            f"Dynamics scaffold builder was unavailable: {exc}"
         )
         return None, None, None, None, tuple(notes)
 
@@ -2615,7 +2615,7 @@ def _build_optional_predicted_representatives(
     )
     notes.append(
         "Predicted optimized representative generated with the Cluster "
-        "Dynamics ML geometry scaffold and locally refined against the "
+        "Dynamics geometry scaffold and locally refined against the "
         "current geometric scoring target."
     )
 
