@@ -27,6 +27,10 @@ from saxshell.cluster import DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME
 from saxshell.cluster.ui.definitions_panel import ClusterDefinitionsPanel
 from saxshell.cluster.workflow import ClusterWorkflow, format_box_dimensions
 from saxshell.clusterdynamics.ui.main_window import ClusterDynamicsTimePanel
+from saxshell.clusterdynamics.ui.project_defaults import (
+    apply_cluster_extraction_project_defaults,
+    apply_mdtrajectory_time_axis_project_defaults,
+)
 from saxshell.clusterdynamicsml.run_config import (
     build_clusterdynamicsml_run_config,
     default_clusterdynamicsml_run_file_path,
@@ -80,7 +84,7 @@ class ClusterDynamicsMLRunFileWindow(QMainWindow):
             if experimental_data_file is None:
                 experimental_data_file = defaults.get("experimental_data_file")
 
-        self.setWindowTitle("Cluster Dynamics ML CLI Setup (Beta)")
+        self.setWindowTitle("Cluster Dynamics Prediction CLI Setup (Beta)")
         self.setWindowIcon(load_saxshell_icon())
         self.resize(1120, 840)
         self._build_ui()
@@ -89,6 +93,8 @@ class ClusterDynamicsMLRunFileWindow(QMainWindow):
         )
         self.definitions_panel.set_shell_reference_editor_enabled(True)
         self._load_shell_reference_library_entries()
+        if project_dir is not None:
+            self._apply_project_analysis_defaults(project_dir)
 
         if project_dir is not None:
             self.project_dir_edit.setText(str(project_dir))
@@ -401,7 +407,7 @@ class ClusterDynamicsMLRunFileWindow(QMainWindow):
             config = self._current_config(project_dir)
         except Exception as exc:
             QMessageBox.warning(
-                self, "Cluster Dynamics ML CLI Setup", str(exc)
+                self, "Cluster Dynamics Prediction CLI Setup", str(exc)
             )
             return
         run_file_path = default_clusterdynamicsml_run_file_path(project_dir)
@@ -412,8 +418,8 @@ class ClusterDynamicsMLRunFileWindow(QMainWindow):
         self.statusBar().showMessage(f"Saved run file: {run_file_path}")
         QMessageBox.information(
             self,
-            "Cluster Dynamics ML CLI Setup",
-            f"Saved cluster dynamics ML CLI run file:\n{run_file_path}",
+            "Cluster Dynamics Prediction CLI Setup",
+            f"Saved cluster dynamics prediction CLI run file:\n{run_file_path}",
         )
 
     def _update_preview(self, *_args: object) -> None:
@@ -493,6 +499,7 @@ class ClusterDynamicsMLRunFileWindow(QMainWindow):
             ),
             analysis_start_fs=self.time_panel.analysis_start_fs(),
             analysis_stop_fs=self.time_panel.analysis_stop_fs(),
+            prediction_enabled=self.prediction_panel.prediction_enabled(),
             target_node_counts=self.prediction_panel.target_node_counts(),
             candidates_per_size=self.prediction_panel.candidates_per_size(),
             prediction_population_share_threshold=(
@@ -546,6 +553,20 @@ class ClusterDynamicsMLRunFileWindow(QMainWindow):
             settings.resolved_experimental_data_path
         )
         return defaults
+
+    def _apply_project_analysis_defaults(self, project_dir: Path) -> None:
+        try:
+            settings = SAXSProjectManager().load_project(project_dir)
+        except Exception:
+            return
+        apply_cluster_extraction_project_defaults(
+            self.definitions_panel,
+            settings.cluster_extraction_settings,
+        )
+        apply_mdtrajectory_time_axis_project_defaults(
+            self.time_panel,
+            settings.mdtrajectory_time_axis_settings,
+        )
 
 
 def _summary_text(summary: dict[str, object]) -> str:

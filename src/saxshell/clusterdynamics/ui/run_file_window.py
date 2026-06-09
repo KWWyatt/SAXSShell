@@ -34,6 +34,10 @@ from saxshell.clusterdynamics.run_config import (
     suggest_clusterdynamics_output_file,
 )
 from saxshell.clusterdynamics.ui.main_window import ClusterDynamicsTimePanel
+from saxshell.clusterdynamics.ui.project_defaults import (
+    apply_cluster_extraction_project_defaults,
+    apply_mdtrajectory_time_axis_project_defaults,
+)
 from saxshell.saxs.project_manager import SAXSProjectManager
 from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
@@ -85,6 +89,8 @@ class ClusterDynamicsRunFileWindow(QMainWindow):
         self.definitions_panel.load_preset(
             DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME
         )
+        if project_dir is not None:
+            self._apply_project_analysis_defaults(project_dir)
 
         if project_dir is not None:
             self.project_dir_edit.setText(str(project_dir))
@@ -476,6 +482,20 @@ class ClusterDynamicsRunFileWindow(QMainWindow):
         defaults["frames_dir"] = settings.resolved_frames_dir
         defaults["energy_file"] = settings.resolved_energy_file
         return defaults
+
+    def _apply_project_analysis_defaults(self, project_dir: Path) -> None:
+        try:
+            settings = SAXSProjectManager().load_project(project_dir)
+        except Exception:
+            return
+        apply_cluster_extraction_project_defaults(
+            self.definitions_panel,
+            settings.cluster_extraction_settings,
+        )
+        apply_mdtrajectory_time_axis_project_defaults(
+            self.time_panel,
+            settings.mdtrajectory_time_axis_settings,
+        )
 
 
 def _summary_text(summary: dict[str, object]) -> str:

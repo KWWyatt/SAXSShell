@@ -20,6 +20,8 @@ import saxshell.clusterdynamicsml.cli as clusterdynamicsml_cli_module
 import saxshell.clusterdynamicsml.workflow as clusterdynamicsml_workflow_module
 from saxshell import saxshell as saxshell_module
 from saxshell.cluster import PDBShellReferenceDefinition
+from saxshell.cluster.clusternetwork import CLUSTER_METADATA_FILENAME
+from saxshell.clusterdynamics import ClusterDynamicsWorkflow
 from saxshell.clusterdynamicsml import (
     ClusterDynamicsMLWorkflow,
     build_clusterdynamicsml_run_config,
@@ -30,7 +32,9 @@ from saxshell.clusterdynamicsml import (
     save_clusterdynamicsml_run_config,
 )
 from saxshell.clusterdynamicsml.ui.main_window import (
+    _HISTORY_EXPANDED_MIN_HEIGHT,
     _UI_REFRESH_DELAY_MS,
+    CLUSTER_DYNAMICS_ML_WINDOW_LOAD_TOTAL_STEPS,
     ClusterDynamicsMLMainWindow,
     ClusterDynamicsMLSettingsPanel,
     _combined_model_weight_rows,
@@ -42,6 +46,10 @@ from saxshell.clusterdynamicsml.ui.plot_panel import (
 )
 from saxshell.clusterdynamicsml.ui.run_file_window import (
     ClusterDynamicsMLRunFileWindow,
+)
+from saxshell.project_memory import (
+    build_cluster_extraction_settings_payload,
+    build_mdtrajectory_time_axis_settings_payload,
 )
 from saxshell.saxs.debye import (
     compute_debye_intensity,
@@ -144,6 +152,47 @@ def _build_frames_dir(tmp_path: Path) -> Path:
     for index, content in enumerate(sequence):
         (frames_dir / f"frame_{index:04d}.xyz").write_text(content)
     return frames_dir
+
+
+def _write_cluster_extraction_metadata_from_result(
+    clusters_dir: Path,
+    *,
+    frames_dir: Path,
+    result,
+) -> Path:
+    clusters_dir.mkdir(parents=True, exist_ok=True)
+    frames_payload = []
+    for frame_path, frame_result in zip(
+        sorted(frames_dir.iterdir()),
+        result.frame_results,
+        strict=False,
+    ):
+        frames_payload.append(
+            {
+                "frame_name": frame_path.name,
+                "frame_label": frame_path.stem,
+                "frame_index": frame_result.frame_index,
+                "status": "completed",
+                "written_files": [],
+                "result": frame_result.to_dict(),
+            }
+        )
+    metadata_path = clusters_dir / CLUSTER_METADATA_FILENAME
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "state": "completed",
+                "input": {
+                    "frames_dir": str(frames_dir),
+                    "n_frames": len(frames_payload),
+                },
+                "frames": frames_payload,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return metadata_path
 
 
 def _build_clusters_dir(tmp_path: Path) -> Path:
@@ -648,6 +697,12 @@ def test_clusterdynamicsml_prediction_panel_tooltips(qapp):
     del qapp
     panel = ClusterDynamicsMLSettingsPanel()
 
+    assert panel.title() == "Prediction Inputs (beta)"
+    assert not panel.prediction_enabled()
+    assert not panel.target_start_spin.isEnabled()
+    assert "larger-cluster prediction calculations" in (
+        panel.prediction_enabled_checkbox.toolTip()
+    )
     assert "stoichiometry label" in panel.clusters_dir_edit.toolTip()
     assert "Leave this blank" in panel.experimental_data_edit.toolTip()
     assert "Lowest node count to predict" in panel.target_start_spin.toolTip()
@@ -664,7 +719,52 @@ def test_clusterdynamicsml_prediction_panel_tooltips(qapp):
     assert "fallback SAXS grid" in panel.q_points_spin.toolTip()
     assert "larger node counts to predict" in panel.toolTip()
 
+    panel.set_prediction_enabled(True)
+    assert panel.prediction_enabled()
+    assert panel.target_start_spin.isEnabled()
+
     panel.close()
+
+
+def test_clusterdynamicsml_main_window_prediction_mode_updates_button(qapp):
+    del qapp
+    window = ClusterDynamicsMLMainWindow()
+
+    assert not window.prediction_panel.prediction_enabled()
+    assert window.run_panel.analyze_button.text() == "Analyze Clusters"
+
+    window.prediction_panel.set_prediction_enabled(True)
+
+    assert window.run_panel.analyze_button.text() == (
+        "Analyze and Predict Larger Clusters"
+    )
+    window.close()
+
+
+def test_clusterdynamicsml_main_window_reports_startup_loader_progress(qapp):
+    del qapp
+    window = ClusterDynamicsMLMainWindow()
+
+    dialog = window._startup_progress_dialog
+    assert dialog is not None
+    assert not dialog.isVisible()
+    assert dialog.windowTitle() == "Opening Cluster Dynamics"
+    assert (
+        dialog.progress_bar.maximum()
+        == CLUSTER_DYNAMICS_ML_WINDOW_LOAD_TOTAL_STEPS
+    )
+    assert (
+        dialog.progress_bar.value()
+        == CLUSTER_DYNAMICS_ML_WINDOW_LOAD_TOTAL_STEPS
+    )
+    output = dialog.output_box.toPlainText()
+    assert "Preparing Cluster Dynamics window." in output
+    assert "Loading Cluster Dynamics controls, prediction inputs" in output
+    assert "No initial Cluster Dynamics inputs supplied." in output
+    assert "Synchronizing project defaults and prediction inputs." in output
+    assert "Checking for saved Cluster Dynamics project results." in output
+    assert "Cluster Dynamics window is ready." in output
+    window.close()
 
 
 def test_clusterdynamicsml_workflow_predicts_larger_clusters(tmp_path):
@@ -721,6 +821,116 @@ def test_clusterdynamicsml_workflow_predicts_larger_clusters(tmp_path):
     )
     assert result.saxs_comparison.rmse is not None
     assert len(result.saxs_comparison.component_weights) >= 3
+
+
+def test_clusterdynamicsml_workflow_can_run_observed_only_without_prediction(
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+
+    workflow = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        prediction_enabled=False,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4, 5),
+    )
+
+    preview = workflow.preview_selection()
+    result = workflow.analyze()
+
+    assert not preview.prediction_enabled
+    assert preview.target_node_counts == ()
+    assert not result.preview.prediction_enabled
+    assert result.preview.target_node_counts == ()
+    assert result.predictions == ()
+    assert result.debye_waller_estimates == ()
+    assert result.saxs_comparison is None
+    assert result.dynamics_result.analyzed_frames > 0
+    assert result.training_observations
+
+
+def test_clusterdynamicsml_reuses_extracted_cluster_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    baseline = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        prediction_enabled=False,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+    ).analyze()
+    clusters_dir = tmp_path / "clusters_reused"
+    _write_cluster_extraction_metadata_from_result(
+        clusters_dir,
+        frames_dir=frames_dir,
+        result=baseline.dynamics_result,
+    )
+
+    def _raise_if_reextracting(*_args, **_kwargs):
+        raise AssertionError("cluster network extraction should be skipped")
+
+    monkeypatch.setattr(
+        ClusterDynamicsWorkflow,
+        "_build_network",
+        _raise_if_reextracting,
+    )
+
+    recycled = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        clusters_dir=clusters_dir,
+        prediction_enabled=False,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+    ).analyze()
+
+    assert recycled.preview.clusters_dir == clusters_dir.resolve()
+    assert (
+        recycled.dynamics_result.cluster_labels
+        == baseline.dynamics_result.cluster_labels
+    )
+    np.testing.assert_allclose(
+        recycled.dynamics_result.raw_count_matrix,
+        baseline.dynamics_result.raw_count_matrix,
+    )
+    np.testing.assert_allclose(
+        recycled.dynamics_result.frame_count_matrix,
+        baseline.dynamics_result.frame_count_matrix,
+    )
+    assert (
+        recycled.dynamics_result.lifetime_by_label
+        == baseline.dynamics_result.lifetime_by_label
+    )
+    assert recycled.training_observations == baseline.training_observations
+
+    project_dir = _build_project_dir(
+        tmp_path,
+        frames_dir=frames_dir,
+        clusters_dir=clusters_dir,
+        experimental_data_file=_write_experimental_data_file(tmp_path),
+    )
+    project_recycled = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        project_dir=project_dir,
+        prediction_enabled=False,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+    ).analyze()
+
+    assert project_recycled.preview.clusters_dir == clusters_dir.resolve()
+    np.testing.assert_allclose(
+        project_recycled.dynamics_result.frame_count_matrix,
+        baseline.dynamics_result.frame_count_matrix,
+    )
 
 
 def test_clusterdynamicsml_project_run_saves_dataset_and_updates_project(
@@ -833,6 +1043,7 @@ def test_clusterdynamicsml_run_file_window_builds_project_config(
     )
     window.time_panel.set_frame_timestep_fs(10.0)
     window.time_panel.set_frames_per_colormap_timestep(1)
+    window.prediction_panel.set_prediction_enabled(True)
     window.prediction_panel.set_target_node_counts((4,))
     window.prediction_panel.set_candidates_per_size(1)
     window.prediction_panel.set_q_settings(
@@ -854,6 +1065,7 @@ def test_clusterdynamicsml_run_file_window_builds_project_config(
         "splitxyz_f0fs_clusterdynamicsml.json"
     )
     assert config.target_node_counts == (4,)
+    assert config.prediction_enabled
     assert config.candidates_per_size == 1
     assert config.q_points == 60
     assert "clusterdynamicsml run" in window.command_box.toPlainText()
@@ -2451,7 +2663,29 @@ def test_clusterdynamicsml_window_history_panel_collapses_and_right_pane_scrolls
 
     assert not window.history_content.isHidden()
     assert window.history_toggle_button.text() == "Collapse History"
-    assert window.history_group.minimumHeight() == 180
+    assert window.history_group.minimumHeight() == _HISTORY_EXPANDED_MIN_HEIGHT
+    window.close()
+
+
+def test_clusterdynamicsml_window_history_actions_do_not_overlap_table(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+
+    window = ClusterDynamicsMLMainWindow(initial_frames_dir=frames_dir)
+    window.resize(900, 620)
+    window.show()
+    qapp.processEvents()
+    window.right_splitter.setSizes([160, 160, _HISTORY_EXPANDED_MIN_HEIGHT])
+    qapp.processEvents()
+
+    assert window.history_load_button.geometry().bottom() < (
+        window.history_table.geometry().top()
+    )
+    assert window.history_refresh_button.geometry().bottom() < (
+        window.history_table.geometry().top()
+    )
     window.close()
 
 
@@ -2546,6 +2780,7 @@ def test_clusterdynamicsml_window_blocks_accidental_field_scroll_and_escape(
     qapp,
 ):
     window = ClusterDynamicsMLMainWindow()
+    window.prediction_panel.set_prediction_enabled(True)
     window.show()
     qapp.processEvents()
 
@@ -2723,6 +2958,47 @@ def test_clusterdynamicsml_window_inherits_project_defaults(
         experimental_data_file=experimental_data_file,
         energy_file=energy_file,
     )
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.cluster_extraction_settings = (
+        build_cluster_extraction_settings_payload(
+            frames_dir=frames_dir,
+            clusters_dir=clusters_dir,
+            atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+            pair_cutoff_definitions=PAIR_CUTOFFS,
+            box_dimensions=(41.0, 42.0, 43.0),
+            use_pbc=True,
+            default_cutoff=4.75,
+            shell_levels=(1,),
+            include_shell_levels=(0, 1),
+            shared_shells=False,
+            smart_solvation_shells=True,
+            include_shell_atoms_in_stoichiometry=True,
+            search_mode="vectorized",
+            save_state_frequency=750,
+        )
+    )
+    settings.mdtrajectory_time_axis_settings = (
+        build_mdtrajectory_time_axis_settings_payload(
+            trajectory_file=tmp_path / "traj.xyz",
+            topology_file=None,
+            energy_file=energy_file,
+            start=5,
+            stop=50,
+            stride=2,
+            frame_timestep_fs=3.5,
+            use_manual_frame_timestep=True,
+            use_cutoff_for_export=True,
+            selected_cutoff_fs=250.0,
+            suggested_cutoff_fs=240.0,
+            use_post_cutoff_stride=True,
+            post_cutoff_stride=3,
+            include_restart_duplicates=True,
+            output_dir=frames_dir,
+            applied_cutoff_fs=255.0,
+        )
+    )
+    manager.save_project(settings)
 
     window = ClusterDynamicsMLMainWindow(initial_project_dir=project_dir)
 
@@ -2733,7 +3009,23 @@ def test_clusterdynamicsml_window_inherits_project_defaults(
         window.prediction_panel.experimental_data_file()
         == experimental_data_file
     )
+    assert not window.prediction_panel.prediction_enabled()
     assert window.run_panel.energy_file() == energy_file
+    assert window.definitions_panel.atom_type_definitions() == (
+        ATOM_TYPE_DEFINITIONS
+    )
+    assert window.definitions_panel.pair_cutoff_definitions() == PAIR_CUTOFFS
+    assert window.definitions_panel.box_dimensions() == (41.0, 42.0, 43.0)
+    assert window.definitions_panel.use_pbc()
+    assert window.definitions_panel.default_cutoff() == pytest.approx(4.75)
+    assert window.definitions_panel.shell_growth_levels() == (1,)
+    assert not window.definitions_panel.shared_shells()
+    assert window.definitions_panel.smart_solvation_shells()
+    assert window.definitions_panel.include_shell_atoms_in_stoichiometry()
+    assert window.definitions_panel.search_mode() == "vectorized"
+    assert window.definitions_panel.save_state_frequency() == 750
+    assert window.time_panel.frame_timestep_fs() == pytest.approx(3.5)
+    assert window.time_panel.folder_start_time_fs() == pytest.approx(255.0)
     window.close()
 
 
@@ -2776,8 +3068,8 @@ def test_clusterdynamicsml_window_exports_colormap_and_lifetime_csv(
         lambda *args, **kwargs: (next(selected_paths), "CSV Files (*.csv)"),
     )
 
-    window.save_colormap_data()
-    window.save_lifetime_table()
+    window.dynamics_plot_panel.save_colormap_button.click()
+    window.dynamics_plot_panel.save_lifetime_button.click()
 
     with colormap_path.open(newline="", encoding="utf-8") as handle:
         colormap_rows = list(csv.DictReader(handle))
@@ -2790,6 +3082,14 @@ def test_clusterdynamicsml_window_exports_colormap_and_lifetime_csv(
     )
     assert colormap_rows[0]["display_mode"] == "count"
     assert colormap_rows[0]["time_unit"] == "ps"
+    assert (
+        window.dynamics_plot_panel.save_colormap_button.text()
+        == "Save Colormap Data"
+    )
+    assert (
+        window.dynamics_plot_panel.save_lifetime_button.text()
+        == "Save Lifetime Table"
+    )
     assert any(row["Label"] == "Pb3I2" for row in lifetime_rows)
     assert any(row["Type"] == "Predicted" for row in lifetime_rows)
     window.close()
@@ -2986,7 +3286,7 @@ def test_clusterdynamicsml_window_shows_observed_lifetime_tab(
     assert tab_titles == [
         "Summary",
         "Lifetimes",
-        "Debye-Waller",
+        "Debye-Waller (beta)",
         "Histograms",
         "SAXS",
     ]
@@ -3222,7 +3522,7 @@ def test_clusterdynamicsml_window_shows_histogram_tabs_and_saxs_model_overlay(
     assert tab_titles == [
         "Summary",
         "Lifetimes",
-        "Debye-Waller",
+        "Debye-Waller (beta)",
         "Histograms",
         "SAXS",
     ]

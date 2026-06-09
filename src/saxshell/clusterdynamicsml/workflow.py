@@ -216,6 +216,7 @@ class ClusterDynamicsMLPreview:
     total_structure_files: int
     observed_node_counts: tuple[int, ...]
     target_node_counts: tuple[int, ...]
+    prediction_enabled: bool = True
     warnings: tuple[str, ...] = ()
 
 
@@ -342,6 +343,7 @@ class ClusterDynamicsMLWorkflow:
         analysis_start_fs: float | None = None,
         analysis_stop_fs: float | None = None,
         energy_file: str | Path | None = None,
+        prediction_enabled: bool = True,
         target_node_counts: tuple[int, ...] | None = None,
         max_target_node_count: int | None = None,
         candidates_per_size: int = 3,
@@ -394,6 +396,7 @@ class ClusterDynamicsMLWorkflow:
             if energy_file is None
             else Path(energy_file).expanduser().resolve()
         )
+        self.prediction_enabled = bool(prediction_enabled)
         self.target_node_counts = (
             None
             if target_node_counts is None
@@ -462,7 +465,11 @@ class ClusterDynamicsMLWorkflow:
                     }
                 )
             )
-        target_counts = self._resolve_target_node_counts(observed_node_counts)
+        target_counts = (
+            self._resolve_target_node_counts(observed_node_counts)
+            if self.prediction_enabled
+            else ()
+        )
         return ClusterDynamicsMLPreview(
             dynamics_preview=dynamics_preview,
             clusters_dir=resolved_clusters_dir,
@@ -472,6 +479,7 @@ class ClusterDynamicsMLWorkflow:
             total_structure_files=total_structure_files,
             observed_node_counts=observed_node_counts,
             target_node_counts=target_counts,
+            prediction_enabled=self.prediction_enabled,
             warnings=warnings,
         )
 
@@ -480,10 +488,12 @@ class ClusterDynamicsMLWorkflow:
         *,
         progress_callback: PredictionProgressCallback | None = None,
     ) -> ClusterDynamicsMLResult:
-        total_steps = 7
+        total_steps = 7 if self.prediction_enabled else 3
         preview = self.preview_selection()
         resolved_clusters_dir = preview.clusters_dir
-        if resolved_clusters_dir is None or not resolved_clusters_dir.is_dir():
+        if self.prediction_enabled and (
+            resolved_clusters_dir is None or not resolved_clusters_dir.is_dir()
+        ):
             raise ValueError(
                 "Select a cluster-structures directory, or provide a SAXSShell "
                 "project with a saved clusters directory before running the "
@@ -499,7 +509,9 @@ class ClusterDynamicsMLWorkflow:
                 "building the observed population and lifetime summaries.",
             ),
         )
-        dynamics_result = self._build_cluster_dynamics_workflow().analyze()
+        dynamics_result = self._build_cluster_dynamics_workflow(
+            precomputed_clusters_dir=resolved_clusters_dir
+        ).analyze()
         self._emit(
             progress_callback,
             self._status_message(
@@ -510,28 +522,44 @@ class ClusterDynamicsMLWorkflow:
                 "stoichiometry label and selecting representative files.",
             ),
         )
-        structure_observations = self._build_structure_observations(
-            resolved_clusters_dir
+        structure_observations = (
+            []
+            if resolved_clusters_dir is None
+            or not resolved_clusters_dir.is_dir()
+            else self._build_structure_observations(resolved_clusters_dir)
         )
         self._emit(
             progress_callback,
             self._status_message(
                 3,
                 total_steps,
-                "Joining kinetics and structure descriptors.",
-                "Combining the cluster-dynamics lifetimes with the observed "
-                "structure counts, radii, semiaxes, and motif information.",
+                (
+                    "Joining kinetics and structure descriptors."
+                    if structure_observations
+                    else "Summarizing observed cluster lifetimes."
+                ),
+                (
+                    "Combining the cluster-dynamics lifetimes with the observed "
+                    "structure counts, radii, semiaxes, and motif information."
+                    if structure_observations
+                    else "Building the observed-only cluster summary without "
+                    "running larger-cluster prediction."
+                ),
             ),
         )
-        training_observations = self._build_training_observations(
-            dynamics_result,
-            structure_observations,
+        training_observations = (
+            self._build_training_observations(
+                dynamics_result,
+                structure_observations,
+            )
+            if structure_observations
+            else self._build_training_observations_from_lifetimes(
+                dynamics_result
+            )
         )
         if not training_observations:
             raise ValueError(
-                "No overlapping structure labels could be matched to the "
-                "observed cluster labels. The prediction workflow requires "
-                "smaller-cluster structure files named by stoichiometry label."
+                "No observed cluster labels were available for analysis."
             )
         observed_node_counts = tuple(
             sorted(
@@ -544,7 +572,43 @@ class ClusterDynamicsMLWorkflow:
         )
         if not observed_node_counts:
             raise ValueError(
-                "Could not infer any node-count observations from the structure labels."
+                "Could not infer any node-count observations from the cluster labels."
+            )
+        if not self.prediction_enabled:
+            return ClusterDynamicsMLResult(
+                dynamics_result=dynamics_result,
+                preview=ClusterDynamicsMLPreview(
+                    dynamics_preview=preview.dynamics_preview,
+                    clusters_dir=preview.clusters_dir,
+                    project_dir=preview.project_dir,
+                    experimental_data_path=preview.experimental_data_path,
+                    structure_label_count=preview.structure_label_count,
+                    total_structure_files=preview.total_structure_files,
+                    observed_node_counts=observed_node_counts,
+                    target_node_counts=(),
+                    prediction_enabled=False,
+                    warnings=preview.warnings,
+                ),
+                structure_observations=tuple(
+                    sorted(
+                        structure_observations,
+                        key=lambda item: (item.node_count, item.label),
+                    )
+                ),
+                training_observations=tuple(
+                    sorted(
+                        training_observations,
+                        key=lambda item: (item.node_count, item.label),
+                    )
+                ),
+                predictions=(),
+                debye_waller_estimates=(),
+                saxs_comparison=None,
+                max_observed_node_count=max(observed_node_counts),
+                max_predicted_node_count=None,
+                prediction_population_share_threshold=(
+                    self.prediction_population_share_threshold
+                ),
             )
         if len(observed_node_counts) < 2:
             raise ValueError(
@@ -631,6 +695,7 @@ class ClusterDynamicsMLWorkflow:
                 target_node_counts=self._resolve_target_node_counts(
                     observed_node_counts
                 ),
+                prediction_enabled=True,
                 warnings=preview.warnings,
             ),
             structure_observations=tuple(
@@ -655,7 +720,11 @@ class ClusterDynamicsMLWorkflow:
             ),
         )
 
-    def _build_cluster_dynamics_workflow(self) -> ClusterDynamicsWorkflow:
+    def _build_cluster_dynamics_workflow(
+        self,
+        *,
+        precomputed_clusters_dir: Path | None = None,
+    ) -> ClusterDynamicsWorkflow:
         return ClusterDynamicsWorkflow(
             self.frames_dir,
             atom_type_definitions=self.atom_type_definitions,
@@ -676,6 +745,11 @@ class ClusterDynamicsMLWorkflow:
             analysis_start_fs=self.analysis_start_fs,
             analysis_stop_fs=self.analysis_stop_fs,
             energy_file=self.energy_file,
+            precomputed_clusters_dir=(
+                self.clusters_dir
+                if precomputed_clusters_dir is None
+                else precomputed_clusters_dir
+            ),
         )
 
     def _resolve_project_inputs(
@@ -869,6 +943,58 @@ class ClusterDynamicsMLWorkflow:
                     association_rate_per_ps=lifetime.association_rate_per_ps,
                     dissociation_rate_per_ps=lifetime.dissociation_rate_per_ps,
                     completed_lifetime_count=lifetime.completed_lifetime_count,
+                    window_truncated_lifetime_count=(
+                        lifetime.window_truncated_lifetime_count
+                    ),
+                    mean_lifetime_fs=lifetime.mean_lifetime_fs,
+                    std_lifetime_fs=lifetime.std_lifetime_fs,
+                )
+            )
+        return training_rows
+
+    def _build_training_observations_from_lifetimes(
+        self,
+        dynamics_result: ClusterDynamicsResult,
+    ) -> list[ClusterDynamicsMLTrainingObservation]:
+        training_rows: list[ClusterDynamicsMLTrainingObservation] = []
+        for lifetime in dynamics_result.lifetime_by_label:
+            element_counts = _parse_stoichiometry_label(lifetime.label)
+            node_count = self._node_count_from_counts(element_counts)
+            if node_count <= 0:
+                node_count = int(lifetime.cluster_size)
+            if node_count <= 0:
+                continue
+            training_rows.append(
+                ClusterDynamicsMLTrainingObservation(
+                    label=lifetime.label,
+                    node_count=node_count,
+                    cluster_size=int(lifetime.cluster_size),
+                    element_counts=element_counts,
+                    file_count=0,
+                    representative_path=None,
+                    structure_dir=(
+                        self.frames_dir
+                        / "__observed_lifetime_only__"
+                        / lifetime.label
+                    ),
+                    motifs=(),
+                    mean_atom_count=float(lifetime.cluster_size),
+                    mean_radius_of_gyration=0.0,
+                    mean_max_radius=0.0,
+                    mean_semiaxis_a=0.0,
+                    mean_semiaxis_b=0.0,
+                    mean_semiaxis_c=0.0,
+                    total_observations=lifetime.total_observations,
+                    occupied_frames=lifetime.occupied_frames,
+                    mean_count_per_frame=lifetime.mean_count_per_frame,
+                    occupancy_fraction=lifetime.occupancy_fraction,
+                    association_events=lifetime.association_events,
+                    dissociation_events=lifetime.dissociation_events,
+                    association_rate_per_ps=lifetime.association_rate_per_ps,
+                    dissociation_rate_per_ps=lifetime.dissociation_rate_per_ps,
+                    completed_lifetime_count=(
+                        lifetime.completed_lifetime_count
+                    ),
                     window_truncated_lifetime_count=(
                         lifetime.window_truncated_lifetime_count
                     ),

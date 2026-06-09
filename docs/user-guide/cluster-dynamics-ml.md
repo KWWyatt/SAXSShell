@@ -1,4 +1,4 @@
-# Cluster Dynamics ML
+# Cluster Dynamics
 
 `clusterdynamicsml` is the predictive companion to `clusterdynamics`. It can be
 launched directly from the source checkout or from the main SAXSShell UI. It
@@ -15,7 +15,7 @@ that includes both observed and predicted structures.
 
 ## What the application does
 
-At a high level, Cluster Dynamics ML answers this question:
+At a high level, Cluster Dynamics answers this question:
 
 > Given the smaller clusters that are observed in a trajectory and the
 > reference structures available for those smaller clusters, what larger
@@ -28,7 +28,7 @@ geometry rules.
 
 ## Inputs
 
-Cluster Dynamics ML expects all of the inputs required by `clusterdynamics`,
+Cluster Dynamics expects all of the inputs required by `clusterdynamics`,
 plus a structure library for the observed smaller clusters.
 
 ### Required inputs
@@ -58,14 +58,14 @@ plus a structure library for the observed smaller clusters.
 6. Set the predicted share threshold used to prune tiny candidate populations.
 7. Optionally load experimental SAXS data.
 8. Run **Analyze and Predict Larger Clusters**.
-9. Review the `Summary`, `Lifetimes`, `Debye-Waller`, `Histograms`, and
+9. Review the `Summary`, `Lifetimes`, `Debye-Waller (beta)`, `Histograms`, and
    `SAXS` tabs.
 10. Save the dataset, CSV exports, or a detailed PowerPoint report if needed.
 
 ## Project-Backed CLI Setup
 
-For background prediction runs, use **Tools > CLI Setup > Open Cluster Dynamics
-ML CLI Setup (Beta)**. The setup window writes
+For background prediction runs, use **Tools > (beta) > CLI Setup > Open Cluster
+Dynamics ML CLI Setup (Beta)**. The setup window writes
 `cluster_dynamics_ml_cli_run.json` in the active project folder and shows the
 terminal commands to run later:
 
@@ -305,7 +305,7 @@ definition.
 
 ## Debye scattering with pairwise Debye-Waller damping
 
-Cluster Dynamics ML now distinguishes between two SAXS-component cases:
+Cluster Dynamics now distinguishes between two SAXS-component cases:
 
 - `Averaged component`
   When a SAXS component is already averaged over many structure files, the
@@ -347,7 +347,7 @@ $\sin(q r_{ij}) / (q r_{ij})$.
 
 ### Debye-Waller-extended single-structure equation
 
-For a single representative structure, Cluster Dynamics ML uses a pairwise
+For a single representative structure, Cluster Dynamics uses a pairwise
 Debye-Waller damping factor on the off-diagonal pair contributions:
 
 $$
@@ -375,7 +375,7 @@ interference terms between distinct atoms are attenuated.
 
 ### Relation between $\sigma$ and $B$
 
-Cluster Dynamics ML reports both the Gaussian displacement width
+Cluster Dynamics reports both the Gaussian displacement width
 $\sigma_{\alpha\beta}$ and the equivalent Debye-Waller $B$ coefficient:
 
 $$
@@ -399,7 +399,7 @@ main-model refinement.
 
 ## How Debye-Waller coefficients are estimated
 
-Cluster Dynamics ML estimates pairwise disorder from the observed structure
+Cluster Dynamics estimates pairwise disorder from the observed structure
 ensembles before it predicts values for the larger clusters.
 
 ### Observed-cluster ensemble estimate
@@ -471,8 +471,8 @@ measure a spread.
 ### Predicted-cluster estimate
 
 The larger predicted clusters do not have their own ensembles yet, so Cluster
-Dynamics ML fits a separate weighted ridge-regression model for each element
-pair type using the observed $\sigma_{L,\alpha\beta}$ values as the training
+Dynamics fits a separate weighted ridge-regression model for each element pair
+type using the observed $\sigma_{L,\alpha\beta}$ values as the training
 targets.
 
 For a candidate feature vector $\mathbf{x}$, the predicted disorder value is:
@@ -493,7 +493,7 @@ $$
 $$
 
 The feature vector is the same one already used for the other Cluster Dynamics
-ML properties:
+properties:
 
 $$
 \mathbf{x} =
@@ -532,11 +532,11 @@ single extrapolated candidate dominate the whole distribution.
 
 ## Outputs
 
-Cluster Dynamics ML can produce:
+Cluster Dynamics can produce:
 
 - the standard time-binned colormap from `clusterdynamics`
 - a combined lifetime table containing observed and predicted rows
-- a `Debye-Waller` table listing the resolved \(\sigma\) and \(B\) values for
+- a `Debye-Waller (beta)` table listing the resolved \(\sigma\) and \(B\) values for
   each observed and predicted element pair
 - histogram views for observed-only and observed-plus-predicted populations
 - SAXS traces for observed-only and observed-plus-predicted models
@@ -622,7 +622,7 @@ model. Related model families include:
 
 ## Why the current algorithm was chosen
 
-Cluster Dynamics ML is trying to extrapolate from a small observed size series
+Cluster Dynamics is trying to extrapolate from a small observed size series
 to larger unobserved clusters. In that setting, a simple regularized model has
 practical advantages:
 
@@ -637,7 +637,7 @@ ridge-style regression plus geometry rules over a higher-capacity learned model.
 
 ## TODO
 
-The current Debye-Waller workflow is intentionally scoped to Cluster Dynamics ML
+The current Debye-Waller workflow is intentionally scoped to Cluster Dynamics
 result inspection and to the single-structure component traces built inside that
 tool. A later extension may expose these pairwise \(B\) or \(\sigma\)
 coefficients to the main SAXS prefit and DREAM refinement templates as optional
