@@ -530,6 +530,9 @@ class DreamTab(QWidget):
         self.parallel_checkbox = QCheckBox("Run chains in parallel")
         self.adapt_checkbox = QCheckBox("Adapt crossover")
         self.restart_checkbox = QCheckBox("Restart previous run")
+        self.export_plot_data_checkbox = QCheckBox(
+            "Export plot data after run"
+        )
         self.verbose_checkbox.setToolTip(
             "Print DREAM sampler progress and status updates into the run output."
         )
@@ -549,6 +552,11 @@ class DreamTab(QWidget):
         self.restart_checkbox.setToolTip(
             "Continue from a previous DREAM run instead of starting a fresh one."
         )
+        self.export_plot_data_checkbox.setToolTip(
+            "Off by default. When enabled, SAXSShell copies DREAM model-fit "
+            "and violin plot data into exported_results/data after the run. "
+            "Large runs can create very large CSV and metadata outputs."
+        )
         layout.addWidget(self.verbose_checkbox, row, 0, 1, 2)
         layout.addWidget(self.parallel_checkbox, row, 2, 1, 2)
 
@@ -561,6 +569,9 @@ class DreamTab(QWidget):
 
         row += 1
         layout.addWidget(self.restart_checkbox, row, 2, 1, 2)
+
+        row += 1
+        layout.addWidget(self.export_plot_data_checkbox, row, 0, 1, 4)
 
         row += 1
         self.history_file_edit = QLineEdit()
@@ -1777,6 +1788,9 @@ class DreamTab(QWidget):
             self.parallel_checkbox.setChecked(settings.parallel)
             self.adapt_checkbox.setChecked(settings.adapt_crossover)
             self.restart_checkbox.setChecked(settings.restart)
+            self.export_plot_data_checkbox.setChecked(
+                bool(settings.export_plot_data)
+            )
             self._set_combo_data(
                 self.search_filter_preset_combo,
                 settings.search_filter_preset or "custom",
@@ -1904,6 +1918,7 @@ class DreamTab(QWidget):
             p_gamma_unity=float(self.p_gamma_unity_spin.value()),
             history_thin=int(self.history_thin_spin.value()),
             history_file=self.history_file_edit.text().strip() or None,
+            export_plot_data=bool(self.export_plot_data_checkbox.isChecked()),
             model_name=self.model_name_edit.text().strip() or None,
             search_filter_preset=self.selected_search_filter_preset(),
             fit_q_min=fit_q_min,

@@ -48,6 +48,7 @@ from saxshell.saxs.project_manager import (
 from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 from saxshell.saxs.ui.experimental_data_loader import (
     ExperimentalDataHeaderDialog,
@@ -985,10 +986,7 @@ def launch_experimental_data_overlay_ui(
     window = ExperimentalDataOverlayWindow(initial_paths=initial_paths)
     window.show()
     window.raise_()
-    _OPEN_WINDOWS.append(window)
-    window.destroyed.connect(
-        lambda _obj=None, win=window: _forget_open_window(win)
-    )
+    track_saxshell_window(window, _OPEN_WINDOWS)
     return window
 
 

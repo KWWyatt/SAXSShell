@@ -527,7 +527,7 @@ def test_representativefinder_workflow_generates_optional_predicted_output(
     assert result.solvent_completed_predicted_candidate is None
     assert result.solvent_completed_predicted_output_path is None
     assert any(
-        "Cluster Dynamics ML geometry scaffold" in note
+        "Cluster Dynamics geometry scaffold" in note
         for note in result.predicted_generation_notes
     )
     assert "Predicted optimized representative" in result.summary_text()

@@ -35,6 +35,7 @@ from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 from saxshell.structure_distributions import (
     StructureDistributionGroup,
@@ -387,10 +388,7 @@ class StructureDistributionBrowserWindow(QMainWindow):
                 default_output_dir=default_output_dir,
                 parent=self,
             )
-            window.destroyed.connect(
-                lambda _obj=None, win=window: self._remove_plot_window(win)
-            )
-            self._plot_windows.append(window)
+            track_saxshell_window(window, self._plot_windows)
         window.show()
         window.raise_()
         window.activateWindow()
@@ -420,10 +418,7 @@ def launch_structure_distribution_browser_ui(
     )
     window.show()
     window.raise_()
-    _OPEN_WINDOWS.append(window)
-    window.destroyed.connect(
-        lambda _obj=None, win=window: _forget_open_window(win)
-    )
+    track_saxshell_window(window, _OPEN_WINDOWS)
     return window
 
 
@@ -437,6 +432,7 @@ def _category_label(category: str) -> str:
     return {
         "bond": "Bond Pairs",
         "angle": "Bond Angles",
+        "dihedral": "Dihedral Angles",
         "coordination": "Coordination Numbers",
         "cutoff_pair": "Pair Distances",
     }.get(category, str(category).replace("_", " ").title())

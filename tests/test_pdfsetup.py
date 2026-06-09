@@ -8,9 +8,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QAbstractItemView, QApplication, QWidget
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QToolButton,
+    QWidget,
+)
 
 import saxshell.pdf.debyer.ui.batch_queue_window as batch_queue_module
+import saxshell.pdf.debyer.ui.main_window as main_window_module
 import saxshell.pdf.debyer.workflow as debyer_workflow
 import saxshell.pdfsetup as pdfsetup_module
 from saxshell import saxshell as saxshell_module
@@ -1004,6 +1010,104 @@ def test_debyer_worker_preview_toggle_requests_next_average(tmp_path):
     assert worker._should_emit_preview(10, 10, True) is False
 
 
+def test_debyer_worker_passes_custom_executable_to_workflow(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    custom_executable = tmp_path / "custom-debyer"
+    settings = DebyerPDFSettings(
+        project_dir=tmp_path / "project",
+        frames_dir=tmp_path / "frames",
+        filename_prefix="custom_runtime",
+    )
+    captured: dict[str, object] = {}
+    workflow_result = object()
+
+    class FakeWorkflow:
+        def __init__(
+            self,
+            settings_arg,
+            *,
+            debyer_executable=None,
+        ):
+            captured["settings"] = settings_arg
+            captured["debyer_executable"] = debyer_executable
+
+        def run(self, **_kwargs):
+            return workflow_result
+
+    monkeypatch.setattr(
+        main_window_module,
+        "DebyerPDFWorkflow",
+        FakeWorkflow,
+    )
+    worker = DebyerPDFWorker(
+        settings,
+        debyer_executable=custom_executable,
+        preview_enabled=False,
+    )
+    finished_results = []
+    worker.finished.connect(finished_results.append)
+
+    worker.run()
+
+    assert captured["settings"] is settings
+    assert captured["debyer_executable"] == custom_executable
+    assert finished_results == [workflow_result]
+
+
+def test_debyer_window_reveals_runtime_path_and_revalidates(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    detected_path = tmp_path / "path" / "debyer"
+    manual_path = tmp_path / "manual" / "debyer"
+    calls = []
+
+    def fake_check_debyer_runtime(executable=None):
+        calls.append(executable)
+        executable_path = (
+            detected_path if executable is None else Path(executable)
+        )
+        return debyer_workflow.DebyerRuntimeStatus(
+            executable_path=executable_path,
+            available=True,
+            runnable=True,
+            permission_granted=True,
+            message=f"Debyer is available at {executable_path}",
+        )
+
+    monkeypatch.setattr(
+        main_window_module,
+        "check_debyer_runtime",
+        fake_check_debyer_runtime,
+    )
+
+    window = DebyerPDFMainWindow()
+    assert calls == [None]
+    assert not window.debyer_executable_edit.isClearButtonEnabled()
+    assert window.debyer_executable_edit.text() == str(detected_path)
+    assert (
+        f"Debyer executable path: {detected_path}"
+        in window.runtime_status_label.text()
+    )
+
+    window.debyer_executable_edit.setText(str(manual_path))
+    window._refresh_runtime_status()
+
+    assert Path(calls[-1]) == manual_path
+    assert window.debyer_executable_edit.text() == str(manual_path)
+    assert (
+        f"Debyer executable path: {manual_path}"
+        in window.runtime_status_label.text()
+    )
+    window.close()
+
+
 def test_debyer_window_clamps_rejected_r_range_maximum_to_half_min_box(
     qapp,
     tmp_path,
@@ -1337,6 +1441,18 @@ def test_debyer_window_loads_saved_calculation(qapp, tmp_path, monkeypatch):
     assert average_row is not None
     assert grouped_row is not None
     assert partial_row is not None
+    assert window.trace_table.minimumHeight() >= 320
+    assert window.calculation_info_label.maximumHeight() <= 84
+    assert window.trace_table.columnWidth(5) <= 36
+    assert window.trace_table.columnWidth(6) <= 36
+    edit_button = window.trace_table.cellWidget(partial_row, 5)
+    reset_button = window.trace_table.cellWidget(partial_row, 6)
+    assert isinstance(edit_button, QToolButton)
+    assert isinstance(reset_button, QToolButton)
+    assert edit_button.text() == ""
+    assert reset_button.text() == ""
+    assert edit_button.width() <= 26
+    assert reset_button.width() <= 26
     group_colors = {
         key: window._trace_colors[key]
         for key in (

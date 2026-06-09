@@ -48,6 +48,7 @@ from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 from saxshell.toolbox.blender.common import (
     ATOM_STYLE_LABELS,
@@ -3992,7 +3993,7 @@ def launch_blender_xyz_renderer_ui(
     )
     window.show()
     window.raise_()
-    _OPEN_WINDOWS.append(window)
+    track_saxshell_window(window, _OPEN_WINDOWS)
     return window
 
 

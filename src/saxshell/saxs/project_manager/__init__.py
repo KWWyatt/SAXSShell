@@ -10,6 +10,8 @@ from .prior_plot import (
     prior_histogram_default_y_label,
 )
 from .project import (
+    PROJECT_LAYOUT_VERSION_CURRENT,
+    PROJECT_LAYOUT_VERSION_LEGACY,
     ClusterImportResult,
     DreamBestFitSelection,
     ExperimentalDataSummary,
@@ -32,6 +34,7 @@ from .project import (
     infer_experimental_columns,
     load_built_component_q_range,
     load_experimental_data_file,
+    normalize_project_layout_version,
     project_artifact_paths,
     read_experimental_column_names,
 )
@@ -48,6 +51,8 @@ __all__ = [
     "ProjectBuildResult",
     "ProjectArtifactPaths",
     "ProjectComponentEntry",
+    "PROJECT_LAYOUT_VERSION_CURRENT",
+    "PROJECT_LAYOUT_VERSION_LEGACY",
     "ProjectPaths",
     "ProjectSettings",
     "SAXSProjectManager",
@@ -59,6 +64,7 @@ __all__ = [
     "infer_experimental_columns",
     "load_built_component_q_range",
     "load_experimental_data_file",
+    "normalize_project_layout_version",
     "project_artifact_paths",
     "read_experimental_column_names",
     "build_prior_histogram_export_payload",

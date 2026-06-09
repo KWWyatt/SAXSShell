@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -54,6 +55,7 @@ DREAM_BATCH_PID_NAME = "dream_batch.pid"
 DREAM_BATCH_STATUS_NAME = "dream_batch_status.json"
 DREAM_BATCH_COMPARISON_NAME = "dream_batch_filter_comparison.txt"
 DREAM_BATCH_FIT_REPORT_PDF_NAME = "dream_batch_fit_report.pdf"
+DREAM_BATCH_PLOT_DATA_DIR_NAME = "plot_data"
 _DISTRIBUTION_PARAM_KEY_ORDER = ("loc", "scale", "s")
 _PDF_TOC_INSERT_INDEX = 1
 _PDF_TOC_ROWS_PER_PAGE = 24
@@ -201,9 +203,14 @@ class DreamBatchRunSet:
     run_set_dir: str
     label: str
     conda_env: str = DEFAULT_DREAM_BATCH_CONDA_ENV
+    export_plot_data: bool = False
+    fit_report_pdf_filename: str = ""
     created_at: str = field(default_factory=_timestamp)
     updated_at: str = field(default_factory=_timestamp)
     queue_items: list[DreamBatchQueueItem] = field(default_factory=list)
+    completed_queue_items: list[DreamBatchQueueItem] = field(
+        default_factory=list
+    )
     filter_sets: list[DreamBatchFilterSet] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
@@ -213,9 +220,14 @@ class DreamBatchRunSet:
             "run_set_dir": self.run_set_dir,
             "label": self.label,
             "conda_env": self.conda_env,
+            "export_plot_data": bool(self.export_plot_data),
+            "fit_report_pdf_filename": self.fit_report_pdf_filename,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "queue_items": [item.to_dict() for item in self.queue_items],
+            "completed_queue_items": [
+                item.to_dict() for item in self.completed_queue_items
+            ],
             "filter_sets": [
                 filter_set.to_dict() for filter_set in self.filter_sets
             ],
@@ -238,6 +250,13 @@ class DreamBatchRunSet:
                 payload.get("conda_env", DEFAULT_DREAM_BATCH_CONDA_ENV)
             ).strip()
             or DEFAULT_DREAM_BATCH_CONDA_ENV,
+            export_plot_data=_coerce_bool(
+                payload.get("export_plot_data", False)
+            ),
+            fit_report_pdf_filename=_optional_pdf_filename(
+                payload.get("fit_report_pdf_filename")
+                or payload.get("fit_report_pdf_path")
+            ),
             created_at=str(payload.get("created_at", "")).strip()
             or _timestamp(),
             updated_at=str(payload.get("updated_at", "")).strip()
@@ -245,6 +264,11 @@ class DreamBatchRunSet:
             queue_items=[
                 DreamBatchQueueItem.from_dict(dict(item))
                 for item in payload.get("queue_items", [])
+                if isinstance(item, dict)
+            ],
+            completed_queue_items=[
+                DreamBatchQueueItem.from_dict(dict(item))
+                for item in payload.get("completed_queue_items", [])
                 if isinstance(item, dict)
             ],
             filter_sets=[
@@ -292,7 +316,64 @@ class DreamBatchRunSet:
 
     @property
     def fit_report_pdf_path(self) -> Path:
-        return self.resolved_run_set_dir / DREAM_BATCH_FIT_REPORT_PDF_NAME
+        filename = (
+            _optional_pdf_filename(self.fit_report_pdf_filename)
+            or DREAM_BATCH_FIT_REPORT_PDF_NAME
+        )
+        return self.resolved_run_set_dir / filename
+
+
+def _queue_item_is_completed(item: DreamBatchQueueItem) -> bool:
+    return str(item.status or "").strip().lower() == "completed"
+
+
+def _queue_items_to_run(
+    queue_items: list[DreamBatchQueueItem],
+) -> list[DreamBatchQueueItem]:
+    return [item for item in queue_items if not _queue_item_is_completed(item)]
+
+
+def _queue_items_for_new_run_set(
+    queue_items: list[DreamBatchQueueItem],
+) -> list[DreamBatchQueueItem]:
+    cloned_items: list[DreamBatchQueueItem] = []
+    for item in _queue_items_to_run(queue_items):
+        cloned_item = DreamBatchQueueItem.from_dict(item.to_dict())
+        cloned_item.status = "queued"
+        cloned_item.started_at = None
+        cloned_item.finished_at = None
+        cloned_item.error = None
+        cloned_items.append(cloned_item)
+    return cloned_items
+
+
+def _optional_pdf_filename(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    filename = Path(text).name
+    if not filename.lower().endswith(".pdf"):
+        return ""
+    return filename
+
+
+def _timestamped_fit_report_pdf_filename(run_set: DreamBatchRunSet) -> str:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = f"{stamp}_{DREAM_BATCH_FIT_REPORT_PDF_NAME}"
+    index = 2
+    while (run_set.resolved_run_set_dir / candidate).exists():
+        candidate = f"{stamp}_{index:02d}_{DREAM_BATCH_FIT_REPORT_PDF_NAME}"
+        index += 1
+    return candidate
+
+
+def _fit_report_pdf_reference(run_set: DreamBatchRunSet) -> str:
+    if _optional_pdf_filename(run_set.fit_report_pdf_filename):
+        return str(run_set.fit_report_pdf_path)
+    return str(
+        run_set.resolved_run_set_dir
+        / f"<YYYYMMDD_HHMMSS>_{DREAM_BATCH_FIT_REPORT_PDF_NAME}"
+    )
 
 
 class DreamBatchRunSetManager:
@@ -483,6 +564,38 @@ class DreamBatchRunSetManager:
         self._discard_generated_launch_files()
         self.save_manifest()
         return removed
+
+    def clear_queue(
+        self,
+        *,
+        delete_incomplete_runtime_bundles: bool = True,
+    ) -> list[DreamBatchQueueItem]:
+        removed_items = [
+            DreamBatchQueueItem.from_dict(item.to_dict())
+            for item in self.run_set.queue_items
+        ]
+        completed_keys = {
+            (item.item_id, str(Path(item.run_dir).expanduser().resolve()))
+            for item in self.run_set.completed_queue_items
+        }
+        for item in self.run_set.queue_items:
+            if _queue_item_is_completed(item):
+                key = (
+                    item.item_id,
+                    str(Path(item.run_dir).expanduser().resolve()),
+                )
+                if key not in completed_keys:
+                    self.run_set.completed_queue_items.append(
+                        DreamBatchQueueItem.from_dict(item.to_dict())
+                    )
+                    completed_keys.add(key)
+                continue
+            if delete_incomplete_runtime_bundles:
+                self._delete_queue_item_runtime_bundle(item)
+        self.run_set.queue_items = []
+        self._discard_generated_launch_files()
+        self.save_manifest()
+        return removed_items
 
     def update_queue_item_fit_range(
         self,
@@ -735,6 +848,12 @@ class DreamBatchRunSetManager:
         return list(self.run_set.filter_sets)
 
     def _rotate_to_new_run_set_dir(self) -> None:
+        queue_items = _queue_items_for_new_run_set(self.run_set.queue_items)
+        if self.run_set.queue_items and not queue_items:
+            raise ValueError(
+                "No unfinished DREAM queue items remain. Add a new queue "
+                "item before generating another backend shell script."
+            )
         new_dir = self._new_run_set_dir(None)
         cloned_run_set = DreamBatchRunSet.from_dict(self.run_set.to_dict())
         timestamp = _timestamp()
@@ -742,6 +861,9 @@ class DreamBatchRunSetManager:
         cloned_run_set.label = new_dir.name
         cloned_run_set.created_at = timestamp
         cloned_run_set.updated_at = timestamp
+        cloned_run_set.queue_items = queue_items
+        cloned_run_set.completed_queue_items = []
+        cloned_run_set.fit_report_pdf_filename = ""
         self.run_set = cloned_run_set
 
     def generate_shell_script(
@@ -814,7 +936,13 @@ def run_dream_batch_manifest(
     try:
         completed_items: list[DreamBatchQueueItem] = []
         failed_items: list[DreamBatchQueueItem] = []
-        for index, item in enumerate(run_set.queue_items, start=1):
+        runnable_items = _queue_items_to_run(run_set.queue_items)
+        skipped_count = len(run_set.queue_items) - len(runnable_items)
+        if skipped_count and output_callback is not None:
+            output_callback(
+                f"Skipping {skipped_count} completed DREAM queue item(s)."
+            )
+        for index, item in enumerate(runnable_items, start=1):
             current_item = item
             item.status = "running"
             item.started_at = _timestamp()
@@ -822,7 +950,7 @@ def run_dream_batch_manifest(
             _save_run_set(run_set)
             if output_callback is not None:
                 output_callback(
-                    f"[{index}/{len(run_set.queue_items)}] Running {item.label}"
+                    f"[{index}/{len(runnable_items)}] Running {item.label}"
                 )
                 output_callback(f"Run directory: {item.run_dir}")
             try:
@@ -871,8 +999,33 @@ def run_dream_batch_manifest(
                 f"Posterior filter reports written: {total_reports}"
             )
 
+        plot_artifact_errors: dict[str, str] = {}
+        if run_set.export_plot_data:
+            if output_callback is not None:
+                output_callback(
+                    "DREAM batch plot data export is ON. This can create "
+                    "large CSV/JSON artifacts for every fit/filter pair."
+                )
+            try:
+                plot_artifact_errors = _write_batch_plot_data_artifacts(
+                    run_set,
+                    output_callback=output_callback,
+                )
+            except Exception as exc:
+                plot_artifact_errors["batch_plot_data"] = str(exc)
+                if output_callback is not None:
+                    output_callback(
+                        "DREAM batch plot data export failed; continuing "
+                        f"with comparison and PDF reports. {exc}"
+                    )
+        elif output_callback is not None:
+            output_callback(
+                "DREAM batch plot data export is off. Comparison and PDF "
+                "fit reports will still be generated."
+            )
         _write_batch_comparison_report(
             run_set,
+            plot_artifact_errors=plot_artifact_errors,
             output_callback=output_callback,
         )
         _write_batch_fit_pdf_report(
@@ -970,10 +1123,17 @@ def command_text_for_run_set(run_set: DreamBatchRunSet) -> str:
     project_dir = _shell_quote(run_set.resolved_project_dir)
     run_set_dir = _shell_quote(run_set.resolved_run_set_dir)
     conda_env = _shell_quote(run_set.conda_env)
+    fit_report_reference = _shell_quote(_fit_report_pdf_reference(run_set))
+    plot_export_text = (
+        "ON - can create large CSV/JSON files"
+        if run_set.export_plot_data
+        else "off"
+    )
     return "\n".join(
         [
             "# DREAM backend run set commands",
             "# Copy one section at a time into Terminal.",
+            f"# Plot data export: {plot_export_text}",
             "",
             "# Start batch process:",
             f"cd {project_dir}",
@@ -1017,8 +1177,8 @@ def command_text_for_run_set(run_set: DreamBatchRunSet) -> str:
             "# Comparison report:",
             f"printf '%s\\n' {_shell_quote(run_set.comparison_report_path)}",
             "",
-            "# Fit report PDF:",
-            f"printf '%s\\n' {_shell_quote(run_set.fit_report_pdf_path)}",
+            "# PDF fit report:",
+            f"printf '%s\\n' {fit_report_reference}",
             "",
         ]
     )
@@ -1032,6 +1192,12 @@ def shell_script_text_for_run_set(run_set: DreamBatchRunSet) -> str:
     run_set_dir = _shell_quote(run_set.resolved_run_set_dir)
     project_dir = _shell_quote(run_set.resolved_project_dir)
     conda_env = _shell_quote(run_set.conda_env)
+    fit_report_reference = _fit_report_pdf_reference(run_set)
+    plot_export_text = (
+        "ON - can create large CSV/JSON files"
+        if run_set.export_plot_data
+        else "off"
+    )
     return "\n".join(
         [
             "#!/usr/bin/env bash",
@@ -1052,7 +1218,8 @@ def shell_script_text_for_run_set(run_set: DreamBatchRunSet) -> str:
             'echo "Started DREAM backend run set with PID $BATCH_PID"',
             f'echo "Progress log: {run_set.log_path}"',
             f'echo "Comparison report: {run_set.comparison_report_path}"',
-            f'echo "Fit report PDF: {run_set.fit_report_pdf_path}"',
+            f'echo "PDF fit report: {fit_report_reference}"',
+            f'echo "Plot data export: {plot_export_text}"',
             "",
         ]
     )
@@ -1093,9 +1260,442 @@ def _write_filter_reports(
     return reports
 
 
+def _write_batch_plot_data_artifacts(
+    run_set: DreamBatchRunSet,
+    *,
+    output_callback=_print_line,
+) -> dict[str, str]:
+    artifact_dir = (
+        run_set.resolved_run_set_dir / DREAM_BATCH_PLOT_DATA_DIR_NAME
+    )
+    artifact_errors: dict[str, str] = {}
+    completed_export_count = 0
+    explicit_filter_sets = list(run_set.filter_sets)
+    for fit_index, item in enumerate(run_set.queue_items, start=1):
+        item_filter_sets = _filter_sets_for_item(item, explicit_filter_sets)
+        for filter_index, filter_set in enumerate(
+            item_filter_sets,
+            start=1,
+        ):
+            report_index = _fit_filter_report_index(
+                fit_index,
+                filter_index,
+            )
+            if item.status != "completed":
+                continue
+            paths = _batch_plot_artifact_paths(run_set, report_index)
+            _remove_stale_plot_artifacts(paths)
+            errors: list[str] = []
+            try:
+                loader = SAXSDreamResultsLoader(item.run_dir)
+                summary_kwargs = _summary_filter_kwargs(filter_set.settings)
+                summary = loader.get_summary(**summary_kwargs)
+            except Exception as exc:
+                artifact_errors[report_index] = str(exc)
+                if output_callback is not None:
+                    output_callback(
+                        "Skipped plot data export for "
+                        f"{item.label} / {filter_set.label}: {exc}"
+                    )
+                continue
+
+            try:
+                model_data = loader.build_model_fit_data(**summary_kwargs)
+                _write_model_fit_data_csv(
+                    paths["fit_data_path"],
+                    model_data,
+                )
+                _write_json_file(
+                    paths["fit_metrics_path"],
+                    _model_fit_metrics_payload(
+                        item,
+                        filter_set,
+                        summary,
+                        model_data,
+                        report_index=report_index,
+                    ),
+                )
+            except Exception as exc:
+                errors.append(f"fit data export failed: {exc}")
+
+            try:
+                violin_data = loader.build_violin_data(
+                    **_violin_filter_kwargs(filter_set.settings)
+                )
+                _write_violin_data_csv(
+                    paths["violin_data_path"],
+                    violin_data,
+                )
+                _write_json_file(
+                    paths["violin_metrics_path"],
+                    _violin_metrics_payload(
+                        item,
+                        filter_set,
+                        summary,
+                        violin_data,
+                        report_index=report_index,
+                    ),
+                )
+            except Exception as exc:
+                errors.append(f"violin data export failed: {exc}")
+
+            if errors:
+                artifact_errors[report_index] = "; ".join(errors)
+                if output_callback is not None:
+                    output_callback(
+                        "Plot data export warning for "
+                        f"{item.label} / {filter_set.label}: "
+                        f"{artifact_errors[report_index]}"
+                    )
+            else:
+                completed_export_count += 1
+
+    if completed_export_count and output_callback is not None:
+        output_callback(
+            "DREAM batch plot data and metrics: "
+            f"{artifact_dir} ({completed_export_count} fit/filter set(s))"
+        )
+    return artifact_errors
+
+
+def _batch_plot_artifact_paths(
+    run_set: DreamBatchRunSet,
+    report_index: str,
+) -> dict[str, Path]:
+    artifact_dir = (
+        run_set.resolved_run_set_dir / DREAM_BATCH_PLOT_DATA_DIR_NAME
+    )
+    file_index = _sanitize_name(str(report_index).replace(".", "_"))
+    prefix = artifact_dir / f"report_{file_index}"
+    return {
+        "fit_data_path": prefix.with_name(f"{prefix.name}_fit_data.csv"),
+        "fit_metrics_path": prefix.with_name(
+            f"{prefix.name}_fit_metrics.json"
+        ),
+        "violin_data_path": prefix.with_name(f"{prefix.name}_violin_data.csv"),
+        "violin_metrics_path": prefix.with_name(
+            f"{prefix.name}_violin_metrics.json"
+        ),
+    }
+
+
+def _remove_stale_plot_artifacts(paths: dict[str, Path]) -> None:
+    for path in paths.values():
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+
+
+def _write_json_file(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_model_fit_data_csv(
+    output_path: Path,
+    model_data: object,
+) -> None:
+    q_values = np.asarray(model_data.q_values, dtype=float).reshape(-1)
+    experimental = np.asarray(
+        model_data.experimental_intensities,
+        dtype=float,
+    ).reshape(-1)
+    model = np.asarray(model_data.model_intensities, dtype=float).reshape(-1)
+    if experimental.shape != q_values.shape or model.shape != q_values.shape:
+        raise ValueError("Model fit arrays do not share the same length.")
+    solvent = _optional_series_for_fit_csv(
+        getattr(model_data, "solvent_contribution", None),
+        q_values.shape,
+    )
+    structure_factor = _optional_series_for_fit_csv(
+        getattr(model_data, "structure_factor_trace", None),
+        q_values.shape,
+    )
+    active_fit_region = _optional_series_for_fit_csv(
+        getattr(model_data, "active_fit_mask", None),
+        q_values.shape,
+        fill_value=1.0,
+        dtype=float,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savetxt(
+        output_path,
+        np.column_stack(
+            [
+                q_values,
+                experimental,
+                model,
+                model - experimental,
+                solvent,
+                structure_factor,
+                active_fit_region,
+            ]
+        ),
+        delimiter=",",
+        header=(
+            "q,experimental_intensity,model_intensity,residual,"
+            "solvent_contribution,structure_factor,active_fit_region"
+        ),
+        comments="",
+    )
+
+
+def _optional_series_for_fit_csv(
+    value: object,
+    shape: tuple[int, ...],
+    *,
+    fill_value: float = np.nan,
+    dtype: object = float,
+) -> np.ndarray:
+    if value is None:
+        return np.full(shape, fill_value, dtype=float)
+    array = np.asarray(value, dtype=dtype).reshape(-1)
+    if array.shape != shape:
+        return np.full(shape, fill_value, dtype=float)
+    return np.asarray(array, dtype=float)
+
+
+def _write_violin_data_csv(
+    output_path: Path,
+    violin_data: object,
+) -> None:
+    samples = np.asarray(violin_data.samples, dtype=float)
+    if samples.ndim == 1:
+        samples = samples.reshape(-1, 1)
+    display_names = [
+        str(name) for name in getattr(violin_data, "display_names", [])
+    ]
+    if len(display_names) != samples.shape[1]:
+        display_names = [
+            str(name) for name in getattr(violin_data, "parameter_names", [])
+        ]
+    if len(display_names) != samples.shape[1]:
+        display_names = [
+            f"parameter_{index + 1}" for index in range(samples.shape[1])
+        ]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(display_names)
+        writer.writerows(samples.tolist())
+
+
+def _model_fit_metrics_payload(
+    item: DreamBatchQueueItem,
+    filter_set: DreamBatchFilterSet,
+    summary: object,
+    model_data: object,
+    *,
+    report_index: str,
+) -> dict[str, object]:
+    q_values = np.asarray(model_data.q_values, dtype=float).reshape(-1)
+    active_fit_mask = getattr(model_data, "active_fit_mask", None)
+    fit_q_bounds = dream_fit_q_bounds(q_values, active_fit_mask)
+    output_q_bounds = dream_output_q_bounds(q_values)
+    fit_point_count = None
+    if active_fit_mask is not None:
+        mask = np.asarray(active_fit_mask, dtype=bool).reshape(-1)
+        if mask.shape == q_values.shape:
+            fit_point_count = int(np.count_nonzero(mask))
+    return {
+        "report_index": report_index,
+        "queue_item": item.label,
+        "filter_set": filter_set.label,
+        "run_dir": item.run_dir,
+        "generated_at": _timestamp(),
+        "bestfit_method": str(model_data.bestfit_method),
+        "posterior_filter": str(summary.posterior_filter_mode),
+        "posterior_candidate_sample_count": int(
+            summary.posterior_candidate_sample_count
+        ),
+        "posterior_sample_count": int(summary.posterior_sample_count),
+        "map_chain": int(summary.map_chain),
+        "map_step": int(summary.map_step),
+        "point_count": int(q_values.size),
+        "fit_point_count": fit_point_count,
+        "fit_q_range": _q_bounds_payload(fit_q_bounds),
+        "output_q_range": _q_bounds_payload(output_q_bounds),
+        "includes_solvent_contribution": bool(
+            getattr(model_data, "solvent_contribution", None) is not None
+        ),
+        "includes_structure_factor": bool(
+            getattr(model_data, "structure_factor_trace", None) is not None
+        ),
+        "fit_metrics": {
+            "rmse": _json_float(model_data.rmse),
+            "mean_abs_residual": _json_float(model_data.mean_abs_residual),
+            "r_squared": _json_float(model_data.r_squared),
+        },
+        "fitted_stoichiometry": (
+            getattr(model_data, "fitted_stoichiometry_text", None) or ""
+        ),
+        "selected_parameters": _fit_parameter_payloads(model_data),
+    }
+
+
+def _violin_metrics_payload(
+    item: DreamBatchQueueItem,
+    filter_set: DreamBatchFilterSet,
+    summary: object,
+    violin_data: object,
+    *,
+    report_index: str,
+) -> dict[str, object]:
+    samples = np.asarray(violin_data.samples, dtype=float)
+    if samples.ndim == 1:
+        samples = samples.reshape(-1, 1)
+    parameter_names = [
+        str(name) for name in getattr(violin_data, "parameter_names", [])
+    ]
+    display_names = [
+        str(name) for name in getattr(violin_data, "display_names", [])
+    ]
+    return {
+        "report_index": report_index,
+        "queue_item": item.label,
+        "filter_set": filter_set.label,
+        "run_dir": item.run_dir,
+        "generated_at": _timestamp(),
+        "posterior_filter": str(summary.posterior_filter_mode),
+        "posterior_candidate_sample_count": int(
+            summary.posterior_candidate_sample_count
+        ),
+        "posterior_sample_count": int(summary.posterior_sample_count),
+        "credible_interval_low": _json_float(summary.credible_interval_low),
+        "credible_interval_high": _json_float(summary.credible_interval_high),
+        "violin_plot": {
+            "mode": str(violin_data.mode),
+            "sample_source": str(violin_data.sample_source),
+            "weight_order": str(violin_data.weight_order),
+            "sample_count": int(violin_data.sample_count),
+            "parameter_count": int(samples.shape[1]),
+            "sample_matrix_shape": list(samples.shape),
+            "parameter_names": parameter_names,
+            "display_names": display_names,
+        },
+        "parameter_metrics": _violin_parameter_metrics(
+            samples,
+            parameter_names,
+            display_names,
+            summary,
+        ),
+    }
+
+
+def _q_bounds_payload(bounds: tuple[float, float] | None) -> dict[str, object]:
+    return {
+        "min": None if bounds is None else _json_float(bounds[0]),
+        "max": None if bounds is None else _json_float(bounds[1]),
+        "label": format_dream_q_bounds(bounds),
+    }
+
+
+def _fit_parameter_payloads(model_data: object) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    for parameter in getattr(model_data, "fit_parameters", []):
+        payloads.append(
+            {
+                "name": str(getattr(parameter, "name", "")),
+                "value": _json_float(getattr(parameter, "value", None)),
+                "varied": bool(getattr(parameter, "varied", False)),
+                "structure": str(getattr(parameter, "structure", "")),
+                "motif": str(getattr(parameter, "motif", "")),
+                "param_type": str(getattr(parameter, "param_type", "")),
+            }
+        )
+    return payloads
+
+
+def _violin_parameter_metrics(
+    samples: np.ndarray,
+    parameter_names: list[str],
+    display_names: list[str],
+    summary: object,
+) -> list[dict[str, object]]:
+    summary_lookup = _summary_parameter_lookup(summary)
+    metrics: list[dict[str, object]] = []
+    for index in range(samples.shape[1]):
+        parameter_name = (
+            parameter_names[index]
+            if index < len(parameter_names)
+            else f"parameter_{index + 1}"
+        )
+        display_name = (
+            display_names[index]
+            if index < len(display_names)
+            else parameter_name
+        )
+        values = np.asarray(samples[:, index], dtype=float)
+        finite_values = values[np.isfinite(values)]
+        summary_values = summary_lookup.get(parameter_name, {})
+        metrics.append(
+            {
+                "parameter": parameter_name,
+                "display_name": display_name,
+                "selected_value": summary_values.get("selected_value"),
+                "credible_interval_low_value": summary_values.get(
+                    "credible_interval_low_value"
+                ),
+                "credible_interval_high_value": summary_values.get(
+                    "credible_interval_high_value"
+                ),
+                "finite_sample_count": int(finite_values.size),
+                "mean": _array_stat(finite_values, np.mean),
+                "median": _array_stat(finite_values, np.median),
+                "std": _array_stat(finite_values, np.std),
+                "min": _array_stat(finite_values, np.min),
+                "max": _array_stat(finite_values, np.max),
+            }
+        )
+    return metrics
+
+
+def _summary_parameter_lookup(
+    summary: object,
+) -> dict[str, dict[str, float | None]]:
+    full_names = [str(name) for name in summary.full_parameter_names]
+    lookup: dict[str, dict[str, float | None]] = {}
+    for index, name in enumerate(full_names):
+        lookup[name] = {
+            "selected_value": _json_float(summary.bestfit_params[index]),
+            "credible_interval_low_value": _json_float(
+                summary.interval_low_values[index]
+            ),
+            "credible_interval_high_value": _json_float(
+                summary.interval_high_values[index]
+            ),
+        }
+    return lookup
+
+
+def _array_stat(values: np.ndarray, func: object) -> float | None:
+    if values.size == 0:
+        return None
+    return _json_float(func(values))
+
+
+def _json_float(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return number
+
+
+def _existing_plot_artifact_path_text(path: Path) -> str:
+    return str(path) if path.is_file() else ""
+
+
 def _write_batch_comparison_report(
     run_set: DreamBatchRunSet,
     *,
+    plot_artifact_errors: dict[str, str] | None = None,
     output_callback=_print_line,
 ) -> Path:
     report_path = run_set.comparison_report_path
@@ -1104,6 +1704,14 @@ def _write_batch_comparison_report(
         f"Run set: {run_set.label}",
         f"Run set folder: {run_set.run_set_dir}",
         f"Project folder: {run_set.project_dir}",
+        (
+            "Plot data export: "
+            f"{'on' if run_set.export_plot_data else 'off'}"
+        ),
+        (
+            "Plot data and metrics folder: "
+            f"{run_set.resolved_run_set_dir / DREAM_BATCH_PLOT_DATA_DIR_NAME}"
+        ),
         f"Generated: {_timestamp()}",
         f"Queued DREAM runs: {len(run_set.queue_items)}",
         (
@@ -1197,6 +1805,12 @@ def _write_batch_comparison_report(
                 fit_index,
                 filter_index,
             )
+            artifact_paths = {}
+            if run_set.export_plot_data:
+                artifact_paths = _batch_plot_artifact_paths(
+                    run_set,
+                    report_index,
+                )
             row = {
                 "report_index": report_index,
                 "fit_index": str(fit_index),
@@ -1217,6 +1831,37 @@ def _write_batch_comparison_report(
                 "map_step": "",
                 "stoichiometry": "",
                 "error": item.error or "",
+                "fit_data_path": (
+                    _existing_plot_artifact_path_text(
+                        artifact_paths["fit_data_path"]
+                    )
+                    if artifact_paths
+                    else ""
+                ),
+                "fit_metrics_path": (
+                    _existing_plot_artifact_path_text(
+                        artifact_paths["fit_metrics_path"]
+                    )
+                    if artifact_paths
+                    else ""
+                ),
+                "violin_data_path": (
+                    _existing_plot_artifact_path_text(
+                        artifact_paths["violin_data_path"]
+                    )
+                    if artifact_paths
+                    else ""
+                ),
+                "violin_metrics_path": (
+                    _existing_plot_artifact_path_text(
+                        artifact_paths["violin_metrics_path"]
+                    )
+                    if artifact_paths
+                    else ""
+                ),
+                "plot_artifacts_error": (
+                    (plot_artifact_errors or {}).get(report_index, "")
+                ),
             }
             if item.status != "completed":
                 matrix_rows.append(row)
@@ -1323,11 +1968,34 @@ def _write_batch_comparison_report(
         "status",
         "error",
         "run_dir",
+        "fit_data_path",
+        "fit_metrics_path",
+        "violin_data_path",
+        "violin_metrics_path",
+        "plot_artifacts_error",
     ]
     lines.extend(["", "Run/filter matrix:", "\t".join(matrix_headers)])
     for row in matrix_rows:
         lines.append(
             "\t".join(row.get(header, "") for header in matrix_headers)
+        )
+
+    artifact_headers = [
+        "report_index",
+        "fit_index",
+        "filter_subindex",
+        "queue_item",
+        "filter_set",
+        "fit_data_path",
+        "fit_metrics_path",
+        "violin_data_path",
+        "violin_metrics_path",
+        "plot_artifacts_error",
+    ]
+    lines.extend(["", "Plot data and metrics:", "\t".join(artifact_headers)])
+    for row in matrix_rows:
+        lines.append(
+            "\t".join(row.get(header, "") for header in artifact_headers)
         )
 
     if parameter_rows:
@@ -1399,6 +2067,9 @@ def _write_batch_fit_pdf_report(
     *,
     output_callback=_print_line,
 ) -> Path:
+    run_set.fit_report_pdf_filename = _timestamped_fit_report_pdf_filename(
+        run_set
+    )
     report_path = run_set.fit_report_pdf_path
     report_path.parent.mkdir(parents=True, exist_ok=True)
     explicit_filter_sets = list(run_set.filter_sets)
@@ -1488,7 +2159,8 @@ def _write_batch_fit_pdf_report(
             pdf.savefig(figure)
 
     if output_callback is not None:
-        output_callback(f"DREAM batch fit PDF report: {report_path}")
+        output_callback(f"DREAM batch PDF fit report: {report_path}")
+    _save_run_set(run_set)
     return report_path
 
 
@@ -2929,6 +3601,14 @@ def _optional_text(value: object) -> str | None:
     return text or None
 
 
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _sanitize_name(value: object) -> str:
     text = str(value or "").strip()
     text = re.sub(r"[^\w.\-]+", "_", text)
@@ -2955,6 +3635,7 @@ __all__ = [
     "DREAM_BATCH_LOG_NAME",
     "DREAM_BATCH_MANIFEST_NAME",
     "DREAM_BATCH_PID_NAME",
+    "DREAM_BATCH_PLOT_DATA_DIR_NAME",
     "DREAM_BATCH_SCRIPT_NAME",
     "DREAM_BATCH_STATUS_NAME",
     "DreamBatchFilterSet",

@@ -51,6 +51,7 @@ from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 from saxshell.saxs.ui.project_status_label import CompactProjectStatusLabel
 
@@ -1458,8 +1459,7 @@ def launch_debye_waller_analysis_ui(
     )
     window.show()
     window.raise_()
-    _OPEN_WINDOWS.append(window)
-    window.destroyed.connect(lambda _obj=None: _release_window(window))
+    track_saxshell_window(window, _OPEN_WINDOWS)
     return window
 
 

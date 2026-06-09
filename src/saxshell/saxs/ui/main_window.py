@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,6 +22,7 @@ from PySide6.QtCore import (
     QEvent,
     QEventLoop,
     QObject,
+    QPoint,
     QRect,
     QSettings,
     QSize,
@@ -60,17 +62,28 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
+    QMenuBar,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
+    QStyle,
+    QTabBar,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from shiboken6 import isValid as _is_valid_qt_object
+except Exception:  # pragma: no cover - PySide runtime normally provides this.
+    _is_valid_qt_object = None
 
 from saxshell.fullrmc.packmol_docker import (
     PackmolDockerLink,
@@ -231,12 +244,49 @@ POWERPOINT_COLOR_MAP_OPTIONS = (
 )
 
 
+def _qt_object_is_live(obj: object) -> bool:
+    try:
+        if isinstance(obj, QObject):
+            if _is_valid_qt_object is None:
+                return True
+            return bool(_is_valid_qt_object(obj))
+    except (RuntimeError, TypeError):
+        return False
+    return True
+
+
+def _is_live_widget(obj: object) -> bool:
+    try:
+        return isinstance(obj, QWidget) and _qt_object_is_live(obj)
+    except RuntimeError:
+        return False
+
+
+def _is_live_main_window(obj: object) -> bool:
+    try:
+        return isinstance(obj, QMainWindow) and _qt_object_is_live(obj)
+    except RuntimeError:
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeBundleOpener:
     label: str
     stored_value: str
     launch_target: str
     launch_mode: str
+
+
+@dataclass(slots=True)
+class HostedToolTabRecord:
+    label: str
+    single_instance_key: str | None = None
+    project_dir: Path | None = None
+    distribution_id: str | None = None
+    detached_window: DetachedToolWindow | None = None
+    hosted_menu_bar: QMenuBar | None = None
+    hosted_menu_actions: tuple[QAction, ...] | None = None
+    closing: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +338,280 @@ WINDOW_LAYOUT_PRESETS = (
 WINDOW_LAYOUT_PRESET_MAP = {
     preset.key: preset for preset in WINDOW_LAYOUT_PRESETS
 }
+
+
+class DetachableMainTabBar(QTabBar):
+    detach_tab_requested = Signal(int, QPoint)
+    tab_order_repair_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._protected_tab_count = 0
+        self._allow_protected_tab_moves = False
+        self._tab_order_repair_pending = False
+        self._drag_start_pos: QPoint | None = None
+        self._drag_start_index = -1
+        self.setMovable(True)
+
+    def set_protected_tab_count(self, count: int) -> None:
+        self._protected_tab_count = max(0, int(count))
+
+    def _is_protected_index(self, index: int) -> bool:
+        return 0 <= index < self._protected_tab_count
+
+    def set_protected_tab_moves_allowed(self, allowed: bool) -> None:
+        self._allow_protected_tab_moves = bool(allowed)
+
+    def _queue_tab_order_repair(self) -> None:
+        if self._tab_order_repair_pending:
+            return
+        self._tab_order_repair_pending = True
+        QTimer.singleShot(0, self._emit_tab_order_repair_requested)
+
+    def _emit_tab_order_repair_requested(self) -> None:
+        self._tab_order_repair_pending = False
+        self.tab_order_repair_requested.emit()
+
+    def moveTab(self, from_index: int, to_index: int) -> None:
+        if not 0 <= from_index < self.count():
+            return
+        if not self._allow_protected_tab_moves and self._is_protected_index(
+            from_index
+        ):
+            return
+        target_index = max(
+            0,
+            min(to_index, max(0, self.count() - 1)),
+        )
+        if not self._allow_protected_tab_moves:
+            target_index = max(self._protected_tab_count, target_index)
+        super().moveTab(from_index, target_index)
+        self._queue_tab_order_repair()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.pos()
+            self._drag_start_index = self.tabAt(event.pos())
+            if self._is_protected_index(self._drag_start_index):
+                self.setCurrentIndex(self._drag_start_index)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._drag_start_pos is not None
+            and self._is_protected_index(self._drag_start_index)
+        ):
+            event.accept()
+            return
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._drag_start_pos is not None
+            and self._drag_start_index >= self._protected_tab_count
+            and (event.pos() - self._drag_start_pos).manhattanLength()
+            >= QApplication.startDragDistance()
+            and not self.rect()
+            .adjusted(-16, -28, 16, 28)
+            .contains(event.pos())
+        ):
+            self.detach_tab_requested.emit(
+                self._drag_start_index,
+                self.mapToGlobal(event.pos()),
+            )
+            self._drag_start_pos = None
+            self._drag_start_index = -1
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._queue_tab_order_repair()
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_start_pos = None
+        self._drag_start_index = -1
+        super().mouseReleaseEvent(event)
+        self._queue_tab_order_repair()
+
+
+class DetachedToolDragHandle(QLabel):
+    reattach_requested = Signal(QPoint)
+
+    def __init__(self, label: str, parent: QWidget | None = None) -> None:
+        super().__init__(label, parent)
+        self._drag_start_pos: QPoint | None = None
+        self._drag_start_global_pos: QPoint | None = None
+        self._drag_last_global_pos: QPoint | None = None
+        self._dragging_window = False
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Drag this tab header back to the SAXSShell tab bar.")
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.setStyleSheet(
+            "QLabel {"
+            "background: #e8f2f3;"
+            "border-bottom: 1px solid #b7cbcf;"
+            "color: #0f4c5c;"
+            "font-weight: 600;"
+            "padding: 6px 10px;"
+            "}"
+        )
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.pos()
+            self._drag_start_global_pos = self._event_global_pos(event)
+            self._drag_last_global_pos = self._drag_start_global_pos
+            self._dragging_window = False
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            self._drag_start_pos is None
+            or self._drag_start_global_pos is None
+            or self._drag_last_global_pos is None
+        ):
+            super().mouseMoveEvent(event)
+            return
+        if not event.buttons() & Qt.MouseButton.LeftButton:
+            super().mouseMoveEvent(event)
+            return
+        global_pos = self._event_global_pos(event)
+        if (
+            not self._dragging_window
+            and (global_pos - self._drag_start_global_pos).manhattanLength()
+            < QApplication.startDragDistance()
+        ):
+            event.accept()
+            return
+        self._dragging_window = True
+        drag_window = self.window()
+        if isinstance(drag_window, QWidget):
+            delta = global_pos - self._drag_last_global_pos
+            drag_window.move(drag_window.pos() + delta)
+        self._drag_last_global_pos = global_pos
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if (
+            self._drag_start_pos is not None
+            and self._drag_start_global_pos is not None
+        ):
+            global_pos = self._event_global_pos(event)
+            self._drag_start_pos = None
+            self._drag_start_global_pos = None
+            self._drag_last_global_pos = None
+            self._dragging_window = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.reattach_requested.emit(global_pos)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    @staticmethod
+    def _event_global_pos(event) -> QPoint:
+        global_position = getattr(event, "globalPosition", None)
+        if callable(global_position):
+            return global_position().toPoint()
+        return event.globalPos()
+
+
+class DetachedToolWindow(QMainWindow):
+    reattach_requested = Signal(QWidget, QPoint)
+    dock_requested = Signal(QWidget)
+
+    def __init__(
+        self,
+        content: QWidget,
+        label: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._content: QWidget | None = content
+        self._reattaching = False
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setWindowTitle(label)
+        container = QWidget(self)
+        self._content_layout = QVBoxLayout(container)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(0)
+
+        self._header = QWidget(container)
+        self._header.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        header_layout = QHBoxLayout(self._header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(0)
+
+        self._dock_button = QToolButton(self._header)
+        self._dock_button.setAutoRaise(True)
+        self._dock_button.setFixedSize(28, 28)
+        self._dock_button.setIconSize(QSize(14, 14))
+        self._dock_button.setIcon(
+            self.style().standardIcon(
+                QStyle.StandardPixmap.SP_TitleBarNormalButton
+            )
+        )
+        self._dock_button.setToolTip("Return this window to a SAXSShell tab.")
+        self._dock_button.clicked.connect(self._on_dock_button_clicked)
+        header_layout.addWidget(self._dock_button)
+
+        self._drag_handle = DetachedToolDragHandle(label, self._header)
+        self._drag_handle.reattach_requested.connect(
+            self._on_reattach_requested
+        )
+        header_layout.addWidget(self._drag_handle, stretch=1)
+        self._content_layout.addWidget(self._header)
+        content.setParent(container)
+        content.setWindowFlags(Qt.WindowType.Widget)
+        self._content_layout.addWidget(content, stretch=1)
+        self.setCentralWidget(container)
+        content.show()
+        self.resize(max(820, content.width()), max(620, content.height()))
+
+    def take_content_for_reattach(self) -> QWidget | None:
+        self._reattaching = True
+        content = self._content
+        if content is not None:
+            self._content_layout.removeWidget(content)
+            content.setParent(None)
+            self._content = None
+        self.hide()
+        return content
+
+    def closeEvent(self, event) -> None:
+        if self._reattaching:
+            event.accept()
+            return
+        content = self._content
+        if content is not None:
+            try:
+                if content.close() is False:
+                    event.ignore()
+                    return
+            except RuntimeError:
+                pass
+        super().closeEvent(event)
+
+    @Slot(QPoint)
+    def _on_reattach_requested(self, global_pos: QPoint) -> None:
+        content = self._content
+        if content is not None:
+            self.reattach_requested.emit(content, global_pos)
+
+    @Slot()
+    def _on_dock_button_clicked(self) -> None:
+        content = self._content
+        if content is not None:
+            self.dock_requested.emit(content)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1171,6 +1495,9 @@ class SAXSMainWindow(QMainWindow):
         self._scale_shortcuts: list[QShortcut] = []
         self._child_tool_windows: list[object] = []
         self._single_instance_child_tool_windows: dict[str, object] = {}
+        self._hosted_tool_tab_records: dict[object, HostedToolTabRecord] = {}
+        self._hosted_tool_proxy_menu_actions: tuple[QAction, ...] = ()
+        self._normalizing_tab_order = False
         self._contrast_mode_tool_window: object | None = None
         self._solute_volume_fraction_tool_window: (
             SoluteVolumeFractionToolWindow | None
@@ -1240,10 +1567,108 @@ class SAXSMainWindow(QMainWindow):
         app.installEventFilter(self)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if self._should_refresh_native_menu_for_event(event):
+            self._queue_native_menu_restore()
         if self._should_suppress_value_wheel_event(watched, event):
             event.ignore()
             return True
         return super().eventFilter(watched, event)
+
+    def _should_refresh_native_menu_for_event(self, event: QEvent) -> bool:
+        if sys.platform != "darwin" or not hasattr(self, "tabs"):
+            return False
+        return event.type() in {
+            QEvent.Type.ApplicationActivate,
+            QEvent.Type.WindowActivate,
+            QEvent.Type.ActivationChange,
+        }
+
+    def _queue_native_menu_restore(self) -> None:
+        if sys.platform != "darwin" or not hasattr(self, "tabs"):
+            return
+        if not getattr(self, "_hosted_tool_tab_records", None):
+            return
+        for delay_ms in (0, 50, 150, 300, 600):
+            QTimer.singleShot(
+                delay_ms,
+                lambda: self._sync_active_tab_menu_bar(
+                    force_native_rebind=True
+                ),
+            )
+
+    def _force_saxshell_native_menu_restore(self) -> None:
+        if sys.platform != "darwin" or not hasattr(self, "tabs"):
+            return
+        try:
+            self.menuBar().setNativeMenuBar(False)
+            self._build_menu_bar()
+            self._refresh_recent_projects_menu()
+            self._update_file_menu_state()
+        except RuntimeError:
+            return
+        shell_actions = getattr(self, "_saxshell_menu_bar_actions", ())
+        self._set_shell_native_menu_actions(
+            shell_actions,
+            source="saxshell",
+            force_native_rebind=True,
+        )
+        self._deactivate_hosted_tool_menu_bars()
+
+    def _discard_hosted_tool_menu_bar_for_close(
+        self,
+        window: object,
+        record: HostedToolTabRecord,
+    ) -> None:
+        if not _is_live_main_window(window):
+            return
+        menu_bar = record.hosted_menu_bar
+        record.closing = True
+        record.hosted_menu_bar = None
+        record.hosted_menu_actions = None
+        try:
+            if menu_bar is not None and _qt_object_is_live(menu_bar):
+                menu_bar.setNativeMenuBar(False)
+                menu_bar.clear()
+                menu_bar.setVisible(False)
+            replacement_menu_bar = QMenuBar(window)
+            replacement_menu_bar.setNativeMenuBar(False)
+            replacement_menu_bar.setVisible(False)
+            replacement_menu_bar.setProperty(
+                "saxshell_native_menu_source",
+                "closing",
+            )
+            window.setMenuBar(replacement_menu_bar)
+        except RuntimeError:
+            return
+
+    def _deactivate_hosted_tool_menu_bars(self) -> None:
+        if not hasattr(self, "tabs"):
+            return
+        for widget, record in list(self._hosted_tool_tab_records.items()):
+            if record.closing:
+                continue
+            if record.detached_window is not None:
+                continue
+            if not _is_live_widget(widget):
+                continue
+            try:
+                if self.tabs.indexOf(widget) < 0:
+                    continue
+            except RuntimeError:
+                continue
+            menu_bar = self._remember_hosted_tool_menu_bar(widget, record)
+            if menu_bar is None:
+                continue
+            self._deactivate_hosted_tool_menu_bar(menu_bar)
+
+    def _queue_saxshell_native_menu_restore(self) -> None:
+        if sys.platform != "darwin" or not hasattr(self, "tabs"):
+            return
+        for delay_ms in (0, 50, 150, 300, 600):
+            QTimer.singleShot(
+                delay_ms,
+                self._force_saxshell_native_menu_restore,
+            )
 
     def _should_suppress_value_wheel_event(
         self,
@@ -1298,6 +1723,17 @@ class SAXSMainWindow(QMainWindow):
 
         self._build_menu_bar()
         self.tabs = QTabWidget()
+        self.main_tab_bar = DetachableMainTabBar(self.tabs)
+        self.main_tab_bar.set_protected_tab_count(3)
+        self.main_tab_bar.detach_tab_requested.connect(
+            self._detach_hosted_tool_tab
+        )
+        self.main_tab_bar.tabMoved.connect(self._on_main_tab_moved)
+        self.main_tab_bar.tab_order_repair_requested.connect(
+            self._restore_main_tab_order
+        )
+        self.tabs.setTabBar(self.main_tab_bar)
+        self.tabs.setTabsClosable(True)
         self.tabs.setCornerWidget(
             build_saxshell_brand_widget(self.tabs),
             Qt.Corner.TopLeftCorner,
@@ -1323,8 +1759,16 @@ class SAXSMainWindow(QMainWindow):
         self.tabs.addTab(self.prefit_tab, "SAXS Prefit")
         self.tabs.addTab(self.dream_tab, "SAXS DREAM Fit")
         self.tabs.currentChanged.connect(self._on_main_tab_changed)
+        self.tabs.tabCloseRequested.connect(self._on_main_tab_close_requested)
+        self._base_tab_widgets = (
+            self.project_setup_tab,
+            self.prefit_tab,
+            self.dream_tab,
+        )
+        self._refresh_base_tab_close_buttons()
         self.setCentralWidget(self.tabs)
         self.statusBar().showMessage("Ready")
+        self._sync_active_tab_menu_bar()
 
         self.project_setup_tab.create_project_requested.connect(
             self.create_project_from_tab
@@ -1631,9 +2075,6 @@ class SAXSMainWindow(QMainWindow):
             self._open_debye_waller_analysis_tool
         )
 
-        self.cluster_dynamics_menu = self.tools_menu.addMenu(
-            "Cluster Dynamics"
-        )
         self.clusterdynamics_action = QAction(
             "Open Cluster Dynamics (only)",
             self,
@@ -1643,13 +2084,13 @@ class SAXSMainWindow(QMainWindow):
         )
 
         self.clusterdynamicsml_action = QAction(
-            "Open Cluster Dynamics (ML)",
+            "Open Cluster Dynamics",
             self,
         )
         self.clusterdynamicsml_action.triggered.connect(
             self._open_clusterdynamicsml_tool
         )
-        self.cluster_dynamics_menu.addAction(self.clusterdynamicsml_action)
+        self.structure_analysis_menu.addAction(self.clusterdynamicsml_action)
 
         self.pdf_menu = self.tools_menu.addMenu("PDF")
         self.pdfsetup_action = QAction("Open PDF Calculation", self)
@@ -1743,7 +2184,6 @@ class SAXSMainWindow(QMainWindow):
             self._open_uvvis_fitting_tool
         )
         self.spectroscopy_menu.addAction(self.uvvis_fitting_action)
-
         self.visualization_menu = self.tools_menu.addMenu("Visualization")
         self.structure_viewer_action = QAction(
             "Structure Viewer",
@@ -1810,6 +2250,16 @@ class SAXSMainWindow(QMainWindow):
         self.component_calculation_preview_menu.addAction(
             self.fft_born_approximation_action
         )
+        self.direct_frame_saxs_action = QAction(
+            "Open Direct Frame SAXS (Beta)",
+            self,
+        )
+        self.direct_frame_saxs_action.triggered.connect(
+            self._open_direct_frame_saxs_tool
+        )
+        self.component_calculation_preview_menu.addAction(
+            self.direct_frame_saxs_action
+        )
 
         self.representative_finder_action = QAction(
             "Open Representative Structures",
@@ -1821,6 +2271,15 @@ class SAXSMainWindow(QMainWindow):
         self.structure_analysis_menu.addAction(
             self.representative_finder_action
         )
+
+        self.exafs_gds_mapping_action = QAction(
+            "Open EXAFS GDS Mapping",
+            self,
+        )
+        self.exafs_gds_mapping_action.triggered.connect(
+            self._open_exafs_gds_mapping_tool
+        )
+        self.structure_analysis_menu.addAction(self.exafs_gds_mapping_action)
 
         self.xray_toolkit_menu = self.tools_menu.addMenu("X-ray Toolkit")
         self.estimation_menu = self.xray_toolkit_menu
@@ -1860,7 +2319,8 @@ class SAXSMainWindow(QMainWindow):
             self._open_fluorescence_tool
         )
         self.xray_toolkit_menu.addAction(self.fluorescence_estimate_action)
-        self.cli_setup_menu = self.tools_menu.addMenu("CLI Setup")
+        self.beta_menu = self.tools_menu.addMenu("(beta)")
+        self.cli_setup_menu = self.beta_menu.addMenu("CLI Setup")
         self.xyz2pdb_cli_setup_action = QAction(
             "Open XYZ -> PDB CLI Setup (Beta)",
             self,
@@ -1886,7 +2346,7 @@ class SAXSMainWindow(QMainWindow):
         )
         self.cli_setup_menu.addAction(self.clusterdynamics_cli_setup_action)
         self.clusterdynamicsml_cli_setup_action = QAction(
-            "Open Cluster Dynamics ML CLI Setup (Beta)",
+            "Open Cluster Dynamics Prediction CLI Setup (Beta)",
             self,
         )
         self.clusterdynamicsml_cli_setup_action.triggered.connect(
@@ -1901,7 +2361,6 @@ class SAXSMainWindow(QMainWindow):
             self._open_representative_cli_setup_tool
         )
         self.cli_setup_menu.addAction(self.representative_cli_setup_action)
-        self.beta_menu = self.tools_menu.addMenu("(beta)")
         self.beta_menu.addAction(self.clusterdynamics_action)
         self.beta_menu.addAction(self.debye_waller_analysis_action)
         self.solvent_shell_builder_action = QAction(
@@ -1988,6 +2447,10 @@ class SAXSMainWindow(QMainWindow):
         self.contact_action = QAction("Contact Developer", self)
         self.contact_action.triggered.connect(self._show_contact_information)
         self.help_menu.addAction(self.contact_action)
+        self._saxshell_menu_bar_actions = tuple(menu_bar.actions())
+        menu_bar.setProperty("saxshell_native_menu_source", "saxshell")
+        menu_bar.setNativeMenuBar(False)
+        menu_bar.setVisible(True)
 
     def _resolve_base_font_point_size(self) -> float:
         font = self.font()
@@ -2649,6 +3112,12 @@ class SAXSMainWindow(QMainWindow):
             "Loading project settings...",
         )
         settings = manager.load_project(project_dir)
+        cluster_inventory_warning = (
+            self._refresh_missing_cluster_inventory_for_project_load(
+                manager,
+                settings,
+            )
+        )
         progress_callback(
             2,
             PROJECT_LOAD_PREP_STEPS,
@@ -2670,12 +3139,41 @@ class SAXSMainWindow(QMainWindow):
             "Checking registered project paths...",
         )
         warnings = tuple(manager.registered_folder_warnings(settings))
+        if cluster_inventory_warning is not None:
+            warnings = (*warnings, cluster_inventory_warning)
         return ProjectLoadPayload(
             settings=settings,
             warnings=warnings,
             prefit=prefit_payload,
             dream=dream_payload,
         )
+
+    def _refresh_missing_cluster_inventory_for_project_load(
+        self,
+        manager: SAXSProjectManager,
+        settings: ProjectSettings,
+    ) -> str | None:
+        clusters_dir = settings.resolved_clusters_dir
+        if clusters_dir is None or not clusters_dir.is_dir():
+            return None
+        needs_available_elements = not settings.available_elements
+        needs_cluster_rows = not settings.cluster_inventory_rows
+        if not needs_available_elements and not needs_cluster_rows:
+            return None
+
+        try:
+            cluster_result = manager.scan_cluster_inventory(clusters_dir)
+        except Exception as exc:
+            return (
+                "Registered clusters folder could not be scanned during "
+                f"project load: {exc}"
+            )
+
+        if needs_available_elements:
+            settings.available_elements = cluster_result.available_elements
+        if needs_cluster_rows:
+            settings.cluster_inventory_rows = cluster_result.cluster_rows
+        return None
 
     def _build_project_load_prefit_payload(
         self,
@@ -2791,17 +3289,6 @@ class SAXSMainWindow(QMainWindow):
             settings=dream_settings,
             parameter_map_entries=parameter_map_entries,
         )
-
-        if (
-            settings is not None
-            and settings.resolved_clusters_dir is not None
-            and settings.resolved_clusters_dir.is_dir()
-        ):
-            self.project_setup_tab.append_summary(
-                "Refreshing cluster inventory from "
-                f"{settings.resolved_clusters_dir}"
-            )
-            self.project_setup_tab.request_cluster_scan()
 
     def scan_clusters_from_tab(self) -> None:
         clusters_dir = self.project_setup_tab.clusters_dir()
@@ -3979,6 +4466,50 @@ class SAXSMainWindow(QMainWindow):
         dialog = self._ensure_progress_dialog()
         dialog.begin(total, message, unit_label=unit_label, title=title)
 
+    def _begin_child_tool_startup_progress(
+        self,
+        total_steps: int,
+        message: str,
+        *,
+        title: str,
+        log_message: str | None = None,
+    ) -> tuple[Callable[[int, int, str], None], Callable[[str], None]]:
+        self._show_progress_dialog(
+            total_steps,
+            message,
+            unit_label="steps",
+            title=title,
+        )
+        if log_message and self._progress_dialog is not None:
+            self._progress_dialog.append_output(log_message)
+        self.statusBar().showMessage(message)
+        QApplication.processEvents()
+
+        def on_startup_progress(
+            processed: int,
+            total: int,
+            progress_message: str,
+        ) -> None:
+            if self._progress_dialog is not None:
+                self._progress_dialog.update_progress(
+                    processed,
+                    total,
+                    progress_message,
+                    unit_label="steps",
+                )
+            self.statusBar().showMessage(progress_message)
+            QApplication.processEvents()
+
+        def on_startup_log(startup_message: str) -> None:
+            stripped = str(startup_message).strip()
+            if not stripped:
+                return
+            if self._progress_dialog is not None:
+                self._progress_dialog.append_output(stripped)
+            QApplication.processEvents()
+
+        return on_startup_progress, on_startup_log
+
     def _begin_project_load_progress(
         self,
         total_steps: int,
@@ -4091,6 +4622,7 @@ class SAXSMainWindow(QMainWindow):
                 settings,
                 progress_callback=advance_step,
             )
+            self._refresh_contextual_child_tool_tabs()
             self.project_setup_tab.finish_activity_progress(finished_message)
         except Exception:
             self.project_setup_tab.finish_activity_progress("Progress: failed")
@@ -4271,18 +4803,26 @@ class SAXSMainWindow(QMainWindow):
         self._refresh_loaded_dream_results()
         auto_export_paths: list[Path] = []
         auto_export_error: str | None = None
-        try:
-            auto_export_paths = self._auto_export_dream_condensed_outputs(
-                settings
-            )
-        except Exception as exc:  # pragma: no cover - defensive UI logging
-            auto_export_error = str(exc)
+        if settings.export_plot_data:
+            try:
+                auto_export_paths = self._auto_export_dream_condensed_outputs(
+                    settings
+                )
+            except Exception as exc:  # pragma: no cover - defensive UI logging
+                auto_export_error = str(exc)
         result_payload = dict(result) if isinstance(result, dict) else {}
+        sampled_params_path = result_payload.get(
+            "sampled_params_path",
+            "unknown",
+        )
+        log_ps_path = result_payload.get("log_ps_path", "unknown")
         self.dream_tab.append_log(
             "DREAM run complete.\n"
             f"Run directory: {run_dir}\n"
-            f"Samples: {result_payload.get('sampled_params_path', 'unknown')}\n"
-            f"Log-posteriors: {result_payload.get('log_ps_path', 'unknown')}"
+            f"Samples: {sampled_params_path}\n"
+            f"Log-posteriors: {log_ps_path}\n"
+            "Plot data export: "
+            f"{'ON' if settings.export_plot_data else 'off'}"
         )
         if assessment_message:
             self.dream_tab.append_log(assessment_message)
@@ -6672,6 +7212,15 @@ class SAXSMainWindow(QMainWindow):
                     "Runtime Bundle not generated. Click Write Runtime Bundle before running DREAM.",
                 )
                 return
+            if settings.export_plot_data:
+                if not self._confirm_dream_plot_data_export():
+                    self.dream_tab.append_log(
+                        "Run DREAM cancelled.\n"
+                        "Plot data export was enabled, but the confirmation "
+                        "prompt was declined."
+                    )
+                    self.statusBar().showMessage("DREAM run cancelled")
+                    return
             self._append_dream_vary_recommendation(entries)
             bundle = self._last_written_dream_bundle
             self.dream_tab.append_log(
@@ -6684,11 +7233,29 @@ class SAXSMainWindow(QMainWindow):
                 "Posterior filter: "
                 f"{self._describe_posterior_filter(settings)}\n"
                 f"Violin data mode: {settings.violin_parameter_mode}\n"
-                f"Violin sample source: {settings.violin_sample_source}"
+                f"Violin sample source: {settings.violin_sample_source}\n"
+                "Plot data export: "
+                f"{'ON' if settings.export_plot_data else 'off'}"
             )
             self._start_dream_run_task(bundle, settings)
         except Exception as exc:
             self._show_error("Run DREAM failed", str(exc))
+
+    def _confirm_dream_plot_data_export(self) -> bool:
+        response = QMessageBox.question(
+            self,
+            "Confirm DREAM Plot Data Export",
+            (
+                "Plot data export is enabled for this DREAM run.\n\n"
+                "SAXSShell will copy model-fit CSV files, violin sample "
+                "CSV files, and metadata sidecars into exported_results/data "
+                "after the run. Large runs can create GB of data.\n\n"
+                "Continue with plot data export enabled?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return response == QMessageBox.StandardButton.Yes
 
     @staticmethod
     def _validate_dream_stoichiometry_filter_settings(
@@ -9588,6 +10155,7 @@ class SAXSMainWindow(QMainWindow):
                 )
         self._refresh_model_only_mode_state()
         self._update_file_menu_state()
+        self._refresh_contextual_child_tool_tabs()
 
     def _apply_loaded_prefit_payload(
         self,
@@ -10883,7 +11451,11 @@ class SAXSMainWindow(QMainWindow):
                     run_set = load_dream_batch_manifest(manifest_path)
                 except Exception:
                     continue
-                for item in run_set.queue_items:
+                completed_batch_items = [
+                    *run_set.queue_items,
+                    *run_set.completed_queue_items,
+                ]
+                for item in completed_batch_items:
                     if item.status != "completed":
                         continue
                     run_dir = Path(item.run_dir).expanduser().resolve()
@@ -10918,11 +11490,509 @@ class SAXSMainWindow(QMainWindow):
             return
         self._refresh_saved_dream_runs(records=records)
 
+    def _refresh_base_tab_close_buttons(self) -> None:
+        base_tab_widgets = getattr(self, "_base_tab_widgets", ())
+        for index in range(self.tabs.count()):
+            widget = self.tabs.widget(index)
+            if widget is None:
+                continue
+            label = self._canonical_main_tab_label(widget)
+            if label and self.tabs.tabText(index) != label:
+                self.tabs.setTabText(index, label)
+                self.tabs.setTabToolTip(
+                    index,
+                    label if widget not in base_tab_widgets else "",
+                )
+            self.tabs.tabBar().setTabButton(
+                index,
+                QTabBar.ButtonPosition.LeftSide,
+                None,
+            )
+            self.tabs.tabBar().setTabButton(
+                index,
+                QTabBar.ButtonPosition.RightSide,
+                None,
+            )
+            if widget in base_tab_widgets:
+                continue
+            self._install_hosted_tab_close_button(index, widget)
+
+    def _canonical_main_tab_label(self, widget: object) -> str | None:
+        base_tab_widgets = getattr(self, "_base_tab_widgets", ())
+        base_labels = (
+            "Project Setup",
+            "SAXS Prefit",
+            "SAXS DREAM Fit",
+        )
+        for base_widget, label in zip(base_tab_widgets, base_labels):
+            if widget is base_widget:
+                return label
+        record = self._hosted_tool_record_for_window(widget)
+        if record is not None:
+            return record.label
+        return None
+
+    def _install_hosted_tab_close_button(
+        self,
+        index: int,
+        widget: QWidget,
+    ) -> None:
+        button = QToolButton(self.tabs.tabBar())
+        button.setAutoRaise(True)
+        button.setCursor(Qt.CursorShape.ArrowCursor)
+        button.setFixedSize(18, 18)
+        button.setIconSize(QSize(12, 12))
+        button.setIcon(
+            self.style().standardIcon(
+                QStyle.StandardPixmap.SP_TitleBarCloseButton
+            )
+        )
+        label = self.tabs.tabText(index) or "tab"
+        button.setToolTip(f"Close {label}")
+        button.clicked.connect(
+            lambda _checked=False, child=widget: (
+                self._close_tracked_child_tool_window(child)
+            )
+        )
+        self.tabs.tabBar().setTabButton(
+            index,
+            QTabBar.ButtonPosition.RightSide,
+            button,
+        )
+
+    def _sync_active_tab_menu_bar(
+        self,
+        *,
+        force_native_rebind: bool = False,
+    ) -> None:
+        if sys.platform != "darwin" or not hasattr(self, "tabs"):
+            return
+        hosted_menu_bars: list[
+            tuple[QWidget, HostedToolTabRecord, QMenuBar]
+        ] = []
+        for widget, record in list(self._hosted_tool_tab_records.items()):
+            if record.closing:
+                continue
+            if not _qt_object_is_live(widget):
+                self._forget_child_tool_window(widget)
+                continue
+            if record.detached_window is not None:
+                continue
+            if not _is_live_widget(widget):
+                continue
+            try:
+                if self.tabs.indexOf(widget) < 0:
+                    continue
+            except RuntimeError:
+                self._forget_child_tool_window(widget)
+                continue
+            menu_bar = self._remember_hosted_tool_menu_bar(widget, record)
+            if menu_bar is not None:
+                self._deactivate_hosted_tool_menu_bar(menu_bar)
+                hosted_menu_bars.append((widget, record, menu_bar))
+        shell_actions = getattr(self, "_saxshell_menu_bar_actions", ())
+        current_widget = self.tabs.currentWidget()
+        for widget, record, _menu_bar in hosted_menu_bars:
+            original_actions = record.hosted_menu_actions or ()
+            if widget is current_widget and original_actions:
+                self._set_shell_proxy_menu_actions(
+                    original_actions,
+                    source=f"hosted:{record.label}",
+                    force_native_rebind=force_native_rebind,
+                )
+                return
+        self._set_shell_native_menu_actions(
+            shell_actions,
+            source="saxshell",
+            force_native_rebind=force_native_rebind,
+        )
+
+    @staticmethod
+    def _hosted_tool_menu_bar(widget: object) -> QMenuBar | None:
+        if not _is_live_main_window(widget):
+            return None
+        try:
+            return widget.menuBar()
+        except RuntimeError:
+            return None
+
+    def _set_shell_native_menu_actions(
+        self,
+        actions: tuple[QAction, ...],
+        *,
+        source: str,
+        force_native_rebind: bool = False,
+    ) -> None:
+        if not actions:
+            return
+        menu_bar = self.menuBar()
+        self._hosted_tool_proxy_menu_actions = ()
+        self._set_menu_bar_actions(
+            menu_bar,
+            actions,
+            source=source,
+            native=False,
+            visible=True,
+            force_native_rebind=force_native_rebind,
+        )
+
+    def _set_shell_proxy_menu_actions(
+        self,
+        actions: tuple[QAction, ...],
+        *,
+        source: str,
+        force_native_rebind: bool = False,
+    ) -> None:
+        if not actions:
+            self._force_saxshell_native_menu_restore()
+            return
+        menu_bar = self.menuBar()
+        try:
+            menu_bar.setNativeMenuBar(False)
+            for action in tuple(menu_bar.actions()):
+                menu_bar.removeAction(action)
+            proxy_actions: list[QAction] = []
+            for action in actions:
+                proxy_action = self._clone_menu_bar_action(action)
+                if proxy_action is None:
+                    continue
+                menu_bar.addAction(proxy_action)
+                proxy_actions.append(proxy_action)
+            if not proxy_actions:
+                self._force_saxshell_native_menu_restore()
+                return
+            self._hosted_tool_proxy_menu_actions = tuple(proxy_actions)
+            menu_bar.setProperty("saxshell_native_menu_source", source)
+            menu_bar.setNativeMenuBar(False)
+            menu_bar.setVisible(True)
+        except RuntimeError:
+            return
+
+    def _clone_menu_bar_action(self, action: QAction) -> QAction | None:
+        try:
+            original_menu = action.menu()
+        except RuntimeError:
+            return None
+        if original_menu is not None:
+            proxy_menu = self._clone_menu(original_menu, action.text())
+            proxy_action = proxy_menu.menuAction()
+            proxy_action.setEnabled(action.isEnabled())
+            proxy_action.setVisible(action.isVisible())
+            return proxy_action
+        return self._clone_leaf_action(action, self)
+
+    def _clone_menu(
+        self, original_menu: QMenu, title: str | None = None
+    ) -> QMenu:
+        proxy_menu = QMenu(title or original_menu.title(), self)
+        proxy_menu.setEnabled(original_menu.isEnabled())
+        proxy_menu.setIcon(original_menu.icon())
+        for action in original_menu.actions():
+            if action.isSeparator():
+                proxy_menu.addSeparator()
+                continue
+            child_menu = action.menu()
+            if child_menu is not None:
+                proxy_menu.addMenu(self._clone_menu(child_menu, action.text()))
+                continue
+            proxy_action = self._clone_leaf_action(action, proxy_menu)
+            if proxy_action is not None:
+                proxy_menu.addAction(proxy_action)
+        return proxy_menu
+
+    def _clone_leaf_action(
+        self,
+        action: QAction,
+        parent: QObject,
+    ) -> QAction | None:
+        try:
+            proxy_action = QAction(action.icon(), action.text(), parent)
+            proxy_action.setEnabled(action.isEnabled())
+            proxy_action.setVisible(action.isVisible())
+            proxy_action.setCheckable(action.isCheckable())
+            proxy_action.setChecked(action.isChecked())
+            proxy_action.setShortcut(action.shortcut())
+            proxy_action.setToolTip(action.toolTip())
+            proxy_action.setStatusTip(action.statusTip())
+            proxy_action.setWhatsThis(action.whatsThis())
+            proxy_action.setData(action.data())
+            proxy_action.triggered.connect(
+                lambda _checked=False, original=action: (
+                    self._trigger_proxy_menu_action(original)
+                )
+            )
+        except RuntimeError:
+            return None
+        return proxy_action
+
+    @staticmethod
+    def _trigger_proxy_menu_action(action: QAction) -> None:
+        try:
+            action.trigger()
+        except RuntimeError:
+            return
+
+    def _remember_hosted_tool_menu_bar(
+        self,
+        widget: QWidget,
+        record: HostedToolTabRecord,
+    ) -> QMenuBar | None:
+        menu_bar = self._hosted_tool_menu_bar(widget)
+        if menu_bar is None:
+            return None
+        try:
+            current_actions = tuple(menu_bar.actions())
+            if record.hosted_menu_bar is not menu_bar:
+                if record.hosted_menu_bar is not None:
+                    self._restore_hosted_tool_menu_bar(record)
+                record.hosted_menu_bar = menu_bar
+            if record.hosted_menu_actions != current_actions:
+                record.hosted_menu_actions = current_actions
+        except RuntimeError:
+            return None
+        return menu_bar
+
+    @staticmethod
+    def _set_menu_bar_actions(
+        menu_bar: QMenuBar,
+        actions: tuple[QAction, ...],
+        *,
+        source: str,
+        native: bool,
+        visible: bool,
+        force_native_rebind: bool = False,
+    ) -> bool:
+        try:
+            current_actions = tuple(menu_bar.actions())
+            current_source = menu_bar.property("saxshell_native_menu_source")
+            if (
+                force_native_rebind
+                or current_actions != actions
+                or current_source != source
+            ):
+                menu_bar.setNativeMenuBar(False)
+            if current_actions != actions:
+                for action in current_actions:
+                    menu_bar.removeAction(action)
+                for action in actions:
+                    menu_bar.addAction(action)
+            menu_bar.setProperty("saxshell_native_menu_source", source)
+            menu_bar.setNativeMenuBar(native)
+            menu_bar.setVisible(visible)
+        except RuntimeError:
+            return False
+        return True
+
+    def _restore_hosted_tool_menu_bar(
+        self,
+        record: HostedToolTabRecord,
+        *,
+        visible: bool = True,
+    ) -> None:
+        menu_bar = record.hosted_menu_bar
+        original_actions = record.hosted_menu_actions
+        record.hosted_menu_bar = None
+        record.hosted_menu_actions = None
+        if menu_bar is None or not _qt_object_is_live(menu_bar):
+            return
+        if original_actions is None:
+            original_actions = ()
+        self._set_menu_bar_actions(
+            menu_bar,
+            original_actions,
+            source="restored",
+            native=False,
+            visible=visible,
+        )
+
+    @staticmethod
+    def _deactivate_hosted_tool_menu_bar(menu_bar: QMenuBar) -> None:
+        try:
+            menu_bar.setProperty("saxshell_native_menu_source", "hosted")
+            menu_bar.setNativeMenuBar(False)
+            menu_bar.setVisible(False)
+        except RuntimeError:
+            return
+
+    @staticmethod
+    def _release_detached_tool_menu_bar(menu_bar: QMenuBar) -> None:
+        try:
+            menu_bar.setProperty("saxshell_native_menu_source", "detached")
+            menu_bar.setNativeMenuBar(False)
+            menu_bar.setVisible(True)
+        except RuntimeError:
+            return
+
+    def _on_main_tab_close_requested(self, index: int) -> None:
+        widget = self.tabs.widget(index)
+        if widget is None:
+            return
+        if widget in getattr(self, "_base_tab_widgets", ()):
+            return
+        self._close_tracked_child_tool_window(widget)
+
+    def _on_main_tab_moved(self, _from_index: int, _to_index: int) -> None:
+        self._restore_main_tab_order()
+
+    def _restore_main_tab_order(self) -> None:
+        if self._normalizing_tab_order:
+            return
+        self._normalizing_tab_order = True
+        active_widget = self.tabs.currentWidget()
+        try:
+            for expected_index, widget in enumerate(self._base_tab_widgets):
+                if not _is_live_widget(widget):
+                    continue
+                current_index = self.tabs.indexOf(widget)
+                if current_index >= 0 and current_index != expected_index:
+                    icon = self.tabs.tabIcon(current_index)
+                    label = self._canonical_main_tab_label(
+                        widget
+                    ) or self.tabs.tabText(current_index)
+                    tooltip = self.tabs.tabToolTip(current_index)
+                    enabled = self.tabs.isTabEnabled(current_index)
+                    self.tabs.removeTab(current_index)
+                    inserted_index = self.tabs.insertTab(
+                        expected_index,
+                        widget,
+                        icon,
+                        label,
+                    )
+                    self.tabs.setTabToolTip(inserted_index, tooltip)
+                    self.tabs.setTabEnabled(inserted_index, enabled)
+        finally:
+            self._normalizing_tab_order = False
+        self._refresh_base_tab_close_buttons()
+        if _is_live_widget(active_widget):
+            active_index = self.tabs.indexOf(active_widget)
+            if active_index >= 0:
+                self.tabs.setCurrentIndex(active_index)
+        self._sync_active_tab_menu_bar()
+
+    @Slot(int, QPoint)
+    def _detach_hosted_tool_tab(
+        self,
+        index: int,
+        global_pos: QPoint,
+    ) -> None:
+        if index < 0:
+            return
+        widget = self.tabs.widget(index)
+        if not _is_live_widget(widget):
+            return
+        if widget in getattr(self, "_base_tab_widgets", ()):
+            return
+        record = self._hosted_tool_record_for_window(widget)
+        if record is None:
+            return
+        label = record.label or self._child_tool_tab_label(
+            widget,
+            record.single_instance_key,
+        )
+        self._restore_hosted_tool_menu_bar(record)
+        self.tabs.removeTab(index)
+        widget.setParent(None)
+        widget.setWindowFlags(Qt.WindowType.Widget)
+        menu_bar = self._hosted_tool_menu_bar(widget)
+        if menu_bar is not None:
+            self._release_detached_tool_menu_bar(menu_bar)
+        detached = DetachedToolWindow(widget, label, self)
+        record.label = label
+        record.detached_window = detached
+        detached.reattach_requested.connect(self._reattach_detached_tool_tab)
+        detached.dock_requested.connect(self._dock_detached_tool_tab)
+        detached.move(global_pos - QPoint(80, 18))
+        detached.show()
+        detached.raise_()
+        detached.activateWindow()
+        self.statusBar().showMessage(f"Detached {label}", 3000)
+        self._refresh_base_tab_close_buttons()
+        self._sync_active_tab_menu_bar()
+
+    @Slot(QWidget, QPoint)
+    def _reattach_detached_tool_tab(
+        self,
+        widget: QWidget,
+        global_pos: QPoint,
+    ) -> None:
+        if not _is_live_widget(widget):
+            self._forget_child_tool_window(widget)
+            return
+        record = self._hosted_tool_record_for_window(widget)
+        if record is None or record.detached_window is None:
+            return
+        if not self._global_pos_hits_main_tab_bar(global_pos):
+            return
+        self._dock_detached_tool_tab(widget)
+
+    @Slot(QWidget)
+    def _dock_detached_tool_tab(self, widget: QWidget) -> None:
+        if not _is_live_widget(widget):
+            self._forget_child_tool_window(widget)
+            return
+        record = self._hosted_tool_record_for_window(widget)
+        if record is None or record.detached_window is None:
+            return
+        detached = record.detached_window
+        content = detached.take_content_for_reattach()
+        if content is not widget:
+            return
+        record.detached_window = None
+        detached.close()
+        detached.deleteLater()
+        self._add_hosted_tool_tab(widget, record.label, make_current=True)
+        self.statusBar().showMessage(f"Docked {record.label}", 3000)
+
+    def _global_pos_hits_main_tab_bar(self, global_pos: QPoint) -> bool:
+        tab_bar = self.tabs.tabBar()
+        local_pos = tab_bar.mapFromGlobal(global_pos)
+        return tab_bar.rect().adjusted(-12, -18, 12, 42).contains(local_pos)
+
+    def _add_hosted_tool_tab(
+        self,
+        widget: QWidget,
+        label: str,
+        *,
+        make_current: bool,
+    ) -> int:
+        if not _is_live_widget(widget):
+            self._forget_child_tool_window(widget)
+            return -1
+        record = self._hosted_tool_record_for_window(widget)
+        if record is not None:
+            self._remember_hosted_tool_menu_bar(widget, record)
+        existing_index = self.tabs.indexOf(widget)
+        if existing_index >= 0:
+            self.tabs.setTabText(existing_index, label)
+            self.tabs.setTabToolTip(existing_index, label)
+            if make_current:
+                self.tabs.setCurrentIndex(existing_index)
+            self._sync_active_tab_menu_bar()
+            self._queue_native_menu_restore()
+            return existing_index
+        widget.setParent(self.tabs)
+        widget.setWindowFlags(Qt.WindowType.Widget)
+        index = self.tabs.addTab(widget, label)
+        self.tabs.setTabToolTip(index, label)
+        widget.show()
+        if make_current:
+            self.tabs.setCurrentIndex(index)
+        self._refresh_base_tab_close_buttons()
+        self._on_main_tab_moved(index, index)
+        self._sync_active_tab_menu_bar()
+        self._queue_native_menu_restore()
+        return self.tabs.indexOf(widget)
+
     def _on_main_tab_changed(self, index: int) -> None:
+        widget = self.tabs.widget(index)
+        is_base_tab = widget in getattr(self, "_base_tab_widgets", ())
+        self._sync_active_tab_menu_bar(
+            force_native_rebind=is_base_tab,
+        )
+        self._queue_native_menu_restore()
         self._autoscale_pending_tab_splitter(index)
         if self.current_settings is None:
             return
-        widget = self.tabs.widget(index)
         if widget is self.dream_tab:
             self._refresh_saved_dream_runs()
 
@@ -11179,19 +12249,19 @@ class SAXSMainWindow(QMainWindow):
             if predicted_state.dataset_file is None:
                 status_text = (
                     "Predicted Structures mode is on, but no Cluster "
-                    "Dynamics ML prediction bundle was found in this project.\n"
-                    "Open Tools > Cluster Dynamics > Open Cluster Dynamics "
-                    "(ML), run a prediction, then rebuild SAXS components "
-                    "and prior weights."
+                    "Dynamics prediction bundle was found in this project.\n"
+                    "Open Tools > Structure Analysis > Open Cluster "
+                    "Dynamics, run a prediction, then rebuild SAXS "
+                    "components and prior weights."
                 )
             else:
                 status_text = (
                     "Predicted Structures mode is on, but the latest "
-                    "Cluster Dynamics ML result bundle does not contain any "
+                    "Cluster Dynamics result bundle does not contain any "
                     "predicted structures.\n"
-                    "Open Tools > Cluster Dynamics > Open Cluster Dynamics "
-                    "(ML), run a prediction, then rebuild SAXS components "
-                    "and prior weights."
+                    "Open Tools > Structure Analysis > Open Cluster "
+                    "Dynamics, run a prediction, then rebuild SAXS "
+                    "components and prior weights."
                 )
             self.project_setup_tab.set_predicted_structure_status_text(
                 status_text
@@ -12260,20 +13330,39 @@ class SAXSMainWindow(QMainWindow):
         settings: ProjectSettings,
         project_dir: Path,
     ) -> None:
-        experimental_dir = (project_dir / "experimental_data").resolve()
+        experimental_dirs = {
+            build_project_paths(
+                project_dir,
+                project_layout_version=settings.project_layout_version,
+            ).experimental_data_dir.resolve(),
+            build_project_paths(
+                project_dir,
+                project_layout_version=1,
+            ).experimental_data_dir.resolve(),
+            build_project_paths(
+                project_dir,
+                project_layout_version=2,
+            ).experimental_data_dir.resolve(),
+        }
         if (
             not settings.copied_experimental_data_file
             and settings.experimental_data_path
         ):
             experimental_path = Path(settings.experimental_data_path).resolve()
-            if experimental_dir in experimental_path.parents:
+            if any(
+                experimental_dir in experimental_path.parents
+                for experimental_dir in experimental_dirs
+            ):
                 settings.copied_experimental_data_file = str(experimental_path)
         if (
             not settings.copied_solvent_data_file
             and settings.solvent_data_path
         ):
             solvent_path = Path(settings.solvent_data_path).resolve()
-            if experimental_dir in solvent_path.parents:
+            if any(
+                experimental_dir in solvent_path.parents
+                for experimental_dir in experimental_dirs
+            ):
                 settings.copied_solvent_data_file = str(solvent_path)
 
     @staticmethod
@@ -12434,34 +13523,141 @@ class SAXSMainWindow(QMainWindow):
             return
         signal.connect(self._on_debye_waller_project_saved)
 
+    def _hosted_tool_record_for_window(
+        self,
+        window: object,
+    ) -> HostedToolTabRecord | None:
+        for existing, record in list(self._hosted_tool_tab_records.items()):
+            if existing is window:
+                return record
+        return None
+
+    def _pop_hosted_tool_record_for_window(
+        self,
+        window: object,
+    ) -> HostedToolTabRecord | None:
+        record: HostedToolTabRecord | None = None
+        for existing, existing_record in list(
+            self._hosted_tool_tab_records.items()
+        ):
+            if existing is window:
+                record = existing_record
+                del self._hosted_tool_tab_records[existing]
+                break
+        return record
+
     def _track_child_tool_window(
         self,
         window: object,
         *,
         single_instance_key: str | None = None,
+        host_in_main_tabs: bool = True,
+        update_on_project_change: bool = True,
+        update_on_distribution_change: bool = False,
     ) -> None:
-        if window in self._child_tool_windows:
+        if not _qt_object_is_live(window):
+            self._forget_child_tool_window(window)
+            return
+        first_seen = window not in self._child_tool_windows
+        if not first_seen:
             if single_instance_key is not None:
                 self._single_instance_child_tool_windows[
                     single_instance_key
                 ] = window
-            return
-        if isinstance(window, QWidget):
-            window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        destroyed_signal = getattr(window, "destroyed", None)
-        if destroyed_signal is not None and hasattr(
-            destroyed_signal, "connect"
-        ):
-            destroyed_signal.connect(
-                lambda _obj=None, win=window: self._forget_child_tool_window(
-                    win
+        else:
+            if _is_live_widget(window):
+                window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            try:
+                destroyed_signal = getattr(window, "destroyed", None)
+            except RuntimeError:
+                self._forget_child_tool_window(window)
+                return
+            if destroyed_signal is not None and hasattr(
+                destroyed_signal, "connect"
+            ):
+                owner_ref = weakref.ref(self)
+                window_ref = weakref.ref(window)
+                destroyed_signal.connect(
+                    lambda _obj=None, owner=owner_ref, child=window_ref: (
+                        owner() is not None
+                        and owner()._forget_child_tool_window_ref(child)
+                    )
                 )
-            )
-        self._child_tool_windows.append(window)
+            self._child_tool_windows.append(window)
         if single_instance_key is not None:
             self._single_instance_child_tool_windows[single_instance_key] = (
                 window
             )
+        if not _is_live_widget(window):
+            return
+        label = self._child_tool_tab_label(window, single_instance_key)
+        record = self._hosted_tool_record_for_window(window)
+        if record is None:
+            record = HostedToolTabRecord(
+                label=label,
+                single_instance_key=single_instance_key,
+                project_dir=(
+                    self._active_project_context_dir()
+                    if update_on_project_change
+                    else None
+                ),
+                distribution_id=(
+                    self._active_distribution_context_id()
+                    if update_on_distribution_change
+                    else None
+                ),
+            )
+            self._hosted_tool_tab_records[window] = record
+        else:
+            record.label = label
+            if single_instance_key is not None:
+                record.single_instance_key = single_instance_key
+        if host_in_main_tabs:
+            self._add_hosted_tool_tab(
+                window,
+                label,
+                make_current=first_seen,
+            )
+
+    def _child_tool_tab_label(
+        self,
+        window: QWidget,
+        single_instance_key: str | None,
+    ) -> str:
+        if not _is_live_widget(window):
+            return (
+                single_instance_key.replace("_", " ").title()
+                if single_instance_key
+                else type(window).__name__.replace("_", " ")
+            )
+        try:
+            title = window.windowTitle().strip()
+        except RuntimeError:
+            title = ""
+        if title:
+            return title
+        if single_instance_key:
+            return single_instance_key.replace("_", " ").title()
+        return type(window).__name__.replace("_", " ")
+
+    def _active_project_context_dir(self) -> Path | None:
+        if self.current_settings is None:
+            return None
+        return Path(self.current_settings.project_dir).expanduser().resolve()
+
+    def _active_distribution_context_id(self) -> str | None:
+        if self.current_settings is None:
+            return None
+        value = str(self.current_settings.active_distribution_id or "").strip()
+        return value or None
+
+    def _forget_child_tool_window_ref(
+        self,
+        window_ref: weakref.ReferenceType[object],
+    ) -> None:
+        window = window_ref()
+        if window is not None:
+            self._forget_child_tool_window(window)
 
     def _forget_child_tool_window(self, window: object) -> None:
         self._child_tool_windows = [
@@ -12474,6 +13670,116 @@ class SAXSMainWindow(QMainWindow):
             for key, existing in self._single_instance_child_tool_windows.items()
             if existing is not window
         }
+        record = self._pop_hosted_tool_record_for_window(window)
+        was_current_hosted = False
+        if record is not None and _is_live_widget(window):
+            try:
+                was_current_hosted = self.tabs.currentWidget() is window
+            except RuntimeError:
+                was_current_hosted = False
+        self._prepare_hosted_tool_window_for_close(window, record)
+        if record is not None:
+            self._restore_hosted_tool_menu_bar(record, visible=False)
+        if _is_live_widget(window):
+            try:
+                index = self.tabs.indexOf(window)
+            except RuntimeError:
+                index = -1
+            if index >= 0:
+                try:
+                    self.tabs.removeTab(index)
+                    self._sync_active_tab_menu_bar()
+                    if (
+                        was_current_hosted
+                        or not self._current_tab_uses_hosted_tool_menu()
+                    ):
+                        self._force_saxshell_native_menu_restore()
+                        self._queue_saxshell_native_menu_restore()
+                    else:
+                        self._queue_native_menu_restore()
+                except RuntimeError:
+                    pass
+            elif (
+                record is not None
+                and not self._current_tab_uses_hosted_tool_menu()
+            ):
+                self._force_saxshell_native_menu_restore()
+                self._queue_saxshell_native_menu_restore()
+        elif (
+            record is not None
+            and not self._current_tab_uses_hosted_tool_menu()
+        ):
+            self._force_saxshell_native_menu_restore()
+            self._queue_saxshell_native_menu_restore()
+        if record is not None and record.detached_window is not None:
+            try:
+                detached_window = record.detached_window
+                if (
+                    _qt_object_is_live(detached_window)
+                    and getattr(detached_window, "_content", None) is window
+                ):
+                    record.detached_window._content = None
+                    record.detached_window.close()
+                    record.detached_window.deleteLater()
+            except RuntimeError:
+                pass
+
+    def _current_tab_uses_hosted_tool_menu(self) -> bool:
+        if not hasattr(self, "tabs"):
+            return False
+        try:
+            current_widget = self.tabs.currentWidget()
+        except RuntimeError:
+            return False
+        record = self._hosted_tool_record_for_window(current_widget)
+        return (
+            record is not None
+            and not record.closing
+            and record.detached_window is None
+            and bool(record.hosted_menu_actions)
+        )
+
+    def _prepare_hosted_tool_window_for_close(
+        self,
+        window: object,
+        record: HostedToolTabRecord | None,
+    ) -> None:
+        if record is None or record.detached_window is not None:
+            return
+        if not _is_live_widget(window) or not hasattr(self, "tabs"):
+            return
+        try:
+            index = self.tabs.indexOf(window)
+        except RuntimeError:
+            return
+        if index < 0:
+            return
+        try:
+            was_current = self.tabs.currentWidget() is window
+            if self.tabs.currentWidget() is window:
+                for base_widget in getattr(self, "_base_tab_widgets", ()):
+                    if (
+                        _is_live_widget(base_widget)
+                        and self.tabs.indexOf(base_widget) >= 0
+                    ):
+                        self.tabs.setCurrentWidget(base_widget)
+                        break
+            self._sync_active_tab_menu_bar(force_native_rebind=True)
+            menu_bar = record.hosted_menu_bar
+            if menu_bar is not None and _qt_object_is_live(menu_bar):
+                self._deactivate_hosted_tool_menu_bar(menu_bar)
+            if was_current:
+                self.show()
+                self.raise_()
+                self.activateWindow()
+                self._force_saxshell_native_menu_restore()
+                self._discard_hosted_tool_menu_bar_for_close(window, record)
+                self._queue_saxshell_native_menu_restore()
+            else:
+                self._discard_hosted_tool_menu_bar_for_close(window, record)
+                self._queue_native_menu_restore()
+        except RuntimeError:
+            return
 
     def _focus_single_instance_child_tool_window(
         self,
@@ -12485,18 +13791,58 @@ class SAXSMainWindow(QMainWindow):
         )
         if window is None:
             return False
-        try:
-            for method_name in ("show", "raise_", "activateWindow"):
-                method = getattr(window, method_name, None)
-                if callable(method):
-                    method()
-        except RuntimeError:
+        if not self._focus_child_tool_window(window):
             self._forget_child_tool_window(window)
             return False
         self.statusBar().showMessage(
             f"{tool_label} is already open; focused the existing window.",
             5000,
         )
+        return True
+
+    def _focus_child_tool_window(self, window: object) -> bool:
+        if not _qt_object_is_live(window):
+            return False
+        record = self._hosted_tool_record_for_window(window)
+        if _is_live_widget(window):
+            try:
+                index = self.tabs.indexOf(window)
+            except RuntimeError:
+                return False
+            if index >= 0:
+                self.tabs.setCurrentIndex(index)
+                try:
+                    for method_name in ("show", "raise_", "activateWindow"):
+                        method = getattr(window, method_name, None)
+                        if callable(method):
+                            method()
+                except RuntimeError:
+                    return False
+                self.show()
+                self.raise_()
+                self.activateWindow()
+                self._sync_active_tab_menu_bar()
+                self._queue_native_menu_restore()
+                return True
+        if (
+            record is not None
+            and record.detached_window is not None
+            and _qt_object_is_live(record.detached_window)
+        ):
+            try:
+                record.detached_window.show()
+                record.detached_window.raise_()
+                record.detached_window.activateWindow()
+            except RuntimeError:
+                return False
+            return True
+        try:
+            for method_name in ("show", "raise_", "activateWindow"):
+                method = getattr(window, method_name, None)
+                if callable(method):
+                    method()
+        except RuntimeError:
+            return False
         return True
 
     def _block_conflicting_child_tool_window(
@@ -12509,12 +13855,7 @@ class SAXSMainWindow(QMainWindow):
         window = self._single_instance_child_tool_windows.get(conflict_key)
         if window is None:
             return False
-        try:
-            for method_name in ("show", "raise_", "activateWindow"):
-                method = getattr(window, method_name, None)
-                if callable(method):
-                    method()
-        except RuntimeError:
+        if not self._focus_child_tool_window(window):
             self._forget_child_tool_window(window)
             return False
         self.statusBar().showMessage(
@@ -12526,13 +13867,68 @@ class SAXSMainWindow(QMainWindow):
 
     def _close_child_tool_windows(self) -> bool:
         for window in list(self._child_tool_windows):
-            close_method = getattr(window, "close", None)
-            if not callable(close_method):
-                continue
-            result = close_method()
-            if result is False:
+            if not self._close_tracked_child_tool_window(window):
                 return False
         return True
+
+    def _close_tracked_child_tool_window(self, window: object) -> bool:
+        if not _qt_object_is_live(window):
+            self._forget_child_tool_window(window)
+            return True
+        record = self._hosted_tool_record_for_window(window)
+        if (
+            record is not None
+            and record.detached_window is not None
+            and _qt_object_is_live(record.detached_window)
+        ):
+            try:
+                result = record.detached_window.close()
+            except RuntimeError:
+                self._forget_child_tool_window(window)
+                return True
+            if result is False:
+                return False
+            self._forget_child_tool_window(window)
+            return True
+        self._prepare_hosted_tool_window_for_close(window, record)
+        try:
+            close_method = getattr(window, "close", None)
+        except RuntimeError:
+            self._forget_child_tool_window(window)
+            return True
+        if not callable(close_method):
+            self._forget_child_tool_window(window)
+            return True
+        try:
+            result = close_method()
+        except RuntimeError:
+            self._forget_child_tool_window(window)
+            return True
+        if result is False:
+            return False
+        self._forget_child_tool_window(window)
+        if _is_live_widget(window):
+            try:
+                window.deleteLater()
+            except RuntimeError:
+                pass
+        return True
+
+    def _refresh_contextual_child_tool_tabs(self) -> None:
+        active_project_dir = self._active_project_context_dir()
+        active_distribution_id = self._active_distribution_context_id()
+        for window, record in list(self._hosted_tool_tab_records.items()):
+            if (
+                record.project_dir is not None
+                and active_project_dir != record.project_dir
+            ):
+                self._close_tracked_child_tool_window(window)
+                continue
+            if (
+                record.distribution_id is not None
+                and active_distribution_id != record.distribution_id
+            ):
+                self._close_tracked_child_tool_window(window)
 
     @Slot(object)
     def _sync_project_folder_references_from_child(
@@ -12970,7 +14366,7 @@ class SAXSMainWindow(QMainWindow):
     def _open_clusterdynamicsml_cli_setup_tool(self) -> None:
         if self._focus_single_instance_child_tool_window(
             "clusterdynamicsml_cli_setup",
-            "Cluster dynamics ML CLI setup",
+            "Cluster dynamics prediction CLI setup",
         ):
             return
         from saxshell.clusterdynamicsml.ui.run_file_window import (
@@ -13002,11 +14398,12 @@ class SAXSMainWindow(QMainWindow):
         )
         if project_dir is not None:
             self.statusBar().showMessage(
-                "Opened cluster dynamics ML CLI setup for " f"{project_dir}"
+                "Opened cluster dynamics prediction CLI setup for "
+                f"{project_dir}"
             )
         else:
             self.statusBar().showMessage(
-                "Opened cluster dynamics ML CLI setup"
+                "Opened cluster dynamics prediction CLI setup"
             )
 
     def _open_bondanalysis_tool(self) -> None:
@@ -13027,6 +14424,7 @@ class SAXSMainWindow(QMainWindow):
             initial_clusters_dir=clusters_dir,
             initial_project_dir=project_dir,
         )
+        window.plot_window_opened.connect(self._track_bondanalysis_plot_window)
         window.show()
         window.raise_()
         self._track_child_tool_window(
@@ -13039,6 +14437,15 @@ class SAXSMainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage("Opened bond analysis")
+
+    def _track_bondanalysis_plot_window(self, window: object) -> None:
+        if not _qt_object_is_live(window):
+            return
+        self._track_child_tool_window(
+            window,
+            single_instance_key="bondanalysis_plots",
+            update_on_project_change=False,
+        )
 
     def _open_bondanalysis_batch_queue_tool(self) -> None:
         if self._focus_single_instance_child_tool_window(
@@ -13196,6 +14603,7 @@ class SAXSMainWindow(QMainWindow):
         ):
             return
         from saxshell.clusterdynamics.ui.main_window import (
+            CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
             ClusterDynamicsMainWindow,
         )
 
@@ -13207,11 +14615,33 @@ class SAXSMainWindow(QMainWindow):
             project_dir = Path(settings.project_dir).resolve()
             frames_dir = settings.resolved_frames_dir
             energy_file = settings.resolved_energy_file
-        window = ClusterDynamicsMainWindow(
-            initial_frames_dir=frames_dir,
-            initial_energy_file=energy_file,
-            initial_project_dir=project_dir,
+        start_message = (
+            f"Opening Cluster Dynamics (only) for {project_dir.name}..."
+            if project_dir is not None
+            else "Opening Cluster Dynamics (only)..."
         )
+        startup_progress_callback, startup_log_callback = (
+            self._begin_child_tool_startup_progress(
+                CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
+                start_message,
+                title="Opening Cluster Dynamics",
+                log_message=(
+                    f"Loading Cluster Dynamics from {project_dir}"
+                    if project_dir is not None
+                    else "Loading Cluster Dynamics."
+                ),
+            )
+        )
+        try:
+            window = ClusterDynamicsMainWindow(
+                initial_frames_dir=frames_dir,
+                initial_energy_file=energy_file,
+                initial_project_dir=project_dir,
+                startup_progress_callback=startup_progress_callback,
+                startup_log_callback=startup_log_callback,
+            )
+        finally:
+            self._close_progress_dialog()
         window.show()
         window.raise_()
         self._track_child_tool_window(
@@ -13228,10 +14658,11 @@ class SAXSMainWindow(QMainWindow):
     def _open_clusterdynamicsml_tool(self) -> None:
         if self._focus_single_instance_child_tool_window(
             "clusterdynamicsml",
-            "Cluster dynamics (ML)",
+            "Cluster dynamics",
         ):
             return
         from saxshell.clusterdynamicsml.ui.main_window import (
+            CLUSTER_DYNAMICS_ML_WINDOW_LOAD_TOTAL_STEPS,
             ClusterDynamicsMLMainWindow,
         )
 
@@ -13247,13 +14678,35 @@ class SAXSMainWindow(QMainWindow):
             clusters_dir = settings.resolved_clusters_dir
             energy_file = settings.resolved_energy_file
             experimental_data_file = settings.resolved_experimental_data_path
-        window = ClusterDynamicsMLMainWindow(
-            initial_frames_dir=frames_dir,
-            initial_energy_file=energy_file,
-            initial_project_dir=project_dir,
-            initial_clusters_dir=clusters_dir,
-            initial_experimental_data_file=experimental_data_file,
+        start_message = (
+            f"Opening Cluster Dynamics for {project_dir.name}..."
+            if project_dir is not None
+            else "Opening Cluster Dynamics..."
         )
+        startup_progress_callback, startup_log_callback = (
+            self._begin_child_tool_startup_progress(
+                CLUSTER_DYNAMICS_ML_WINDOW_LOAD_TOTAL_STEPS,
+                start_message,
+                title="Opening Cluster Dynamics",
+                log_message=(
+                    f"Loading Cluster Dynamics from {project_dir}"
+                    if project_dir is not None
+                    else "Loading Cluster Dynamics."
+                ),
+            )
+        )
+        try:
+            window = ClusterDynamicsMLMainWindow(
+                initial_frames_dir=frames_dir,
+                initial_energy_file=energy_file,
+                initial_project_dir=project_dir,
+                initial_clusters_dir=clusters_dir,
+                initial_experimental_data_file=experimental_data_file,
+                startup_progress_callback=startup_progress_callback,
+                startup_log_callback=startup_log_callback,
+            )
+        finally:
+            self._close_progress_dialog()
         window.show()
         window.raise_()
         self._track_child_tool_window(
@@ -13262,10 +14715,10 @@ class SAXSMainWindow(QMainWindow):
         )
         if project_dir is not None:
             self.statusBar().showMessage(
-                f"Opened cluster dynamics (ML) for {project_dir}"
+                f"Opened cluster dynamics for {project_dir}"
             )
         else:
-            self.statusBar().showMessage("Opened cluster dynamics (ML)")
+            self.statusBar().showMessage("Opened cluster dynamics")
 
     def _open_fullrmc_tool(self) -> None:
         if self._focus_single_instance_child_tool_window(
@@ -13374,7 +14827,10 @@ class SAXSMainWindow(QMainWindow):
         )
 
         window = launch_blender_xyz_renderer_ui()
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            update_on_distribution_change=True,
+        )
         self.statusBar().showMessage("Opened Blender XYZ renderer")
 
     def _open_structure_viewer_tool(self) -> None:
@@ -13383,7 +14839,10 @@ class SAXSMainWindow(QMainWindow):
         )
 
         window = launch_structure_viewer_ui()
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            update_on_distribution_change=True,
+        )
         self.statusBar().showMessage("Opened Structure Viewer")
 
     def _open_experimental_data_overlay_tool(self) -> None:
@@ -13392,7 +14851,10 @@ class SAXSMainWindow(QMainWindow):
         )
 
         window = launch_experimental_data_overlay_ui()
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            update_on_distribution_change=True,
+        )
         self.statusBar().showMessage("Opened experimental data overlay")
 
     def _open_uvvis_fitting_tool(self) -> None:
@@ -13527,6 +14989,44 @@ class SAXSMainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage("Opened representative structures")
+
+    def _open_exafs_gds_mapping_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "exafs_gds_mapping",
+            "EXAFS GDS Mapping",
+        ):
+            return
+        from saxshell.exafs.ui.main_window import launch_exafs_gds_mapping_ui
+
+        project_dir = None
+        absorber_element = None
+        if self.current_settings is not None:
+            project_dir = Path(self.current_settings.project_dir).resolve()
+            absorber_element = self._default_exafs_absorber_element()
+        window = launch_exafs_gds_mapping_ui(
+            initial_project_dir=project_dir,
+            initial_absorber_element=absorber_element,
+        )
+        if not isinstance(window, int):
+            self._track_child_tool_window(
+                window,
+                single_instance_key="exafs_gds_mapping",
+            )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                "Opened EXAFS GDS Mapping for " f"{project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened EXAFS GDS Mapping")
+
+    def _default_exafs_absorber_element(self) -> str | None:
+        settings = self.current_settings
+        if settings is None:
+            return None
+        for element in settings.available_elements:
+            if str(element).strip().lower() == "pb":
+                return "Pb"
+        return None
 
     def _open_representative_cli_setup_tool(self) -> None:
         if self._focus_single_instance_child_tool_window(
@@ -13975,6 +15475,58 @@ class SAXSMainWindow(QMainWindow):
                 if preview_mode
                 else "Opened 3D FFT Born Approximation"
             )
+
+    def _open_direct_frame_saxs_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "direct_frame_saxs",
+            "Direct Frame SAXS",
+        ):
+            return
+        from saxshell.saxs.ui.direct_frame_window import (
+            launch_direct_frame_saxs_ui,
+        )
+
+        settings = self._active_project_launch_settings()
+        project_dir = None
+        input_path = None
+        output_dir = None
+        q_min = None
+        q_max = None
+        if settings is not None:
+            project_dir = Path(settings.project_dir).resolve()
+            q_min = settings.q_min
+            q_max = settings.q_max
+            input_candidates = (
+                settings.resolved_frames_dir,
+                settings.resolved_pdb_frames_dir,
+                settings.resolved_clusters_dir,
+            )
+            for candidate in input_candidates:
+                if candidate is not None and candidate.exists():
+                    input_path = candidate
+                    break
+            output_dir = project_dir / "direct_frame_saxs_runs"
+        window = launch_direct_frame_saxs_ui(
+            initial_project_dir=project_dir,
+            initial_input_path=input_path,
+            initial_output_dir=output_dir,
+            initial_q_min=q_min,
+            initial_q_max=q_max,
+        )
+        self._track_child_tool_window(
+            window,
+            single_instance_key="direct_frame_saxs",
+        )
+        if input_path is not None:
+            self.statusBar().showMessage(
+                f"Opened Direct Frame SAXS for {input_path}"
+            )
+        elif project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened Direct Frame SAXS for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened Direct Frame SAXS")
 
     @Slot(object)
     def _on_contrast_components_built(self, payload: object) -> None:
@@ -14837,6 +16389,10 @@ class SAXSMainWindow(QMainWindow):
             f"Adaptive crossover: {'on' if settings.adapt_crossover else 'off'}",
             f"Restart from history: {'on' if settings.restart else 'off'}",
             f"History file: {settings.history_file or 'None'}",
+            (
+                "Plot data export: "
+                f"{'on' if settings.export_plot_data else 'off'}"
+            ),
             f"Verbose sampler output: {'on' if settings.verbose else 'off'}",
             (
                 "Verbose output interval (s): "
@@ -14994,6 +16550,10 @@ class SAXSMainWindow(QMainWindow):
             f"Violin sample source: {settings.violin_sample_source}",
             f"Weight order: {settings.violin_weight_order}",
             f"Y-axis scale: {settings.violin_value_scale_mode}",
+            (
+                "Plot data export: "
+                f"{'on' if settings.export_plot_data else 'off'}"
+            ),
             f"Violin palette: {settings.violin_palette}",
             f"Point color: {settings.violin_point_color}",
             (

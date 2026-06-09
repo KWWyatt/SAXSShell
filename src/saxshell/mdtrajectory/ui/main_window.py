@@ -26,6 +26,10 @@ from saxshell.mdtrajectory.ui.export_panel import ExportPanel
 from saxshell.mdtrajectory.ui.state import MDTrajectoryAppState
 from saxshell.mdtrajectory.ui.trajectory_panel import TrajectoryPanel
 from saxshell.mdtrajectory.workflow import suggest_output_dir
+from saxshell.project_memory import (
+    build_mdtrajectory_time_axis_settings_payload,
+    coerce_mdtrajectory_time_axis_settings,
+)
 from saxshell.saxs.project_manager import (
     ProjectSettings,
     SAXSProjectManager,
@@ -440,6 +444,85 @@ class MDTrajectoryMainWindow(QMainWindow):
             self.trajectory_panel.topology_edit.setText(str(resolved_topology))
         if resolved_energy is not None:
             self.trajectory_panel.energy_edit.setText(str(resolved_energy))
+        if settings is not None:
+            self._apply_project_time_axis_defaults(
+                settings.mdtrajectory_time_axis_settings
+            )
+
+    def _apply_project_time_axis_defaults(self, payload: object) -> None:
+        defaults = coerce_mdtrajectory_time_axis_settings(payload)
+        if not defaults:
+            return
+
+        self.trajectory_panel.start_spin.blockSignals(True)
+        self.trajectory_panel.stop_spin.blockSignals(True)
+        self.trajectory_panel.stride_spin.blockSignals(True)
+        self.trajectory_panel.auto_timestep_box.blockSignals(True)
+        try:
+            self.trajectory_panel.start_spin.setValue(
+                -1 if defaults.get("start") is None else int(defaults["start"])
+            )
+            self.trajectory_panel.stop_spin.setValue(
+                -1 if defaults.get("stop") is None else int(defaults["stop"])
+            )
+            if defaults.get("stride") is not None:
+                self.trajectory_panel.stride_spin.setValue(
+                    max(int(defaults["stride"]), 1)
+                )
+            if defaults.get("use_manual_frame_timestep") is not None:
+                self.trajectory_panel.auto_timestep_box.setChecked(
+                    not bool(defaults["use_manual_frame_timestep"])
+                )
+        finally:
+            self.trajectory_panel.start_spin.blockSignals(False)
+            self.trajectory_panel.stop_spin.blockSignals(False)
+            self.trajectory_panel.stride_spin.blockSignals(False)
+            self.trajectory_panel.auto_timestep_box.blockSignals(False)
+        if defaults.get("frame_timestep_fs") is not None:
+            self.trajectory_panel.set_frame_timestep_fs(
+                float(defaults["frame_timestep_fs"])
+            )
+
+        self.export_panel.use_cutoff_box.blockSignals(True)
+        self.export_panel.post_cutoff_stride_box.blockSignals(True)
+        self.export_panel.post_cutoff_stride_spin.blockSignals(True)
+        self.export_panel.include_restart_duplicates_box.blockSignals(True)
+        try:
+            if defaults.get("use_cutoff_for_export") is not None:
+                self.export_panel.use_cutoff_box.setChecked(
+                    bool(defaults["use_cutoff_for_export"])
+                )
+            if defaults.get("use_post_cutoff_stride") is not None:
+                self.export_panel.post_cutoff_stride_box.setChecked(
+                    bool(defaults["use_post_cutoff_stride"])
+                )
+            if defaults.get("post_cutoff_stride") is not None:
+                self.export_panel.post_cutoff_stride_spin.setValue(
+                    max(int(defaults["post_cutoff_stride"]), 1)
+                )
+            if defaults.get("include_restart_duplicates") is not None:
+                self.export_panel.include_restart_duplicates_box.setChecked(
+                    bool(defaults["include_restart_duplicates"])
+                )
+        finally:
+            self.export_panel.use_cutoff_box.blockSignals(False)
+            self.export_panel.post_cutoff_stride_box.blockSignals(False)
+            self.export_panel.post_cutoff_stride_spin.blockSignals(False)
+            self.export_panel.include_restart_duplicates_box.blockSignals(
+                False
+            )
+        self.export_panel._update_post_cutoff_stride_controls()
+
+        selected_cutoff = defaults.get("selected_cutoff_fs")
+        if selected_cutoff is not None:
+            self.cutoff_panel._set_cutoff_value(
+                float(selected_cutoff),
+                emit_signals=False,
+            )
+        suggested_cutoff = defaults.get("suggested_cutoff_fs")
+        if suggested_cutoff is not None:
+            self.cutoff_panel._suggested_cutoff_fs = float(suggested_cutoff)
+        self._sync_state_from_controls()
 
     def _register_project_file_inputs(self) -> str | None:
         settings = self._load_project_settings()
@@ -464,6 +547,10 @@ class MDTrajectoryMainWindow(QMainWindow):
                 if energy_file is None
                 else str(energy_file.expanduser().resolve())
             )
+            self._sync_state_from_controls()
+            settings.mdtrajectory_time_axis_settings = (
+                self._mdtrajectory_time_axis_payload()
+            )
             self._project_manager.save_project(settings)
         except Exception as exc:
             return (
@@ -471,6 +558,31 @@ class MDTrajectoryMainWindow(QMainWindow):
                 f"not be updated: {exc}"
             )
         return None
+
+    def _mdtrajectory_time_axis_payload(
+        self,
+        *,
+        output_dir: Path | None = None,
+        applied_cutoff_fs: float | None = None,
+    ) -> dict[str, object]:
+        return build_mdtrajectory_time_axis_settings_payload(
+            trajectory_file=self.trajectory_panel.get_trajectory_path(),
+            topology_file=self.trajectory_panel.get_topology_path(),
+            energy_file=self.trajectory_panel.get_energy_path(),
+            start=self.state.start,
+            stop=self.state.stop,
+            stride=self.state.stride,
+            frame_timestep_fs=self.state.frame_timestep_fs,
+            use_manual_frame_timestep=self.state.use_manual_frame_timestep,
+            use_cutoff_for_export=self.state.use_cutoff_for_export,
+            selected_cutoff_fs=self.state.selected_cutoff_fs,
+            suggested_cutoff_fs=self.state.suggested_cutoff_fs,
+            use_post_cutoff_stride=self.state.use_post_cutoff_stride,
+            post_cutoff_stride=self.state.post_cutoff_stride,
+            include_restart_duplicates=self.state.include_restart_duplicates,
+            output_dir=output_dir,
+            applied_cutoff_fs=applied_cutoff_fs,
+        )
 
     def inspect_trajectory(self) -> None:
         try:
@@ -521,6 +633,19 @@ class MDTrajectoryMainWindow(QMainWindow):
             self.state.use_manual_frame_timestep = current_manual_timestep
             self.state.include_restart_duplicates = (
                 self.export_panel.include_restart_duplicates()
+            )
+            self.state.use_cutoff_for_export = self.export_panel.use_cutoff()
+            self.state.use_post_cutoff_stride = (
+                self.export_panel.use_post_cutoff_stride()
+            )
+            self.state.post_cutoff_stride = (
+                self.export_panel.get_post_cutoff_stride()
+            )
+            self.state.selected_cutoff_fs = (
+                self.cutoff_panel.get_selected_cutoff()
+            )
+            self.state.suggested_cutoff_fs = (
+                self.cutoff_panel.get_suggested_cutoff()
             )
             self._update_suggested_output_dir()
             registration_message = self._register_project_file_inputs()
@@ -884,6 +1009,7 @@ class MDTrajectoryMainWindow(QMainWindow):
                 float(detected_timestep)
             )
             self.state.frame_timestep_fs = float(detected_timestep)
+            self._register_project_file_inputs()
         self.trajectory_panel.set_summary(result.summary)
         n_frames = result.summary.get("n_frames", "unknown")
         file_type = result.summary.get("file_type", "unknown")
@@ -926,6 +1052,7 @@ class MDTrajectoryMainWindow(QMainWindow):
             total=2 if self.state.energy_file is not None else 1,
         )
         self._refresh_selection_preview()
+        self._register_project_file_inputs()
         self.statusBar().showMessage(
             f"Loaded trajectory metadata for {self.state.trajectory_file}",
             5000,
@@ -1008,7 +1135,8 @@ class MDTrajectoryMainWindow(QMainWindow):
 
         self.export_panel.set_log("\n".join(lines))
         registration_message = self._register_exported_frames_folder(
-            result.output_dir
+            result.output_dir,
+            applied_cutoff_fs=result.applied_cutoff_fs,
         )
         if registration_message is not None:
             self.export_panel.append_log(registration_message)
@@ -1168,6 +1296,8 @@ class MDTrajectoryMainWindow(QMainWindow):
     def _register_exported_frames_folder(
         self,
         output_dir: Path,
+        *,
+        applied_cutoff_fs: float | None = None,
     ) -> str | None:
         if self._project_dir is None:
             return None
@@ -1180,6 +1310,13 @@ class MDTrajectoryMainWindow(QMainWindow):
         try:
             settings = self._project_manager.load_project(self._project_dir)
             settings.frames_dir = str(Path(output_dir).expanduser().resolve())
+            self._sync_state_from_controls()
+            settings.mdtrajectory_time_axis_settings = (
+                self._mdtrajectory_time_axis_payload(
+                    output_dir=output_dir,
+                    applied_cutoff_fs=applied_cutoff_fs,
+                )
+            )
             self._project_manager.save_project(settings)
             self._emit_project_paths_registered(frames_dir=output_dir)
         except Exception as exc:

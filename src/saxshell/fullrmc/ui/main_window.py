@@ -164,6 +164,7 @@ from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 from saxshell.ui.periodic_table import PeriodicTableElementDialog
 
@@ -7307,7 +7308,7 @@ def launch_rmcsetup_ui(
     configure_saxshell_application(app)
 
     window = RMCSetupMainWindow(initial_project_dir=project_dir)
-    _OPEN_WINDOWS.append(window)
+    track_saxshell_window(window, _OPEN_WINDOWS)
     window.show()
     if owns_app:
         return app.exec()

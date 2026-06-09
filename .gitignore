@@ -84,6 +84,7 @@ site/
 tests/born_vs_debye_backend_debug_*/
 tests/contrast_fft_backend_debug_*/
 tests/edm_contiguous_mode_report/
+tests/direct_frame_saxs_beta/
 tests/representativefinder_performance/output_results/
 tests/smearing_analysis_*/
 tests/CsPbI3_SAXS_fit/
@@ -91,6 +92,10 @@ tests/CsPbI3_SAXS_fit.zip
 
 # Generated reports
 docs/reports/
+
+# Generated direct-frame SAXS beta outputs
+direct_frame_saxs_runs/
+examples/direct_frame_saxs_runs/
 
 # PyBuilder
 target/

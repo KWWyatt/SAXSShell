@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from saxshell.mdtrajectory.frame.manager import DEFAULT_FRAME_TIMESTEP_FS
 from saxshell.mdtrajectory.workflow import MDTrajectoryWorkflow
+from saxshell.project_memory import coerce_mdtrajectory_time_axis_settings
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
@@ -228,11 +229,29 @@ def _queue_item_from_project_defaults(
         settings = SAXSProjectManager().load_project(resolved_project_dir)
     except Exception:
         return item
+    time_axis = coerce_mdtrajectory_time_axis_settings(
+        settings.mdtrajectory_time_axis_settings
+    )
     return replace(
         item,
         trajectory_file=settings.resolved_trajectory_file,
         topology_file=settings.resolved_topology_file,
         energy_file=settings.resolved_energy_file,
+        frame_timestep_fs=float(
+            time_axis.get("frame_timestep_fs", item.frame_timestep_fs)
+        ),
+        use_manual_frame_timestep=bool(
+            time_axis.get(
+                "use_manual_frame_timestep",
+                item.use_manual_frame_timestep,
+            )
+        ),
+        include_restart_duplicates=bool(
+            time_axis.get(
+                "include_restart_duplicates",
+                item.include_restart_duplicates,
+            )
+        ),
     )
 
 

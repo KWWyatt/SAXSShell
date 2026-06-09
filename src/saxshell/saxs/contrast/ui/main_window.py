@@ -100,6 +100,7 @@ from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 
 _OPEN_WINDOWS: list["ContrastModeMainWindow"] = []
@@ -530,7 +531,7 @@ class ContrastModeMainWindow(QMainWindow):
         advanced_header.addWidget(self.sampler_settings_toggle_button)
         self.sampler_settings_status_label = QLabel(
             "For large cluster bins, a fast geometry/count screen inspired by "
-            "Cluster Dynamics ML and bond-analysis preprocessing can limit the "
+            "Cluster Dynamics and bond-analysis preprocessing can limit the "
             "full contrast descriptor search to a seeded Monte Carlo shortlist."
         )
         self.sampler_settings_status_label.setWordWrap(True)
@@ -3734,7 +3735,7 @@ class ContrastModeMainWindow(QMainWindow):
             log_callback(
                 "Predicted Structures mode is active, so the contrast representative "
                 f"analysis will include {predicted_component_count} predicted "
-                "structure bin(s) from the current Cluster Dynamics ML bundle."
+                "structure bin(s) from the current Cluster Dynamics bundle."
             )
         if settings.resolved_clusters_dir is None:
             raise ValueError(
@@ -4581,8 +4582,5 @@ def launch_contrast_mode_ui(
     )
     window.show()
     window.raise_()
-    _OPEN_WINDOWS.append(window)
-    window.destroyed.connect(
-        lambda _obj=None, win=window: _forget_open_window(win)
-    )
+    track_saxshell_window(window, _OPEN_WINDOWS)
     return window
