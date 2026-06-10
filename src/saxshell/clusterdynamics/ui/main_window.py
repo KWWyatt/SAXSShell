@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +59,10 @@ from saxshell.clusterdynamics.report import (
     export_cluster_dynamics_report_pptx,
 )
 from saxshell.clusterdynamics.ui.plot_panel import ClusterDynamicsPlotPanel
+from saxshell.clusterdynamics.ui.project_defaults import (
+    apply_cluster_extraction_project_defaults,
+    apply_mdtrajectory_time_axis_project_defaults,
+)
 from saxshell.clusterdynamics.workflow import (
     _resolve_colormap_timestep_settings,
 )
@@ -70,10 +75,14 @@ from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
+from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
 from saxshell.structure import AtomTypeDefinitions
 
 _OPEN_WINDOWS: list["ClusterDynamicsMainWindow"] = []
+CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS = 5
+ClusterDynamicsStartupProgressCallback = Callable[[int, int, str], None]
 
 
 @dataclass(slots=True)
@@ -584,8 +593,6 @@ class ClusterDynamicsDatasetPanel(QGroupBox):
 
     save_dataset_requested = Signal()
     load_dataset_requested = Signal()
-    save_colormap_requested = Signal()
-    save_lifetime_requested = Signal()
     save_powerpoint_requested = Signal()
     settings_changed = Signal()
 
@@ -645,26 +652,6 @@ class ClusterDynamicsDatasetPanel(QGroupBox):
         button_row.addWidget(self.load_dataset_button)
         layout.addLayout(button_row)
 
-        export_row = QHBoxLayout()
-        self.save_colormap_button = QPushButton("Save Colormap Data")
-        self.save_colormap_button.setToolTip(
-            "Write the currently plotted heatmap data to a CSV file using "
-            "the active display mode and time-unit selections."
-        )
-        self.save_colormap_button.clicked.connect(
-            lambda _checked=False: self.save_colormap_requested.emit()
-        )
-        self.save_lifetime_button = QPushButton("Save Lifetime Table")
-        self.save_lifetime_button.setToolTip(
-            "Write the observed lifetime summary table to a CSV file."
-        )
-        self.save_lifetime_button.clicked.connect(
-            lambda _checked=False: self.save_lifetime_requested.emit()
-        )
-        export_row.addWidget(self.save_colormap_button)
-        export_row.addWidget(self.save_lifetime_button)
-        layout.addLayout(export_row)
-
         report_row = QHBoxLayout()
         self.save_powerpoint_button = QPushButton("Save PowerPoint Report")
         self.save_powerpoint_button.setToolTip(
@@ -715,6 +702,11 @@ class ClusterDynamicsMainWindow(QMainWindow):
         initial_frames_dir: Path | None = None,
         initial_energy_file: Path | None = None,
         initial_project_dir: Path | None = None,
+        *,
+        startup_progress_callback: (
+            ClusterDynamicsStartupProgressCallback | None
+        ) = None,
+        startup_log_callback: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__()
         self._project_manager = SAXSProjectManager()
@@ -725,17 +717,75 @@ class ClusterDynamicsMainWindow(QMainWindow):
         self._last_result: ClusterDynamicsResult | None = None
         self._last_dataset_file: Path | None = None
         self._suspend_preview_refresh = False
-        self._build_ui()
-
-        if initial_frames_dir is not None:
-            self.trajectory_panel.frames_dir_edit.setText(
-                str(initial_frames_dir)
+        self._startup_progress_dialog: SAXSProgressDialog | None = None
+        self._startup_progress_callback = startup_progress_callback
+        self._startup_log_callback = startup_log_callback
+        self._last_startup_load_message = ""
+        self._begin_startup_load_progress(
+            "Preparing Cluster Dynamics window..."
+        )
+        try:
+            self._update_startup_load_progress(
+                1,
+                "Preparing Cluster Dynamics window...",
+                log_message="Preparing Cluster Dynamics window.",
             )
-        if initial_energy_file is not None:
-            self.run_panel.energy_path_edit.setText(str(initial_energy_file))
-        if initial_project_dir is not None:
-            self.dataset_panel.set_project_dir(initial_project_dir)
-        self._sync_project_defaults()
+            self._build_ui()
+            self._update_startup_load_progress(
+                2,
+                "Loading Cluster Dynamics controls...",
+                log_message=(
+                    "Loading Cluster Dynamics controls, plots, and editors."
+                ),
+            )
+            if (
+                initial_frames_dir is not None
+                or initial_energy_file is not None
+                or initial_project_dir is not None
+            ):
+                self._update_startup_load_progress(
+                    3,
+                    "Applying initial Cluster Dynamics inputs...",
+                    log_message=self._initial_input_startup_message(
+                        initial_frames_dir,
+                        initial_energy_file,
+                        initial_project_dir,
+                    ),
+                )
+                if initial_frames_dir is not None:
+                    self.trajectory_panel.frames_dir_edit.setText(
+                        str(initial_frames_dir)
+                    )
+                if initial_energy_file is not None:
+                    self.run_panel.energy_path_edit.setText(
+                        str(initial_energy_file)
+                    )
+                if initial_project_dir is not None:
+                    self.dataset_panel.set_project_dir(initial_project_dir)
+            else:
+                self._update_startup_load_progress(
+                    3,
+                    "Preparing empty Cluster Dynamics workspace...",
+                    log_message=(
+                        "No initial frames folder, energy file, or project "
+                        "directory was supplied."
+                    ),
+                )
+            self._update_startup_load_progress(
+                4,
+                "Synchronizing project defaults...",
+                log_message=(
+                    "Synchronizing project defaults and selection preview."
+                ),
+            )
+            self._sync_project_defaults()
+            self._update_startup_load_progress(
+                CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
+                "Cluster Dynamics window ready.",
+                log_message="Cluster Dynamics window is ready.",
+            )
+        finally:
+            self._close_startup_load_progress_dialog()
 
     def closeEvent(self, event) -> None:
         if self._run_thread is not None and self._run_thread.isRunning():
@@ -783,7 +833,7 @@ class ClusterDynamicsMainWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(12)
 
-        self.plot_panel = ClusterDynamicsPlotPanel()
+        self.plot_panel = ClusterDynamicsPlotPanel(enable_plot_editor=True)
         right_layout.addWidget(self.plot_panel, stretch=3)
 
         self.results_tabs = QTabWidget()
@@ -842,10 +892,10 @@ class ClusterDynamicsMainWindow(QMainWindow):
         self.run_panel.analyze_requested.connect(self.run_analysis)
         self.dataset_panel.save_dataset_requested.connect(self.save_dataset)
         self.dataset_panel.load_dataset_requested.connect(self.load_dataset)
-        self.dataset_panel.save_colormap_requested.connect(
+        self.plot_panel.save_colormap_requested.connect(
             self.save_colormap_data
         )
-        self.dataset_panel.save_lifetime_requested.connect(
+        self.plot_panel.save_lifetime_requested.connect(
             self.save_lifetime_table
         )
         self.dataset_panel.save_powerpoint_requested.connect(
@@ -865,6 +915,76 @@ class ClusterDynamicsMainWindow(QMainWindow):
             "cluster-distribution heatmap and lifetime table."
         )
         self._set_frame_format(None)
+
+    def _begin_startup_load_progress(self, message: str) -> None:
+        self._last_startup_load_message = ""
+        if self._startup_progress_callback is None:
+            dialog = SAXSProgressDialog(self)
+            self._startup_progress_dialog = dialog
+            dialog.begin(
+                CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
+                message,
+                unit_label="steps",
+                title="Opening Cluster Dynamics",
+            )
+        QApplication.processEvents()
+
+    def _update_startup_load_progress(
+        self,
+        processed: int,
+        message: str,
+        *,
+        log_message: str | None = None,
+    ) -> None:
+        if self._startup_progress_callback is not None:
+            self._startup_progress_callback(
+                processed,
+                CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
+                message,
+            )
+        elif self._startup_progress_dialog is not None:
+            self._startup_progress_dialog.update_progress(
+                processed,
+                CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
+                message,
+                unit_label="steps",
+            )
+        self._append_startup_load_output(log_message or message)
+        if self.centralWidget() is not None:
+            self.statusBar().showMessage(message)
+        QApplication.processEvents()
+
+    def _append_startup_load_output(self, message: str) -> None:
+        stripped = str(message).strip()
+        if not stripped or stripped == self._last_startup_load_message:
+            return
+        self._last_startup_load_message = stripped
+        if self._startup_log_callback is not None:
+            self._startup_log_callback(stripped)
+        elif self._startup_progress_dialog is not None:
+            self._startup_progress_dialog.append_output(stripped)
+
+    def _close_startup_load_progress_dialog(self) -> None:
+        self._last_startup_load_message = ""
+        if self._startup_progress_dialog is not None:
+            self._startup_progress_dialog.close()
+
+    @staticmethod
+    def _initial_input_startup_message(
+        frames_dir: Path | None,
+        energy_file: Path | None,
+        project_dir: Path | None,
+    ) -> str:
+        parts: list[str] = []
+        if frames_dir is not None:
+            parts.append(f"frames={Path(frames_dir).expanduser()}")
+        if energy_file is not None:
+            parts.append(f"energy={Path(energy_file).expanduser()}")
+        if project_dir is not None:
+            parts.append(f"project={Path(project_dir).expanduser()}")
+        if not parts:
+            return "No initial Cluster Dynamics inputs supplied."
+        return "Applying initial Cluster Dynamics inputs: " + ", ".join(parts)
 
     def inspect_frames_folder(self) -> None:
         frames_dir = self.trajectory_panel.get_frames_dir()
@@ -1853,6 +1973,16 @@ class ClusterDynamicsMainWindow(QMainWindow):
                 str(settings.resolved_energy_file)
             )
             changed = True
+        if apply_cluster_extraction_project_defaults(
+            self.definitions_panel,
+            settings.cluster_extraction_settings,
+        ):
+            changed = True
+        if apply_mdtrajectory_time_axis_project_defaults(
+            self.time_panel,
+            settings.mdtrajectory_time_axis_settings,
+        ):
+            changed = True
         return changed
 
     def _register_project_inputs(self) -> str | None:
@@ -1957,7 +2087,7 @@ def launch_clusterdynamics_ui(
             None if project_dir is None else Path(project_dir)
         ),
     )
-    _OPEN_WINDOWS.append(window)
+    track_saxshell_window(window, _OPEN_WINDOWS)
     window.show()
     if owns_app:
         return app.exec()
@@ -1995,8 +2125,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
+    "CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS",
     "ClusterDynamicsJobConfig",
     "ClusterDynamicsMainWindow",
+    "ClusterDynamicsStartupProgressCallback",
     "ClusterDynamicsWorker",
     "launch_clusterdynamics_ui",
     "main",

@@ -19,7 +19,16 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
-from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QPointF,
+    QRect,
+    QSize,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import QColor, QTextOption, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -30,16 +39,20 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
+    QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QTabBar,
     QTextEdit,
+    QToolButton,
     QWidget,
 )
 from scipy import stats
@@ -3103,6 +3116,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.structure_distribution_browser_action.text() == (
         "Open Structure Distribution Browser"
     )
+    assert window.exafs_gds_mapping_action.text() == "Open EXAFS GDS Mapping"
     assert (
         window.debye_waller_analysis_action.text()
         == "Open Debye-Waller Analysis"
@@ -3114,14 +3128,12 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert [action.text() for action in window.tools_menu.actions()] == [
         "MD Extraction",
         "Structure Analysis",
-        "Cluster Dynamics",
         "PDF",
         "Batch Processing",
         "Spectroscopy",
         "Visualization",
         "SAXS Calculation Preview",
         "X-ray Toolkit",
-        "CLI Setup",
         "(beta)",
     ]
     assert [
@@ -3136,7 +3148,9 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     ] == [
         "Open Bond Analysis",
         "Open Structure Distribution Browser",
+        "Open Cluster Dynamics",
         "Open Representative Structures",
+        "Open EXAFS GDS Mapping",
     ]
     visualization_actions = [
         action.text() for action in window.visualization_menu.actions()
@@ -3150,14 +3164,12 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert [action.text() for action in window.tools_menu.actions()] == [
         "MD Extraction",
         "Structure Analysis",
-        "Cluster Dynamics",
         "PDF",
         "Batch Processing",
         "Spectroscopy",
         "Visualization",
         "SAXS Calculation Preview",
         "X-ray Toolkit",
-        "CLI Setup",
         "(beta)",
     ]
     assert [
@@ -3165,7 +3177,9 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     ] == [
         "Open Bond Analysis",
         "Open Structure Distribution Browser",
+        "Open Cluster Dynamics",
         "Open Representative Structures",
+        "Open EXAFS GDS Mapping",
     ]
     visualization_actions = [
         action.text() for action in window.visualization_menu.actions()
@@ -3178,12 +3192,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert (
         window.clusterdynamics_action.text() == "Open Cluster Dynamics (only)"
     )
-    assert (
-        window.clusterdynamicsml_action.text() == "Open Cluster Dynamics (ML)"
-    )
-    assert [
-        action.text() for action in window.cluster_dynamics_menu.actions()
-    ] == ["Open Cluster Dynamics (ML)"]
+    assert window.clusterdynamicsml_action.text() == "Open Cluster Dynamics"
     assert [action.text() for action in window.pdf_menu.actions()] == [
         "Open PDF Calculation",
         "Open RMC Setup (fullrmc)",
@@ -3285,7 +3294,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     )
     assert (
         window.clusterdynamicsml_cli_setup_action.text()
-        == "Open Cluster Dynamics ML CLI Setup (Beta)"
+        == "Open Cluster Dynamics Prediction CLI Setup (Beta)"
     )
     assert (
         window.representative_cli_setup_action.text()
@@ -3295,10 +3304,11 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         "Open XYZ -> PDB CLI Setup (Beta)",
         "Open Cluster Extraction CLI Setup (Beta)",
         "Open Cluster Dynamics CLI Setup (Beta)",
-        "Open Cluster Dynamics ML CLI Setup (Beta)",
+        "Open Cluster Dynamics Prediction CLI Setup (Beta)",
         "Open Representative CLI Setup (Beta)",
     ]
     assert [action.text() for action in window.beta_menu.actions()] == [
+        "CLI Setup",
         "Open Cluster Dynamics (only)",
         "Open Debye-Waller Analysis",
         "Open Solvent Shell Builder (Beta)",
@@ -3599,6 +3609,1070 @@ def test_console_autoscroll_setting_controls_tab_output_scroll(
     window.close()
 
 
+def test_main_window_starts_with_fixed_core_tabs(qapp):
+    del qapp
+    window = SAXSMainWindow()
+
+    assert window.tabs.count() == 3
+    assert [window.tabs.tabText(index) for index in range(3)] == [
+        "Project Setup",
+        "SAXS Prefit",
+        "SAXS DREAM Fit",
+    ]
+    assert window.tabs.tabsClosable()
+    for index in range(3):
+        assert (
+            window.tabs.tabBar().tabButton(
+                index,
+                QTabBar.ButtonPosition.RightSide,
+            )
+            is None
+        )
+
+    window.close()
+
+
+def test_child_tool_windows_are_hosted_as_closeable_tabs(qapp):
+    window = SAXSMainWindow()
+    tool = QWidget()
+    tool.setWindowTitle("Example Tool")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="example_tool",
+    )
+
+    assert window.tabs.count() == 4
+    assert window.tabs.indexOf(tool) == 3
+    assert window.tabs.tabText(3) == "Example Tool"
+    assert tool in window._child_tool_windows
+    assert window._single_instance_child_tool_windows["example_tool"] is tool
+    assert (
+        window.tabs.tabBar().tabButton(
+            3,
+            QTabBar.ButtonPosition.RightSide,
+        )
+        is not None
+    )
+
+    window.tabs.tabCloseRequested.emit(3)
+    qapp.processEvents()
+
+    assert tool not in window._child_tool_windows
+    assert "example_tool" not in window._single_instance_child_tool_windows
+    assert window.tabs.count() == 3
+
+    window.close()
+
+
+def test_child_tool_cleanup_tolerates_deleted_qt_wrapper(qapp):
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Deleted Tool")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="deleted_tool",
+    )
+
+    assert tool in window._child_tool_windows
+
+    tool.close()
+    qapp.processEvents()
+    qapp.sendPostedEvents(None, 0)
+    qapp.processEvents()
+
+    window._forget_child_tool_window(tool)
+    assert window._close_tracked_child_tool_window(tool)
+    assert tool not in window._child_tool_windows
+    assert "deleted_tool" not in window._single_instance_child_tool_windows
+
+    window.close()
+
+
+def test_hosted_tool_menu_bar_keeps_saxshell_native_menu(qapp, monkeypatch):
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.sys,
+        "platform",
+        "darwin",
+    )
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("UV-Vis Peak Fitter")
+    tool.menuBar().addMenu("File")
+    tool.menuBar().addMenu("Fit")
+    tool.menuBar().addMenu("Help")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="uvvis_peak_fitter",
+    )
+    qapp.processEvents()
+    record = window._hosted_tool_record_for_window(tool)
+    assert record is not None
+    child_menu_actions = record.hosted_menu_actions
+    assert child_menu_actions is not None
+
+    assert window.tabs.currentWidget() is tool
+    assert (
+        window.menuBar().property("saxshell_native_menu_source")
+        == "hosted:UV-Vis Peak Fitter"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Fit",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert all(
+        action not in child_menu_actions
+        for action in window.menuBar().actions()
+    )
+    assert tool.menuBar().property("saxshell_native_menu_source") == "hosted"
+    assert not tool.menuBar().isNativeMenuBar()
+    assert [action.text() for action in tool.menuBar().actions()] == [
+        "File",
+        "Fit",
+        "Help",
+    ]
+
+    for base_tab in (
+        window.project_setup_tab,
+        window.prefit_tab,
+        window.dream_tab,
+    ):
+        window.tabs.setCurrentWidget(base_tab)
+        qapp.processEvents()
+
+        assert (
+            window.menuBar().property("saxshell_native_menu_source")
+            == "saxshell"
+        )
+        assert [action.text() for action in window.menuBar().actions()] == [
+            "File",
+            "Tools",
+            "Settings",
+            "Help",
+        ]
+        assert not window.menuBar().isNativeMenuBar()
+        assert not window.menuBar().isHidden()
+        assert [action.text() for action in tool.menuBar().actions()] == [
+            "File",
+            "Fit",
+            "Help",
+        ]
+
+    window.tabs.setCurrentWidget(tool)
+    qapp.processEvents()
+
+    assert (
+        window.menuBar().property("saxshell_native_menu_source")
+        == "hosted:UV-Vis Peak Fitter"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Fit",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert all(
+        action not in child_menu_actions
+        for action in window.menuBar().actions()
+    )
+    assert [action.text() for action in tool.menuBar().actions()] == [
+        "File",
+        "Fit",
+        "Help",
+    ]
+
+    window.close()
+
+
+def test_closing_active_hosted_tool_restores_saxshell_menu_bar(
+    qapp,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.sys,
+        "platform",
+        "darwin",
+    )
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Closable Menu Tool")
+    tool.menuBar().addMenu("File")
+    tool.menuBar().addMenu("Fit")
+    tool.menuBar().addMenu("Help")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="closable_menu_tool",
+    )
+    qapp.processEvents()
+
+    assert window.tabs.currentWidget() is tool
+    assert (
+        window.menuBar().property("saxshell_native_menu_source")
+        == "hosted:Closable Menu Tool"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Fit",
+        "Help",
+    ]
+    closed_tool_menu_actions = tuple(window.menuBar().actions())
+
+    queued_delays: list[int] = []
+
+    def fake_single_shot(delay_ms, callback):
+        del callback
+        queued_delays.append(delay_ms)
+
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.QTimer,
+        "singleShot",
+        fake_single_shot,
+    )
+    window.tabs.tabCloseRequested.emit(window.tabs.indexOf(tool))
+    qapp.processEvents()
+    qapp.sendPostedEvents(None, 0)
+    qapp.processEvents()
+
+    assert {0, 50, 150, 300, 600} <= set(queued_delays)
+    assert window.tabs.count() == 3
+    assert window.tabs.currentWidget() in (
+        window.project_setup_tab,
+        window.prefit_tab,
+        window.dream_tab,
+    )
+    assert (
+        window.menuBar().property("saxshell_native_menu_source") == "saxshell"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Tools",
+        "Settings",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert all(
+        action not in closed_tool_menu_actions
+        for action in window.menuBar().actions()
+    )
+
+    window.close()
+
+
+def test_forgetting_hosted_tool_after_tab_removal_rebuilds_saxshell_menu_bar(
+    qapp,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.sys,
+        "platform",
+        "darwin",
+    )
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Removed Menu Tool")
+    tool.menuBar().addMenu("File")
+    tool.menuBar().addMenu("Fit")
+    tool.menuBar().addMenu("Help")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="removed_menu_tool",
+    )
+    qapp.processEvents()
+
+    assert window.tabs.currentWidget() is tool
+    closed_tool_menu_actions = tuple(window.menuBar().actions())
+    window.tabs.removeTab(window.tabs.indexOf(tool))
+    qapp.processEvents()
+
+    window._forget_child_tool_window(tool)
+    qapp.processEvents()
+
+    assert (
+        window.menuBar().property("saxshell_native_menu_source") == "saxshell"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Tools",
+        "Settings",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert all(
+        action not in closed_tool_menu_actions
+        for action in window.menuBar().actions()
+    )
+
+    window.close()
+
+
+def test_preparing_active_hosted_tool_close_discards_child_menu_bar(
+    qapp,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.sys,
+        "platform",
+        "darwin",
+    )
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Closing Native Owner")
+    tool.menuBar().addMenu("File")
+    tool.menuBar().addMenu("Fit")
+    tool.menuBar().addMenu("Help")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="closing_native_owner",
+    )
+    qapp.processEvents()
+
+    record = window._hosted_tool_record_for_window(tool)
+    assert record is not None
+    child_menu_bar = tool.menuBar()
+    child_menu_actions = tuple(window.menuBar().actions())
+    assert [action.text() for action in child_menu_actions] == [
+        "File",
+        "Fit",
+        "Help",
+    ]
+
+    window._prepare_hosted_tool_window_for_close(tool, record)
+    qapp.processEvents()
+
+    assert window.tabs.currentWidget() in (
+        window.project_setup_tab,
+        window.prefit_tab,
+        window.dream_tab,
+    )
+    assert tool.menuBar() is not child_menu_bar
+    assert tool.menuBar().actions() == []
+    assert tool.menuBar().property("saxshell_native_menu_source") == "closing"
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Tools",
+        "Settings",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert all(
+        action not in child_menu_actions
+        for action in window.menuBar().actions()
+    )
+
+    window.close()
+
+
+def test_hosted_tool_without_menus_keeps_saxshell_menu_bar(qapp, monkeypatch):
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.sys,
+        "platform",
+        "darwin",
+    )
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Menu-less Hosted Tool")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="menu_less_hosted_tool",
+    )
+    qapp.processEvents()
+
+    assert window.tabs.currentWidget() is tool
+    assert (
+        window.menuBar().property("saxshell_native_menu_source") == "saxshell"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Tools",
+        "Settings",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert tool.menuBar().property("saxshell_native_menu_source") == "hosted"
+    assert not tool.menuBar().isNativeMenuBar()
+    assert tool.menuBar().actions() == []
+
+    window.close()
+
+
+def test_hosted_tool_detects_menus_added_after_hosting(qapp, monkeypatch):
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.sys,
+        "platform",
+        "darwin",
+    )
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Late Menu Tool")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="late_menu_tool",
+    )
+    qapp.processEvents()
+
+    assert window.tabs.currentWidget() is tool
+    assert (
+        window.menuBar().property("saxshell_native_menu_source") == "saxshell"
+    )
+    assert tool.menuBar().actions() == []
+
+    tool.menuBar().addMenu("File")
+    tool.menuBar().addMenu("Analyze")
+    window._sync_active_tab_menu_bar(force_native_rebind=True)
+    qapp.processEvents()
+
+    record = window._hosted_tool_record_for_window(tool)
+    assert record is not None
+    child_menu_actions = record.hosted_menu_actions
+    assert child_menu_actions is not None
+    assert [action.text() for action in child_menu_actions] == [
+        "File",
+        "Analyze",
+    ]
+    assert (
+        window.menuBar().property("saxshell_native_menu_source")
+        == "hosted:Late Menu Tool"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Analyze",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert all(
+        action not in child_menu_actions
+        for action in window.menuBar().actions()
+    )
+    assert tool.menuBar().property("saxshell_native_menu_source") == "hosted"
+    assert [action.text() for action in tool.menuBar().actions()] == [
+        "File",
+        "Analyze",
+    ]
+
+    window.tabs.setCurrentWidget(window.project_setup_tab)
+    qapp.processEvents()
+
+    assert (
+        window.menuBar().property("saxshell_native_menu_source") == "saxshell"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Tools",
+        "Settings",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert [action.text() for action in tool.menuBar().actions()] == [
+        "File",
+        "Analyze",
+    ]
+
+    window.close()
+
+
+def test_initial_saxshell_menu_bar_does_not_queue_native_repair(
+    qapp,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.sys,
+        "platform",
+        "darwin",
+    )
+    queued_delays: list[int] = []
+
+    def fake_single_shot(delay_ms, callback):
+        del callback
+        queued_delays.append(delay_ms)
+
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.QTimer,
+        "singleShot",
+        fake_single_shot,
+    )
+
+    window = SAXSMainWindow()
+    qapp.processEvents()
+    queued_delays.clear()
+    window.eventFilter(window, QEvent(QEvent.Type.ApplicationActivate))
+    qapp.processEvents()
+
+    assert queued_delays == []
+    assert (
+        window.menuBar().property("saxshell_native_menu_source") == "saxshell"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Tools",
+        "Settings",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+
+    window.close()
+
+
+def test_shown_tool_window_keeps_saxshell_menu_when_hosted(
+    qapp,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.sys,
+        "platform",
+        "darwin",
+    )
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Shown Hosted Tool")
+    tool.menuBar().addMenu("File")
+    tool.menuBar().addMenu("Fit")
+    tool.show()
+    tool.raise_()
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="shown_hosted_tool",
+    )
+    qapp.processEvents()
+    record = window._hosted_tool_record_for_window(tool)
+    assert record is not None
+    child_menu_actions = record.hosted_menu_actions
+    assert child_menu_actions is not None
+
+    assert window.tabs.currentWidget() is tool
+    assert (
+        window.menuBar().property("saxshell_native_menu_source")
+        == "hosted:Shown Hosted Tool"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Fit",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert all(
+        action not in child_menu_actions
+        for action in window.menuBar().actions()
+    )
+    assert [action.text() for action in tool.menuBar().actions()] == [
+        "File",
+        "Fit",
+    ]
+
+    window.tabs.setCurrentWidget(window.project_setup_tab)
+    qapp.processEvents()
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Tools",
+        "Settings",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert [action.text() for action in tool.menuBar().actions()] == [
+        "File",
+        "Fit",
+    ]
+
+    window.close()
+
+
+def test_native_menu_restore_recovers_after_child_tool_reclaims_native_menu(
+    qapp,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.sys,
+        "platform",
+        "darwin",
+    )
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Delayed Native Menu Tool")
+    tool.menuBar().addMenu("File")
+    tool.menuBar().addMenu("Fit")
+    tool.menuBar().addMenu("Help")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="delayed_native_menu_tool",
+    )
+    qapp.processEvents()
+    record = window._hosted_tool_record_for_window(tool)
+    assert record is not None
+    child_menu_actions = record.hosted_menu_actions
+    assert child_menu_actions is not None
+
+    child_menu_bar = tool.menuBar()
+    child_menu_bar.setVisible(True)
+    child_menu_bar.setNativeMenuBar(True)
+    child_menu_bar.setProperty("saxshell_native_menu_source", "child")
+
+    window.eventFilter(tool, QEvent(QEvent.Type.WindowActivate))
+    qapp.processEvents()
+    QTest.qWait(650)
+    qapp.processEvents()
+
+    assert (
+        window.menuBar().property("saxshell_native_menu_source")
+        == "hosted:Delayed Native Menu Tool"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Fit",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert all(
+        action not in child_menu_actions
+        for action in window.menuBar().actions()
+    )
+    assert child_menu_bar.property("saxshell_native_menu_source") == "hosted"
+    assert not child_menu_bar.isNativeMenuBar()
+    assert [action.text() for action in child_menu_bar.actions()] == [
+        "File",
+        "Fit",
+        "Help",
+    ]
+
+    window.close()
+
+
+def test_native_menu_sync_switches_between_hosted_and_shell_menus(
+    qapp,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        saxs_ui_main_window_module.sys,
+        "platform",
+        "darwin",
+    )
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Hosted Menu Tool")
+    tool.menuBar().addMenu("File")
+    tool.menuBar().addMenu("Fit")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="hosted_menu_tool",
+    )
+    qapp.processEvents()
+    record = window._hosted_tool_record_for_window(tool)
+    assert record is not None
+    child_menu_actions = record.hosted_menu_actions
+    assert child_menu_actions is not None
+
+    window._sync_active_tab_menu_bar()
+    assert (
+        window.menuBar().property("saxshell_native_menu_source")
+        == "hosted:Hosted Menu Tool"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Fit",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert all(
+        action not in child_menu_actions
+        for action in window.menuBar().actions()
+    )
+    assert tool.menuBar().property("saxshell_native_menu_source") == "hosted"
+    assert [action.text() for action in tool.menuBar().actions()] == [
+        "File",
+        "Fit",
+    ]
+
+    window.tabs.setCurrentWidget(window.project_setup_tab)
+    qapp.processEvents()
+    window._sync_active_tab_menu_bar()
+    assert (
+        window.menuBar().property("saxshell_native_menu_source") == "saxshell"
+    )
+    assert [action.text() for action in window.menuBar().actions()] == [
+        "File",
+        "Tools",
+        "Settings",
+        "Help",
+    ]
+    assert not window.menuBar().isNativeMenuBar()
+    assert not window.menuBar().isHidden()
+    assert [action.text() for action in tool.menuBar().actions()] == [
+        "File",
+        "Fit",
+    ]
+
+    window.close()
+
+
+def test_child_tool_tabs_cannot_split_fixed_core_tabs(qapp):
+    window = SAXSMainWindow()
+    first_tool = QWidget()
+    first_tool.setWindowTitle("First Tool")
+    second_tool = QWidget()
+    second_tool.setWindowTitle("Second Tool")
+
+    window._track_child_tool_window(
+        first_tool,
+        single_instance_key="first_tool",
+    )
+    window._track_child_tool_window(
+        second_tool,
+        single_instance_key="second_tool",
+    )
+
+    tab_bar = window.tabs.tabBar()
+    tab_bar.moveTab(window.tabs.indexOf(second_tool), 1)
+    qapp.processEvents()
+
+    assert [window.tabs.tabText(index) for index in range(3)] == [
+        "Project Setup",
+        "SAXS Prefit",
+        "SAXS DREAM Fit",
+    ]
+    assert window.tabs.indexOf(second_tool) == 3
+    assert window.tabs.indexOf(first_tool) >= 3
+    for tool in (first_tool, second_tool):
+        assert (
+            tab_bar.tabButton(
+                window.tabs.indexOf(tool),
+                QTabBar.ButtonPosition.RightSide,
+            )
+            is not None
+        )
+
+    tab_bar.setTabButton(
+        window.tabs.indexOf(first_tool),
+        QTabBar.ButtonPosition.RightSide,
+        None,
+    )
+    tab_bar.moveTab(window.tabs.indexOf(first_tool), 3)
+    qapp.processEvents()
+
+    assert window.tabs.indexOf(first_tool) == 3
+    for tool in (first_tool, second_tool):
+        assert (
+            tab_bar.tabButton(
+                window.tabs.indexOf(tool),
+                QTabBar.ButtonPosition.RightSide,
+            )
+            is not None
+        )
+
+    tab_bar.moveTab(
+        window.tabs.indexOf(window.project_setup_tab),
+        window.tabs.count() - 1,
+    )
+    qapp.processEvents()
+
+    assert [window.tabs.tabText(index) for index in range(3)] == [
+        "Project Setup",
+        "SAXS Prefit",
+        "SAXS DREAM Fit",
+    ]
+    assert window.tabs.indexOf(first_tool) >= 3
+    assert window.tabs.indexOf(second_tool) >= 3
+
+    prefit_index = window.tabs.indexOf(window.prefit_tab)
+    prefit_icon = window.tabs.tabIcon(prefit_index)
+    prefit_label = window.tabs.tabText(prefit_index)
+    window.tabs.removeTab(prefit_index)
+    window.tabs.insertTab(0, window.prefit_tab, prefit_icon, prefit_label)
+    assert [window.tabs.tabText(index) for index in range(3)] != [
+        "Project Setup",
+        "SAXS Prefit",
+        "SAXS DREAM Fit",
+    ]
+
+    tab_bar.tab_order_repair_requested.emit()
+    qapp.processEvents()
+
+    assert [window.tabs.tabText(index) for index in range(3)] == [
+        "Project Setup",
+        "SAXS Prefit",
+        "SAXS DREAM Fit",
+    ]
+    assert window.tabs.tabText(window.tabs.indexOf(first_tool)) == "First Tool"
+    assert (
+        window.tabs.tabText(window.tabs.indexOf(second_tool)) == "Second Tool"
+    )
+
+    window.tabs.setTabText(
+        window.tabs.indexOf(window.dream_tab),
+        "SAXSShell (pdfsetup)",
+    )
+    window.tabs.setTabText(
+        window.tabs.indexOf(first_tool),
+        "SAXS DREAM Fit",
+    )
+    window._refresh_base_tab_close_buttons()
+
+    assert [window.tabs.tabText(index) for index in range(3)] == [
+        "Project Setup",
+        "SAXS Prefit",
+        "SAXS DREAM Fit",
+    ]
+    assert window.tabs.tabText(window.tabs.indexOf(first_tool)) == "First Tool"
+
+    first_tool_close = tab_bar.tabButton(
+        window.tabs.indexOf(first_tool),
+        QTabBar.ButtonPosition.RightSide,
+    )
+    assert first_tool_close is not None
+    first_tool_close.click()
+    qapp.processEvents()
+
+    assert window.tabs.indexOf(first_tool) == -1
+    assert window.tabs.indexOf(second_tool) >= 3
+    assert second_tool in window._child_tool_windows
+
+    window.close()
+
+
+def test_child_tool_tab_can_detach_and_reattach(qapp):
+    window = SAXSMainWindow()
+    tool = QWidget()
+    tool.setWindowTitle("Detachable Tool")
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="detachable_tool",
+    )
+
+    tab_bar = window.tabs.tabBar()
+    tab_bar_center = tab_bar.mapToGlobal(tab_bar.rect().center())
+    window.tabs.setTabText(window.tabs.indexOf(tool), "SAXS Prefit")
+    window._detach_hosted_tool_tab(3, tab_bar_center + QPoint(80, 80))
+
+    record = window._hosted_tool_tab_records[tool]
+    assert window.tabs.indexOf(tool) == -1
+    assert record.detached_window is not None
+    assert record.detached_window.isVisible()
+    assert record.detached_window.windowTitle() == "Detachable Tool"
+
+    window._reattach_detached_tool_tab(tool, tab_bar_center)
+    qapp.processEvents()
+
+    assert window.tabs.indexOf(tool) >= 3
+    assert record.detached_window is None
+
+    window.close()
+
+
+def test_detached_hosted_main_window_shows_content_below_drag_handle(qapp):
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Hosted Main Window")
+    content_label = QLabel("Hosted content")
+    tool.setCentralWidget(content_label)
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="hosted_main_window",
+    )
+
+    tab_bar = window.tabs.tabBar()
+    tab_bar_center = tab_bar.mapToGlobal(tab_bar.rect().center())
+    window._detach_hosted_tool_tab(
+        window.tabs.indexOf(tool),
+        tab_bar_center + QPoint(80, 80),
+    )
+    qapp.processEvents()
+
+    record = window._hosted_tool_tab_records[tool]
+    assert record.detached_window is not None
+    detached = record.detached_window
+    drag_handle = detached._drag_handle
+
+    assert tool.isVisible()
+    assert content_label.isVisible()
+    assert drag_handle.height() < detached.centralWidget().height() // 4
+    assert tool.geometry().top() > drag_handle.geometry().top()
+    assert tool.height() > drag_handle.height()
+
+    window.close()
+
+
+def test_detached_tool_drag_handle_moves_window_and_reattaches(qapp):
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Drag Back Tool")
+    tool.setCentralWidget(QLabel("Drag back content"))
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="drag_back_tool",
+    )
+
+    tab_bar = window.tabs.tabBar()
+    tab_bar_center = tab_bar.mapToGlobal(tab_bar.rect().center())
+    window._detach_hosted_tool_tab(
+        window.tabs.indexOf(tool),
+        tab_bar_center + QPoint(140, 120),
+    )
+    qapp.processEvents()
+
+    record = window._hosted_tool_tab_records[tool]
+    assert record.detached_window is not None
+    detached = record.detached_window
+    drag_handle = detached._drag_handle
+    press_pos = drag_handle.rect().center()
+    press_global = drag_handle.mapToGlobal(press_pos)
+    original_window_pos = detached.pos()
+
+    class FakeMouseEvent:
+        def __init__(
+            self,
+            *,
+            pos: QPoint,
+            global_pos: QPoint,
+            button: Qt.MouseButton,
+            buttons: Qt.MouseButton,
+        ) -> None:
+            self._pos = pos
+            self._global_pos = global_pos
+            self._button = button
+            self._buttons = buttons
+            self.accepted = False
+
+        def button(self):
+            return self._button
+
+        def buttons(self):
+            return self._buttons
+
+        def pos(self):
+            return self._pos
+
+        def globalPosition(self):
+            return SimpleNamespace(toPoint=lambda: self._global_pos)
+
+        def accept(self):
+            self.accepted = True
+
+    drag_handle.mousePressEvent(
+        FakeMouseEvent(
+            pos=press_pos,
+            global_pos=press_global,
+            button=Qt.MouseButton.LeftButton,
+            buttons=Qt.MouseButton.LeftButton,
+        )
+    )
+    drag_handle.mouseMoveEvent(
+        FakeMouseEvent(
+            pos=press_pos,
+            global_pos=tab_bar_center,
+            button=Qt.MouseButton.NoButton,
+            buttons=Qt.MouseButton.LeftButton,
+        )
+    )
+
+    assert detached.pos() == original_window_pos + (
+        tab_bar_center - press_global
+    )
+    assert record.detached_window is detached
+
+    drag_handle.mouseReleaseEvent(
+        FakeMouseEvent(
+            pos=press_pos,
+            global_pos=tab_bar_center,
+            button=Qt.MouseButton.LeftButton,
+            buttons=Qt.MouseButton.NoButton,
+        )
+    )
+    qapp.processEvents()
+
+    assert record.detached_window is None
+    assert window.tabs.indexOf(tool) >= 3
+
+    window.close()
+
+
+def test_detached_tool_dock_button_reattaches_without_drag(qapp):
+    window = SAXSMainWindow()
+    tool = QMainWindow()
+    tool.setWindowTitle("Button Dock Tool")
+    tool.setCentralWidget(QLabel("Button dock content"))
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="button_dock_tool",
+    )
+
+    tab_bar = window.tabs.tabBar()
+    tab_bar_center = tab_bar.mapToGlobal(tab_bar.rect().center())
+    window._detach_hosted_tool_tab(
+        window.tabs.indexOf(tool),
+        tab_bar_center + QPoint(180, 140),
+    )
+    qapp.processEvents()
+
+    record = window._hosted_tool_tab_records[tool]
+    assert record.detached_window is not None
+    detached = record.detached_window
+    dock_button = detached._dock_button
+
+    assert dock_button.isVisible()
+    assert dock_button.geometry().topLeft() == QPoint(0, 0)
+    assert detached._drag_handle.geometry().left() >= dock_button.width()
+
+    dock_button.click()
+    qapp.processEvents()
+
+    assert record.detached_window is None
+    assert window.tabs.indexOf(tool) >= 3
+    assert window.tabs.currentWidget() is tool
+
+    window.close()
+
+
+def test_project_bound_tool_tabs_close_when_active_project_changes(
+    qapp,
+    tmp_path,
+):
+    first_project_dir, _paths = _build_minimal_saxs_project(tmp_path / "first")
+    second_project_dir, _paths = _build_minimal_saxs_project(
+        tmp_path / "second"
+    )
+    window = SAXSMainWindow(initial_project_dir=first_project_dir)
+    tool = QWidget()
+    tool.setWindowTitle("Project Tool")
+
+    window._track_child_tool_window(
+        tool,
+        single_instance_key="project_tool",
+        update_on_project_change=True,
+    )
+    assert window.tabs.indexOf(tool) >= 3
+
+    window.current_settings = window.project_manager.load_project(
+        second_project_dir
+    )
+    window._refresh_contextual_child_tool_tabs()
+    qapp.processEvents()
+
+    assert tool not in window._child_tool_windows
+    assert "project_tool" not in window._single_instance_child_tool_windows
+    assert window.tabs.indexOf(tool) == -1
+
+    window.close()
+
+
 def test_volume_fraction_tool_window_opens_with_citation_and_target(
     qapp,
     tmp_path,
@@ -3846,6 +4920,83 @@ def test_structure_distribution_browser_uses_active_project_dir(
         ]
         is launched["instance"]
     )
+    window.close()
+
+
+def test_exafs_gds_mapping_uses_active_project_dir(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeEXAFSWindow:
+        pass
+
+    def fake_launch_exafs_gds_mapping_ui(
+        *,
+        initial_project_dir=None,
+        initial_absorber_element=None,
+    ):
+        launched["project_dir"] = initial_project_dir
+        launched["absorber_element"] = initial_absorber_element
+        launched["instance"] = FakeEXAFSWindow()
+        return launched["instance"]
+
+    monkeypatch.setattr(
+        "saxshell.exafs.ui.main_window.launch_exafs_gds_mapping_ui",
+        fake_launch_exafs_gds_mapping_ui,
+    )
+
+    window._open_exafs_gds_mapping_tool()
+
+    assert launched["project_dir"] == Path(project_dir).resolve()
+    assert launched["absorber_element"] is None
+    assert launched["instance"] in window._child_tool_windows
+    assert (
+        window._single_instance_child_tool_windows["exafs_gds_mapping"]
+        is launched["instance"]
+    )
+    window.close()
+
+
+def test_exafs_gds_mapping_prefers_project_pb_absorber(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.available_elements = ["I", "Pb"]
+    manager.save_project(settings)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeEXAFSWindow:
+        pass
+
+    def fake_launch_exafs_gds_mapping_ui(
+        *,
+        initial_project_dir=None,
+        initial_absorber_element=None,
+    ):
+        launched["project_dir"] = initial_project_dir
+        launched["absorber_element"] = initial_absorber_element
+        launched["instance"] = FakeEXAFSWindow()
+        return launched["instance"]
+
+    monkeypatch.setattr(
+        "saxshell.exafs.ui.main_window.launch_exafs_gds_mapping_ui",
+        fake_launch_exafs_gds_mapping_ui,
+    )
+
+    window._open_exafs_gds_mapping_tool()
+
+    assert launched["project_dir"] == Path(project_dir).resolve()
+    assert launched["absorber_element"] == "Pb"
     window.close()
 
 
@@ -5310,11 +6461,33 @@ def test_cluster_dynamics_tool_uses_active_project_dir(
             initial_frames_dir=None,
             initial_energy_file=None,
             initial_project_dir=None,
+            startup_progress_callback=None,
+            startup_log_callback=None,
         ):
+            from saxshell.clusterdynamics.ui.main_window import (
+                CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
+            )
+
             launched["frames_dir"] = initial_frames_dir
             launched["energy_file"] = initial_energy_file
             launched["project_dir"] = initial_project_dir
+            launched["startup_progress_callback"] = startup_progress_callback
+            launched["startup_log_callback"] = startup_log_callback
             launched["instance"] = self
+            assert startup_progress_callback is not None
+            assert startup_log_callback is not None
+            startup_progress_callback(
+                1,
+                CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
+                "Preparing Cluster Dynamics window...",
+            )
+            startup_log_callback("Preparing Cluster Dynamics window.")
+            startup_progress_callback(
+                CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
+                CLUSTER_DYNAMICS_WINDOW_LOAD_TOTAL_STEPS,
+                "Cluster Dynamics window ready.",
+            )
+            startup_log_callback("Cluster Dynamics window is ready.")
 
         def show(self):
             launched["shown"] = True
@@ -5335,6 +6508,17 @@ def test_cluster_dynamics_tool_uses_active_project_dir(
         launched["project_dir"]
         == Path(window.current_settings.project_dir).resolve()
     )
+    assert launched["startup_progress_callback"] is not None
+    assert launched["startup_log_callback"] is not None
+    assert window._progress_dialog is not None
+    assert not window._progress_dialog.isVisible()
+    assert (
+        window._progress_dialog.progress_bar.maximum()
+        == window._progress_dialog.progress_bar.value()
+    )
+    dialog_output = window._progress_dialog.output_box.toPlainText()
+    assert "Loading Cluster Dynamics from" in dialog_output
+    assert "Cluster Dynamics window is ready." in dialog_output
     assert launched["shown"] is True
     assert launched["raised"] is True
     assert launched["instance"] in window._child_tool_windows
@@ -5371,13 +6555,35 @@ def test_cluster_dynamics_ml_tool_uses_active_project_dir(
             initial_project_dir=None,
             initial_clusters_dir=None,
             initial_experimental_data_file=None,
+            startup_progress_callback=None,
+            startup_log_callback=None,
         ):
+            from saxshell.clusterdynamicsml.ui.main_window import (
+                CLUSTER_DYNAMICS_ML_WINDOW_LOAD_TOTAL_STEPS,
+            )
+
             launched["frames_dir"] = initial_frames_dir
             launched["energy_file"] = initial_energy_file
             launched["project_dir"] = initial_project_dir
             launched["clusters_dir"] = initial_clusters_dir
             launched["experimental_data_file"] = initial_experimental_data_file
+            launched["startup_progress_callback"] = startup_progress_callback
+            launched["startup_log_callback"] = startup_log_callback
             launched["instance"] = self
+            assert startup_progress_callback is not None
+            assert startup_log_callback is not None
+            startup_progress_callback(
+                1,
+                CLUSTER_DYNAMICS_ML_WINDOW_LOAD_TOTAL_STEPS,
+                "Preparing Cluster Dynamics window...",
+            )
+            startup_log_callback("Preparing Cluster Dynamics window.")
+            startup_progress_callback(
+                CLUSTER_DYNAMICS_ML_WINDOW_LOAD_TOTAL_STEPS,
+                CLUSTER_DYNAMICS_ML_WINDOW_LOAD_TOTAL_STEPS,
+                "Cluster Dynamics window ready.",
+            )
+            startup_log_callback("Cluster Dynamics window is ready.")
 
         def show(self):
             launched["shown"] = True
@@ -5403,6 +6609,17 @@ def test_cluster_dynamics_ml_tool_uses_active_project_dir(
         launched["project_dir"]
         == Path(window.current_settings.project_dir).resolve()
     )
+    assert launched["startup_progress_callback"] is not None
+    assert launched["startup_log_callback"] is not None
+    assert window._progress_dialog is not None
+    assert not window._progress_dialog.isVisible()
+    assert (
+        window._progress_dialog.progress_bar.maximum()
+        == window._progress_dialog.progress_bar.value()
+    )
+    dialog_output = window._progress_dialog.output_box.toPlainText()
+    assert "Loading Cluster Dynamics from" in dialog_output
+    assert "Cluster Dynamics window is ready." in dialog_output
     assert launched["shown"] is True
     assert launched["raised"] is True
     assert launched["instance"] in window._child_tool_windows
@@ -6027,6 +7244,10 @@ def test_dream_backend_batch_generate_script_rotates_command_folder(
     first_commands_path = manager.run_set.commands_path
     assert first_run_set_dir != original_run_set_dir
     assert first_commands_path.is_file()
+    assert manager.run_set.export_plot_data is False
+    assert "Plot data export: off" in first_commands_path.read_text(
+        encoding="utf-8"
+    )
     assert Path(window.run_set_edit.text()).resolve() == first_run_set_dir
     assert window.open_commands_button.isEnabled() is True
 
@@ -6048,6 +7269,55 @@ def test_dream_backend_batch_generate_script_rotates_command_folder(
     opened_paths.clear()
     window._reveal_command_set_file()
     assert opened_paths == [second_commands_path]
+    window.close()
+
+
+def test_dream_backend_batch_plot_data_export_requires_confirmation(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+    manager = window._require_manager()
+    original_run_set_dir = manager.run_set.resolved_run_set_dir
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *args, **kwargs: None,
+    )
+
+    window._create_queue_item()
+    window.export_plot_data_checkbox.setChecked(True)
+    assert manager.run_set.export_plot_data is True
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.No,
+    )
+
+    window._generate_shell_script()
+
+    assert manager.run_set.resolved_run_set_dir == original_run_set_dir
+    assert not manager.run_set.commands_path.is_file()
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window._generate_shell_script()
+
+    assert manager.run_set.resolved_run_set_dir != original_run_set_dir
+    assert manager.run_set.export_plot_data is True
+    assert "Plot data export: ON" in manager.run_set.commands_path.read_text(
+        encoding="utf-8"
+    )
     window.close()
 
 
@@ -6259,13 +7529,73 @@ def test_dream_backend_batch_queue_preset_creates_monosq_sweep(
     window.close()
 
 
+def test_dream_backend_batch_clear_queue_preserves_completed_runs(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    from saxshell.saxs.dream.batch import load_dream_batch_manifest
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+    manager = window._require_manager()
+    entries = manager.workflow.create_default_parameter_map(persist=False)
+    settings = manager.workflow.load_settings()
+    completed_item = manager.add_queue_item(
+        label="completed fit",
+        settings=settings,
+        entries=entries,
+    )
+    queued_item = manager.add_queue_item(
+        label="queued fit",
+        settings=settings,
+        entries=entries,
+    )
+    completed_item.status = "completed"
+    manager.save_manifest()
+    completed_dir = Path(completed_item.run_dir)
+    queued_dir = Path(queued_item.run_dir)
+    window._refresh_tables()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window._clear_entire_queue()
+
+    assert window.queue_table.rowCount() == 0
+    assert manager.run_set.queue_items == []
+    assert [item.label for item in manager.run_set.completed_queue_items] == [
+        "completed fit"
+    ]
+    assert completed_dir.is_dir()
+    assert not queued_dir.exists()
+    assert "preserved 1 completed run" in window.statusBar().currentMessage()
+    reloaded = load_dream_batch_manifest(manager.run_set.manifest_path)
+    assert reloaded.queue_items == []
+    assert [item.label for item in reloaded.completed_queue_items] == [
+        "completed fit"
+    ]
+    window.close()
+
+
 def test_dream_backend_batch_filter_presets_save_and_reload(
     qapp,
     tmp_path,
+    monkeypatch,
 ):
     del qapp
     from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
 
+    monkeypatch.setenv(
+        "SAXSHELL_DREAM_BATCH_PRESETS_DIR",
+        str(tmp_path / "dream_batch_user_presets"),
+    )
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
     prefit = SAXSPrefitWorkflow(project_dir)
     prefit.save_fit(prefit.parameter_entries)
@@ -6317,14 +7647,37 @@ def test_dream_backend_batch_filter_presets_save_and_reload(
     )
     reopened.close()
 
+    second_project_dir, _second_paths = _build_minimal_saxs_project(
+        tmp_path / "second_project"
+    )
+    second_prefit = SAXSPrefitWorkflow(second_project_dir)
+    second_prefit.save_fit(second_prefit.parameter_entries)
+    second_window = DreamBatchRunFileWindow(
+        initial_project_dir=second_project_dir
+    )
+    second_index = second_window.filter_preset_combo.findData(
+        f"saved:{preset_path.name}"
+    )
+    assert second_index >= 0
+    second_window.filter_preset_combo.setCurrentIndex(second_index)
+    second_window._load_selected_filter_preset()
+    assert second_window.posterior_filter_combo.currentData() == "top_n_logp"
+    assert second_window.posterior_top_n_spin.value() == 123
+    second_window.close()
+
 
 def test_dream_backend_batch_filter_list_presets_save_and_reload(
     qapp,
     tmp_path,
+    monkeypatch,
 ):
     del qapp
     from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
 
+    monkeypatch.setenv(
+        "SAXSHELL_DREAM_BATCH_PRESETS_DIR",
+        str(tmp_path / "dream_batch_user_presets"),
+    )
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
     prefit = SAXSPrefitWorkflow(project_dir)
     prefit.save_fit(prefit.parameter_entries)
@@ -6499,6 +7852,106 @@ def test_dream_backend_batch_filter_list_presets_save_and_reload(
         "top_123_median"
     )
     reopened.close()
+
+    second_project_dir, _second_paths = _build_minimal_saxs_project(
+        tmp_path / "second_project"
+    )
+    second_prefit = SAXSPrefitWorkflow(second_project_dir)
+    second_prefit.save_fit(second_prefit.parameter_entries)
+    second_window = DreamBatchRunFileWindow(
+        initial_project_dir=second_project_dir
+    )
+    second_index = second_window.filter_list_preset_combo.findData(
+        f"saved:{preset_path.name}"
+    )
+    assert second_index >= 0
+    second_window.filter_list_preset_combo.setCurrentIndex(second_index)
+    second_window._load_selected_filter_list_preset()
+    assert [
+        item.label
+        for item in second_window._require_manager().run_set.filter_sets
+    ] == ["all_map", "top_123_median"]
+    second_window.close()
+
+
+def test_dream_backend_batch_filter_presets_load_legacy_project_files(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    from saxshell.saxs.dream import PosteriorFilterSettings
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    monkeypatch.setenv(
+        "SAXSHELL_DREAM_BATCH_PRESETS_DIR",
+        str(tmp_path / "dream_batch_user_presets"),
+    )
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+
+    settings = PosteriorFilterSettings(
+        posterior_filter_mode="top_n_logp",
+        posterior_top_n=77,
+        bestfit_method="median",
+    )
+    legacy_filter_dir = window._legacy_project_filter_preset_dir()
+    assert legacy_filter_dir is not None
+    legacy_filter_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_filter_dir / "legacy_top_77.json").write_text(
+        json.dumps(
+            {
+                "label": "legacy_top_77",
+                "posterior_filter_settings": settings.to_dict(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    window._refresh_filter_preset_combo()
+    filter_index = window.filter_preset_combo.findData(
+        "project:legacy_top_77.json"
+    )
+    assert filter_index >= 0
+    window.filter_preset_combo.setCurrentIndex(filter_index)
+    window._load_selected_filter_preset()
+    assert window.posterior_filter_combo.currentData() == "top_n_logp"
+    assert window.posterior_top_n_spin.value() == 77
+    assert window.bestfit_method_combo.currentData() == "median"
+
+    legacy_list_dir = window._legacy_project_filter_list_preset_dir()
+    assert legacy_list_dir is not None
+    legacy_list_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_list_dir / "legacy_filter_list.json").write_text(
+        json.dumps(
+            {
+                "label": "legacy_filter_list",
+                "filter_sets": [
+                    {
+                        "label": "legacy_top_77",
+                        "posterior_filter_settings": settings.to_dict(),
+                    }
+                ],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    window._refresh_filter_list_preset_combo()
+    list_index = window.filter_list_preset_combo.findData(
+        "project:legacy_filter_list.json"
+    )
+    assert list_index >= 0
+    window.filter_list_preset_combo.setCurrentIndex(list_index)
+    window._load_selected_filter_list_preset()
+    assert [
+        item.label for item in window._require_manager().run_set.filter_sets
+    ] == ["legacy_top_77"]
+    window.close()
 
 
 def test_dream_backend_batch_filter_table_edits_update_manifest(
@@ -11897,6 +13350,49 @@ def test_run_dream_requires_written_runtime_bundle(
     )
 
 
+def test_run_dream_plot_data_export_requires_confirmation(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    workflow = SAXSDreamWorkflow(project_dir)
+    entries = workflow.create_default_parameter_map(persist=True)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    window._save_distribution_entries(entries)
+    window.write_dream_bundle()
+    window.dream_tab.export_plot_data_checkbox.setChecked(True)
+    started: list[bool] = []
+    monkeypatch.setattr(
+        window,
+        "_start_dream_run_task",
+        lambda *args, **kwargs: started.append(True),
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.main_window.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.No,
+    )
+
+    window.run_dream_bundle()
+
+    assert started == []
+    assert "confirmation prompt was declined" in (
+        window.dream_tab.output_box.toPlainText()
+    )
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.main_window.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window.run_dream_bundle()
+
+    assert started == [True]
+    assert "Plot data export: ON" in window.dream_tab.output_box.toPlainText()
+
+
 def test_write_dream_bundle_shows_progress_popup(qapp, tmp_path, monkeypatch):
     del qapp
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
@@ -12739,6 +14235,7 @@ def test_dream_analysis_saved_run_dropdown_refreshes_completed_batch_run(
 ):
     del qapp
     from saxshell.saxs.dream import DreamBatchRunSetManager
+    from saxshell.saxs.dream.batch import load_dream_batch_manifest
 
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
     prefit = SAXSPrefitWorkflow(project_dir)
@@ -12771,6 +14268,12 @@ def test_dream_analysis_saved_run_dropdown_refreshes_completed_batch_run(
     np.save(run_dir / "dream_log_ps.npy", np.zeros((2, 3)))
     item.status = "completed"
     manager.save_manifest()
+    manager.clear_queue()
+    reloaded_run_set = load_dream_batch_manifest(manager.run_set.manifest_path)
+    assert reloaded_run_set.queue_items == []
+    assert [item.label for item in reloaded_run_set.completed_queue_items] == [
+        "batch item"
+    ]
 
     window.tabs.setCurrentWidget(window.dream_tab)
     QApplication.processEvents()
@@ -14324,7 +15827,7 @@ def test_dream_recycle_pushes_selected_best_fit_into_prefit(qapp, tmp_path):
     )
 
 
-def test_dream_run_finish_auto_exports_condensed_results(qapp, tmp_path):
+def test_dream_run_finish_skips_plot_data_export_by_default(qapp, tmp_path):
     del qapp
     project_dir, paths = _build_minimal_saxs_project(tmp_path)
     bundle = _write_minimal_dream_results(project_dir)
@@ -14347,8 +15850,41 @@ def test_dream_run_finish_auto_exports_condensed_results(qapp, tmp_path):
         paths.exported_data_dir.glob("dream_violin_auto_*.csv")
     )
 
+    assert auto_model_exports == []
+    assert auto_violin_exports == []
+    assert "Plot data export: off" in window.dream_tab.output_box.toPlainText()
+
+
+def test_dream_run_finish_auto_exports_condensed_results_when_enabled(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    bundle = _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    window.dream_tab.export_plot_data_checkbox.setChecked(True)
+
+    window._on_dream_run_finished(
+        str(bundle.run_dir),
+        {
+            "sampled_params_path": str(
+                bundle.run_dir / "dream_sampled_params.npy"
+            ),
+            "log_ps_path": str(bundle.run_dir / "dream_log_ps.npy"),
+        },
+    )
+
+    auto_model_exports = sorted(
+        paths.exported_data_dir.glob("dream_model_fit_auto_*.csv")
+    )
+    auto_violin_exports = sorted(
+        paths.exported_data_dir.glob("dream_violin_auto_*.csv")
+    )
+
     assert auto_model_exports
     assert auto_violin_exports
+    assert "Plot data export: ON" in window.dream_tab.output_box.toPlainText()
     auto_model_base = auto_model_exports[-1].stem
     auto_violin_base = auto_violin_exports[-1].stem
     assert (
@@ -17195,6 +18731,37 @@ def test_loading_project_reports_registered_folder_warnings(qapp, tmp_path):
     window.close()
 
 
+def test_loading_project_populates_elements_from_registered_clusters(
+    qapp,
+    tmp_path,
+):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    settings = manager.create_project(project_dir)
+    clusters_dir = project_dir / "clusters"
+    cluster_bin_dir = clusters_dir / "PbI2"
+    cluster_bin_dir.mkdir(parents=True)
+    (cluster_bin_dir / "frame_0001.xyz").write_text(
+        "3\ncomment\nPb 0.0 0.0 0.0\nI 1.0 0.0 0.0\nI 0.0 1.0 0.0\n",
+        encoding="utf-8",
+    )
+    settings.clusters_dir = str(clusters_dir.resolve())
+    manager.save_project(settings)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    qapp.processEvents()
+
+    assert window.project_setup_tab.available_elements() == ["I", "Pb"]
+    assert window.project_setup_tab.recognized_clusters_table.rowCount() == 1
+    assert (
+        window.project_setup_tab.recognized_clusters_table.item(0, 0).text()
+        == "PbI2"
+    )
+    assert window.current_settings is not None
+    assert window.current_settings.available_elements == ["I", "Pb"]
+    window.close()
+
+
 def test_selecting_experimental_file_triggers_project_autosave(
     qapp, tmp_path, monkeypatch
 ):
@@ -17505,6 +19072,47 @@ def test_experimental_data_metadata_comments_are_not_used_as_columns(
     assert summary.column_names == ["q_(Å⁻¹)", "I(q)"]
     assert np.allclose(summary.q_values, [0.01, 0.02, 0.03])
     assert np.allclose(summary.intensities, [100.0, 95.0, 90.0])
+
+
+def test_experimental_data_loader_accepts_commented_columns_directive(
+    tmp_path,
+):
+    data_path = tmp_path / "exp_recleaned.txt"
+    data_path.write_text(
+        "# FileType: cleaned_aps_trace_stitch_corrected_midq_recleaned\n"
+        "# Created: 2026-05-27T13:21:58\n"
+        "# SourceFile: mapbi3_dmso_cleaned_stitch_corrected.txt\n"
+        "# columns: q(1/A)    I_recleaned(Q)    err_recleaned(Q)\n"
+        "2.6755035000e-03\t4.0466246682e+02\t0.0000000000e+00\n"
+        "2.8552634000e-03\t3.2074013829e+02\t1.0000000000e-01\n",
+        encoding="utf-8",
+    )
+
+    header_rows = guess_experimental_header_rows(data_path)
+    assert header_rows == 4
+
+    column_names = read_experimental_column_names(
+        data_path,
+        skiprows=header_rows,
+    )
+    assert column_names == [
+        "q(1/A)",
+        "I_recleaned(Q)",
+        "err_recleaned(Q)",
+    ]
+
+    summary = load_experimental_data_file(data_path)
+    assert summary.header_rows == 4
+    assert summary.q_column == 0
+    assert summary.intensity_column == 1
+    assert summary.error_column == 2
+    assert np.allclose(summary.q_values, [0.0026755035, 0.0028552634])
+    assert np.allclose(
+        summary.intensities,
+        [404.66246682, 320.74013829],
+    )
+    assert summary.errors is not None
+    assert np.allclose(summary.errors, [0.0, 0.1])
 
 
 def test_project_setup_preview_updates_with_experimental_q_range(
@@ -20136,7 +21744,12 @@ def test_project_setup_preview_plots_solvent_data_in_green(qapp, tmp_path):
         if line.get_label() == "Solvent data"
     )
     assert to_hex(solvent_line.get_color()) == "#008000"
-    assert preview_axis.get_legend() is not None
+    assert preview_axis.get_legend() is None
+    legend_labels = {
+        tab.component_legend_table.item(row, 2).text()
+        for row in range(tab.component_legend_table.rowCount())
+    }
+    assert {"Experimental data", "Solvent data"} <= legend_labels
 
 
 def test_project_setup_data_trace_controls_toggle_and_persist(
@@ -20234,7 +21847,12 @@ def test_project_setup_component_overlay_uses_secondary_y_axis(qapp, tmp_path):
         experimental_axis.get_ylabel() == "Experimental Intensity (arb. units)"
     )
     assert component_axis.get_ylabel() == "Model Intensity (arb. units)"
-    assert experimental_axis.get_legend() is not None
+    assert experimental_axis.get_legend() is None
+    legend_labels = {
+        tab.component_legend_table.item(row, 2).text()
+        for row in range(tab.component_legend_table.rowCount())
+    }
+    assert {"Experimental data", "A_no_motif"} <= legend_labels
     assert (
         component_axis.get_ylim()[1] - component_axis.get_ylim()[0] > 4.8 - 4.2
     )
@@ -20309,11 +21927,13 @@ def test_project_setup_component_plot_editor_updates_dual_axis_plot(
     qapp.processEvents()
 
     experimental_axis, component_axis = tab.component_figure.axes
-    legend = experimental_axis.get_legend()
-    assert legend is not None
-    legend_labels = [text.get_text() for text in legend.get_texts()]
+    legend_labels = [
+        tab.component_legend_table.item(row, 2).text()
+        for row in range(tab.component_legend_table.rowCount())
+    ]
 
     assert experimental_axis.get_title() == "Custom SAXS Overlay"
+    assert experimental_axis.get_legend() is None
     assert "Component Average" in legend_labels
     assert experimental_axis.yaxis.label.get_fontsize() == pytest.approx(18.5)
     assert component_axis.get_ylabel() == "Model Intensity (arb. units)"
@@ -20348,11 +21968,15 @@ def test_component_legend_toggle_hides_and_shows_legend(qapp, tmp_path):
     tab._apply_experimental_file(data_path, summary)
     tab.draw_component_plot([component_path])
 
-    assert tab.component_figure.axes[0].get_legend() is not None
+    assert tab.component_figure.axes[0].get_legend() is None
+    assert not tab.component_legend_table.isHidden()
+    assert tab.component_legend_table.rowCount() > 0
 
     tab.component_legend_toggle_button.setChecked(False)
 
     assert tab.component_figure.axes[0].get_legend() is None
+    assert not tab.component_legend_table.isVisible()
+    assert tab.component_legend_table.rowCount() == 0
 
 
 def test_component_autoscale_to_model_range_uses_model_q_limits(
@@ -20433,7 +22057,7 @@ def test_component_show_hide_all_button_toggles_all_model_traces(
     )
     tab.draw_component_plot([component_edge, component_face])
 
-    assert tab.component_all_traces_button.text() == "Hide Computed Traces"
+    assert tab.component_all_traces_button.text() == "Hide Computed"
 
     tab.component_all_traces_button.click()
 
@@ -20447,7 +22071,7 @@ def test_component_show_hide_all_button_toggles_all_model_traces(
         tab.recognized_clusters_table.item(1, 6).checkState()
         == Qt.CheckState.Unchecked
     )
-    assert tab.component_all_traces_button.text() == "Show Computed Traces"
+    assert tab.component_all_traces_button.text() == "Show Computed"
 
     tab.component_all_traces_button.click()
 
@@ -20461,7 +22085,7 @@ def test_component_show_hide_all_button_toggles_all_model_traces(
         tab.recognized_clusters_table.item(1, 6).checkState()
         == Qt.CheckState.Checked
     )
-    assert tab.component_all_traces_button.text() == "Hide Computed Traces"
+    assert tab.component_all_traces_button.text() == "Hide Computed"
 
 
 def test_component_trace_color_scheme_applies_histogram_colormap(
@@ -20545,17 +22169,13 @@ def test_component_table_toggle_and_legend_pick_stay_synced(qapp, tmp_path):
 
     visibility_item.setCheckState(Qt.CheckState.Unchecked)
 
-    assert not tab._component_line_lookup["PbI2_edge"].get_visible()
-    assert tab._component_legend_lookup[
-        "PbI2_edge"
-    ].get_alpha() == pytest.approx(0.25)
+    legend_row = tab._component_legend_row_lookup["PbI2_edge"]
+    legend_visibility_item = tab.component_legend_table.item(legend_row, 0)
 
-    event = type(
-        "LegendEvent",
-        (),
-        {"artist": tab._component_legend_lookup["PbI2_edge"]},
-    )()
-    tab._handle_component_legend_pick(event)
+    assert not tab._component_line_lookup["PbI2_edge"].get_visible()
+    assert legend_visibility_item.checkState() == Qt.CheckState.Unchecked
+
+    legend_visibility_item.setCheckState(Qt.CheckState.Checked)
 
     refreshed_item = tab.recognized_clusters_table.item(0, 6)
     assert tab._component_line_lookup["PbI2_edge"].get_visible()
@@ -21253,7 +22873,167 @@ def test_project_setup_plot_previews_expand_with_the_right_pane(qapp):
         == QSizePolicy.Policy.Expanding
     )
     assert tab.component_canvas.minimumHeight() >= 320
-    assert tab.prior_canvas.minimumHeight() >= 240
+    assert tab.prior_canvas.minimumHeight() >= 300
+
+
+def test_project_setup_plot_pane_controls_do_not_force_wide_scroll(qapp):
+    del qapp
+    tab = ProjectSetupTab()
+    right_contents = tab._right_scroll_area.widget()
+
+    assert right_contents is not None
+    assert right_contents.minimumSizeHint().width() <= 420
+    assert tab.component_group.minimumSizeHint().width() <= 420
+    assert tab.prior_group.minimumSizeHint().width() <= 420
+
+
+def test_project_setup_component_controls_stay_compact_with_wide_legend(qapp):
+    del qapp
+    tab = ProjectSetupTab()
+
+    compact_controls = [
+        tab.component_legend_toggle_button,
+        tab.component_model_range_button,
+        tab.component_all_traces_button,
+        tab.component_observed_traces_button,
+        tab.component_predicted_traces_button,
+        tab.component_trace_color_scheme_combo,
+        tab.open_component_plot_editor_button,
+        tab.save_component_plot_data_button,
+    ]
+    for control in compact_controls:
+        assert (
+            control.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Fixed
+        )
+
+    assert tab.component_model_range_button.maximumWidth() <= 130
+    assert tab.component_all_traces_button.maximumWidth() <= 150
+    assert tab.component_trace_color_scheme_combo.maximumWidth() <= 180
+    assert tab.component_legend_panel.minimumWidth() >= 300
+    assert tab.component_legend_table.minimumWidth() >= 300
+    assert tab.component_legend_table.maximumWidth() >= 420
+    assert tab.component_legend_table.maximumHeight() >= 240
+    assert (
+        tab.component_legend_table.horizontalHeader().sectionResizeMode(2)
+        == QHeaderView.ResizeMode.Stretch
+    )
+    assert tab.component_toolbar.iconSize() == QSize(24, 24)
+    assert tab.component_toolbar.minimumHeight() >= 44
+    assert tab.component_toolbar.maximumHeight() <= 48
+    toolbar_buttons = tab.component_toolbar.findChildren(QToolButton)
+    assert toolbar_buttons
+    for button in toolbar_buttons:
+        assert button.iconSize() == QSize(24, 24)
+        assert button.minimumWidth() >= 40
+        assert button.minimumHeight() >= 40
+        assert button.maximumWidth() <= 40
+        assert button.maximumHeight() <= 40
+
+
+def test_project_setup_prior_controls_stay_clear_of_histogram(qapp, tmp_path):
+    prior_path = tmp_path / "md_prior_weights.json"
+    prior_path.write_text(
+        json.dumps(
+            {
+                "origin": "clusters",
+                "available_elements": ["Pb", "I", "O"],
+                "total_files": 10,
+                "structures": {
+                    "PbI2": {
+                        "no_motif": {
+                            "count": 8,
+                            "weight": 0.8,
+                            "profile_file": "PbI2_no_motif.txt",
+                            "secondary_atom_distributions": {
+                                "O": {"0": 2, "1": 6},
+                            },
+                        },
+                    },
+                    "Pb2I4": {
+                        "no_motif": {
+                            "count": 2,
+                            "weight": 0.2,
+                            "profile_file": "Pb2I4_no_motif.txt",
+                            "secondary_atom_distributions": {
+                                "O": {"0": 1, "1": 1},
+                            },
+                        },
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    tab = ProjectSetupTab()
+    tab.set_project_selected(True)
+    tab.resize(860, 520)
+    tab.show()
+    tab.apply_cluster_import_data(
+        ["Pb", "I", "O"],
+        [
+            {
+                "structure": "PbI2",
+                "motif": "no_motif",
+                "count": 8,
+                "weight": 0.8,
+                "atom_fraction_percent": 100.0,
+                "structure_fraction_percent": 80.0,
+            },
+            {
+                "structure": "Pb2I4",
+                "motif": "no_motif",
+                "count": 2,
+                "weight": 0.2,
+                "atom_fraction_percent": 100.0,
+                "structure_fraction_percent": 20.0,
+            },
+        ],
+    )
+    tab.draw_prior_plot(prior_path)
+    qapp.processEvents()
+
+    action_parent = tab.open_prior_plot_editor_button.parentWidget()
+    assert isinstance(action_parent.layout(), QHBoxLayout)
+    assert action_parent.layout().count() == 4
+    action_buttons = [
+        tab.open_prior_plot_editor_button,
+        tab.generate_prior_plot_button,
+        tab.save_prior_png_button,
+        tab.save_prior_plot_data_button,
+    ]
+    assert len({button.geometry().top() for button in action_buttons}) == 1
+
+    def assert_controls_are_clear_of_plot() -> None:
+        canvas_rect = tab.prior_canvas.geometry()
+        controls_rect = tab.prior_controls_panel.geometry()
+        assert controls_rect.bottom() < canvas_rect.top()
+        assert canvas_rect.top() - controls_rect.bottom() <= 12
+        assert controls_rect.height() <= 150
+
+    assert_controls_are_clear_of_plot()
+
+    for mode in (
+        "atom_fraction",
+        "solvent_sort_structure_fraction",
+        "solvent_sort_atom_fraction",
+    ):
+        index = tab.prior_mode_combo.findData(mode)
+        assert index >= 0
+        tab.prior_mode_combo.setCurrentIndex(index)
+        qapp.processEvents()
+        assert_controls_are_clear_of_plot()
+
+        axis = tab.prior_figure.axes[0]
+        tab.prior_canvas.draw()
+        renderer = tab.prior_canvas.get_renderer()
+        label_box = axis.yaxis.label.get_window_extent(renderer=renderer)
+        assert label_box.y0 >= -2
+        assert label_box.y1 <= tab.prior_canvas.height() + 2
+
+    tab.close()
 
 
 def test_project_setup_activity_progress_updates(qapp):
@@ -21469,7 +23249,7 @@ def test_predicted_structure_mode_status_guides_user_when_bundle_is_missing(
     assert "Predicted Structures mode is on" in (
         window.project_setup_tab.predicted_structure_status_label.text()
     )
-    assert "Open Cluster Dynamics (ML)" in (
+    assert "Open Cluster Dynamics" in (
         window.project_setup_tab.predicted_structure_status_label.text()
     )
     window.close()
@@ -21593,12 +23373,8 @@ def test_project_setup_predicted_mode_toggles_observed_and_predicted_traces(
 
     assert not tab.component_observed_traces_button.isHidden()
     assert not tab.component_predicted_traces_button.isHidden()
-    assert tab.component_observed_traces_button.text() == (
-        "Hide Observed Traces"
-    )
-    assert tab.component_predicted_traces_button.text() == (
-        "Hide Predicted Traces"
-    )
+    assert tab.component_observed_traces_button.text() == ("Hide Observed")
+    assert tab.component_predicted_traces_button.text() == ("Hide Predicted")
     assert tab._component_line_lookup["A_no_motif"].get_visible()
     assert tab._component_line_lookup["A2_predicted_rank01"].get_visible()
 
@@ -21607,9 +23383,7 @@ def test_project_setup_predicted_mode_toggles_observed_and_predicted_traces(
 
     assert tab._component_line_lookup["A_no_motif"].get_visible()
     assert not tab._component_line_lookup["A2_predicted_rank01"].get_visible()
-    assert tab.component_predicted_traces_button.text() == (
-        "Show Predicted Traces"
-    )
+    assert tab.component_predicted_traces_button.text() == ("Show Predicted")
     assert (
         tab.recognized_clusters_table.item(0, 6).checkState()
         == Qt.CheckState.Checked
@@ -21630,9 +23404,7 @@ def test_project_setup_predicted_mode_toggles_observed_and_predicted_traces(
 
     assert not tab._component_line_lookup["A_no_motif"].get_visible()
     assert tab._component_line_lookup["A2_predicted_rank01"].get_visible()
-    assert tab.component_observed_traces_button.text() == (
-        "Show Observed Traces"
-    )
+    assert tab.component_observed_traces_button.text() == ("Show Observed")
     assert (
         tab.recognized_clusters_table.item(0, 6).checkState()
         == Qt.CheckState.Unchecked

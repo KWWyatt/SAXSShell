@@ -6,6 +6,8 @@ from .bondanalyzer import (
     BondAnalyzer,
     BondPairDefinition,
     CoordinationNumberDefinition,
+    DihedralQuartetDefinition,
+    expanded_solvent_dihedral_quartets,
 )
 from .presets import (
     BondAnalysisPreset,
@@ -49,11 +51,13 @@ __all__ = [
     "BondAnalysisWorkflow",
     "BondPairDefinition",
     "CoordinationNumberDefinition",
+    "DihedralQuartetDefinition",
     "ClusterTypeSummary",
     "build_plot_request",
     "bondanalysis_presets_path",
     "default_presets",
     "discover_cluster_types",
+    "expanded_solvent_dihedral_quartets",
     "load_result_index",
     "load_presets",
     "next_available_output_dir",

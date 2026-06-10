@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from matplotlib.backends.backend_qtagg import (
 )
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -65,6 +67,7 @@ from saxshell.saxs.dream.distributions import (
 )
 from saxshell.saxs.prefit import PrefitEvaluation, PrefitParameterEntry
 from saxshell.saxs.ui.branding import (
+    SAXSHELL_THEME_COLORS,
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
@@ -80,6 +83,49 @@ from saxshell.saxs.ui.distribution_window import (
 DREAM_BATCH_QUEUE_PRIOR_MODES = ("strict", "proportional", "lenient")
 DREAM_BATCH_FILTER_PRESET_DIR_NAME = "backend_filter_presets"
 DREAM_BATCH_FILTER_LIST_PRESET_DIR_NAME = "backend_filter_list_presets"
+DREAM_BATCH_PRESETS_DIR_ENV_VAR = "SAXSHELL_DREAM_BATCH_PRESETS_DIR"
+DREAM_BATCH_FILTER_PRESET_DIR_ENV_VAR = (
+    "SAXSHELL_DREAM_BATCH_FILTER_PRESET_DIR"
+)
+DREAM_BATCH_FILTER_LIST_PRESET_DIR_ENV_VAR = (
+    "SAXSHELL_DREAM_BATCH_FILTER_LIST_PRESET_DIR"
+)
+DREAM_BATCH_JSON_EDITOR_OBJECT_NAME = "dreamBatchJsonEditor"
+DREAM_BATCH_JSON_EDITOR_STYLE = f"""
+QPlainTextEdit#{DREAM_BATCH_JSON_EDITOR_OBJECT_NAME} {{
+    background: {SAXSHELL_THEME_COLORS["surface"]};
+    border: 1px solid {SAXSHELL_THEME_COLORS["border_strong"]};
+    border-radius: 6px;
+    color: {SAXSHELL_THEME_COLORS["editor_text"]};
+    font-family: "Menlo", "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
+    font-size: 13px;
+    font-weight: 650;
+    padding: 6px 8px;
+    selection-background-color: {SAXSHELL_THEME_COLORS["selection"]};
+    selection-color: {SAXSHELL_THEME_COLORS["selection_text"]};
+}}
+QPlainTextEdit#{DREAM_BATCH_JSON_EDITOR_OBJECT_NAME}:disabled {{
+    background: {SAXSHELL_THEME_COLORS["surface"]};
+    color: {SAXSHELL_THEME_COLORS["editor_text"]};
+}}
+"""
+
+
+def _apply_json_editor_readability(editor: QPlainTextEdit) -> None:
+    editor.setObjectName(DREAM_BATCH_JSON_EDITOR_OBJECT_NAME)
+    editor.setStyleSheet(DREAM_BATCH_JSON_EDITOR_STYLE)
+    palette = editor.palette()
+    text_color = QColor(SAXSHELL_THEME_COLORS["editor_text"])
+    base_color = QColor(SAXSHELL_THEME_COLORS["surface"])
+    for group in (
+        QPalette.ColorGroup.Active,
+        QPalette.ColorGroup.Inactive,
+        QPalette.ColorGroup.Disabled,
+    ):
+        palette.setColor(group, QPalette.ColorRole.Text, text_color)
+        palette.setColor(group, QPalette.ColorRole.Base, base_color)
+    editor.setPalette(palette)
+
 
 DREAM_BATCH_QUEUE_PRESETS: tuple[dict[str, object], ...] = (
     {
@@ -193,6 +239,23 @@ class _WheelGuardedDoubleSpinBox(QDoubleSpinBox):
 class _WheelGuardedSpinBox(QSpinBox):
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt override
         event.ignore()
+
+
+def _configured_user_preset_dir(
+    *,
+    specific_env_var: str,
+    folder_name: str,
+) -> Path:
+    configured_dir = os.environ.get(specific_env_var, "").strip()
+    if configured_dir:
+        return Path(configured_dir).expanduser()
+    configured_root = os.environ.get(
+        DREAM_BATCH_PRESETS_DIR_ENV_VAR,
+        "",
+    ).strip()
+    if configured_root:
+        return Path(configured_root).expanduser() / folder_name
+    return Path.home() / ".saxshell" / "dream_batch" / folder_name
 
 
 class DreamBatchRunFileWindow(QMainWindow):
@@ -572,6 +635,7 @@ class DreamBatchRunFileWindow(QMainWindow):
 
         layout.addWidget(QLabel("Advanced DREAM settings JSON"))
         self.settings_json_edit = QPlainTextEdit()
+        _apply_json_editor_readability(self.settings_json_edit)
         self.settings_json_edit.setMinimumHeight(150)
         layout.addWidget(self.settings_json_edit)
 
@@ -740,6 +804,13 @@ class DreamBatchRunFileWindow(QMainWindow):
             self._remove_selected_queue_item
         )
         queue_button_row.addWidget(remove_queue_item_button)
+        clear_queue_button = QPushButton("Clear Entire Queue")
+        clear_queue_button.setToolTip(
+            "Remove all active queue rows. Completed runs stay in batch "
+            "history and their result folders are kept."
+        )
+        clear_queue_button.clicked.connect(self._clear_entire_queue)
+        queue_button_row.addWidget(clear_queue_button)
         queue_button_row.addStretch(1)
         layout.addLayout(queue_button_row)
 
@@ -1022,6 +1093,7 @@ class DreamBatchRunFileWindow(QMainWindow):
 
         layout.addWidget(QLabel("Posterior filter JSON preview"))
         self.filter_json_edit = QPlainTextEdit()
+        _apply_json_editor_readability(self.filter_json_edit)
         self.filter_json_edit.setMinimumHeight(120)
         layout.addWidget(self.filter_json_edit)
 
@@ -1067,6 +1139,20 @@ class DreamBatchRunFileWindow(QMainWindow):
     def _build_command_group(self) -> QGroupBox:
         group = QGroupBox("Command Output")
         layout = QVBoxLayout(group)
+        self.export_plot_data_checkbox = QCheckBox(
+            "Generate plot data CSV/JSON artifacts"
+        )
+        self.export_plot_data_checkbox.setChecked(False)
+        self.export_plot_data_checkbox.setToolTip(
+            "Off by default. When enabled, the batch runner writes model-fit "
+            "CSV files, violin sample CSV files, and metrics JSON files for "
+            "every completed fit/filter pair. Large batches can create GB of "
+            "data."
+        )
+        self.export_plot_data_checkbox.toggled.connect(
+            self._on_export_plot_data_toggled
+        )
+        layout.addWidget(self.export_plot_data_checkbox)
         button_row = QHBoxLayout()
         generate_button = QPushButton("Generate Shell Script")
         generate_button.clicked.connect(self._generate_shell_script)
@@ -1111,6 +1197,7 @@ class DreamBatchRunFileWindow(QMainWindow):
             )
         except Exception as exc:
             self._manager = None
+            self._sync_export_plot_data_checkbox()
             self.run_set_edit.clear()
             self.prefit_status_label.setText(str(exc))
             self._clear_prefit_preview(str(exc))
@@ -1123,6 +1210,7 @@ class DreamBatchRunFileWindow(QMainWindow):
             str(self._manager.run_set.resolved_run_set_dir)
         )
         self.conda_env_edit.setText(self._manager.run_set.conda_env)
+        self._sync_export_plot_data_checkbox()
         self._reload_project_state()
         self._apply_pending_prefit_parameter_entries()
         self._apply_pending_fit_q_range()
@@ -1454,6 +1542,48 @@ class DreamBatchRunFileWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Remove DREAM Queue Item", str(exc))
             self._set_status("Queue item removal failed.")
+
+    def _clear_entire_queue(self, *_args: object) -> None:
+        try:
+            manager = self._require_manager()
+            queue_items = list(manager.run_set.queue_items)
+            if not queue_items:
+                self._set_status("No DREAM queue items to clear.")
+                return
+            completed_count = sum(
+                1
+                for item in queue_items
+                if str(item.status).strip().lower() == "completed"
+            )
+            incomplete_count = len(queue_items) - completed_count
+            response = QMessageBox.question(
+                self,
+                "Clear DREAM Queue",
+                (
+                    "Clear every DREAM queue row?\n\n"
+                    f"Completed runs preserved in history: "
+                    f"{completed_count}\n"
+                    f"Incomplete runtime bundles deleted: "
+                    f"{incomplete_count}\n\n"
+                    "Completed result folders will be kept so they remain "
+                    "available from DREAM saved runs."
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if response != QMessageBox.StandardButton.Yes:
+                self._set_status("Queue clear cancelled.")
+                return
+            removed_items = manager.clear_queue()
+            self._refresh_tables()
+            self._refresh_command_box()
+            self._set_status(
+                f"Cleared {len(removed_items)} queue item(s); "
+                f"preserved {completed_count} completed run(s)."
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Clear DREAM Queue", str(exc))
+            self._set_status("Queue clear failed.")
 
     def _on_queue_preset_changed(self, _index: int) -> None:
         if not hasattr(self, "queue_preset_combo"):
@@ -1820,8 +1950,13 @@ class DreamBatchRunFileWindow(QMainWindow):
             for preset in self._saved_filter_presets():
                 preset_id = str(preset["id"])
                 self._filter_preset_items[preset_id] = preset
+                suffix = (
+                    "project saved"
+                    if preset.get("source") == "project"
+                    else "saved"
+                )
                 self.filter_preset_combo.addItem(
-                    f"{preset['label']} (saved)",
+                    f"{preset['label']} ({suffix})",
                     preset_id,
                 )
             if previous_id:
@@ -1918,39 +2053,53 @@ class DreamBatchRunFileWindow(QMainWindow):
         ]
 
     def _saved_filter_presets(self) -> list[dict[str, object]]:
-        if self._manager is None:
-            return []
-        preset_dir = self._filter_preset_dir()
-        if not preset_dir.is_dir():
-            return []
         presets: list[dict[str, object]] = []
-        for path in sorted(preset_dir.glob("*.json")):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                settings_payload = payload.get("posterior_filter_settings")
-                if not isinstance(settings_payload, dict):
-                    settings_payload = payload.get("settings", {})
-                if not isinstance(settings_payload, dict):
-                    settings_payload = {}
-                settings = PosteriorFilterSettings.from_dict(settings_payload)
-            except Exception:
+        seen_ids: set[str] = set()
+        for source, preset_dir in self._filter_preset_dirs():
+            if not preset_dir.is_dir():
                 continue
-            label = str(payload.get("label", path.stem)).strip() or path.stem
-            description = str(
-                payload.get(
-                    "description",
-                    self._filter_preset_description(settings),
+            for path in sorted(preset_dir.glob("*.json")):
+                preset_id = (
+                    f"saved:{path.name}"
+                    if source == "user"
+                    else f"project:{path.name}"
                 )
-            ).strip()
-            presets.append(
-                {
-                    "id": f"saved:{path.name}",
-                    "label": label,
-                    "description": description,
-                    "settings": settings,
-                    "path": path,
-                }
-            )
+                if preset_id in seen_ids:
+                    continue
+                if source == "project" and f"saved:{path.name}" in seen_ids:
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    settings_payload = payload.get("posterior_filter_settings")
+                    if not isinstance(settings_payload, dict):
+                        settings_payload = payload.get("settings", {})
+                    if not isinstance(settings_payload, dict):
+                        settings_payload = {}
+                    settings = PosteriorFilterSettings.from_dict(
+                        settings_payload
+                    )
+                except Exception:
+                    continue
+                label = (
+                    str(payload.get("label", path.stem)).strip() or path.stem
+                )
+                description = str(
+                    payload.get(
+                        "description",
+                        self._filter_preset_description(settings),
+                    )
+                ).strip()
+                presets.append(
+                    {
+                        "id": preset_id,
+                        "label": label,
+                        "description": description,
+                        "settings": settings,
+                        "path": path,
+                        "source": source,
+                    }
+                )
+                seen_ids.add(preset_id)
         return presets
 
     def _on_filter_preset_changed(self, _index: int) -> None:
@@ -1987,7 +2136,6 @@ class DreamBatchRunFileWindow(QMainWindow):
 
     def _save_current_filter_preset(self, *_args: object) -> None:
         try:
-            self._require_manager()
             settings = self._filter_settings_from_controls()
             label = (
                 self.filter_label_edit.text().strip()
@@ -2036,8 +2184,13 @@ class DreamBatchRunFileWindow(QMainWindow):
             for preset in presets:
                 preset_id = str(preset["id"])
                 self._filter_list_preset_items[preset_id] = preset
+                suffix = (
+                    "project saved"
+                    if preset.get("source") == "project"
+                    else "saved"
+                )
                 self.filter_list_preset_combo.addItem(
-                    f"{preset['label']} (saved)",
+                    f"{preset['label']} ({suffix})",
                     preset_id,
                 )
             if previous_id:
@@ -2052,59 +2205,74 @@ class DreamBatchRunFileWindow(QMainWindow):
         )
 
     def _saved_filter_list_presets(self) -> list[dict[str, object]]:
-        if self._manager is None:
-            return []
-        preset_dir = self._filter_list_preset_dir()
-        if not preset_dir.is_dir():
-            return []
         presets: list[dict[str, object]] = []
-        for path in sorted(preset_dir.glob("*.json")):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                filter_sets_payload = payload.get("filter_sets", [])
-                if not isinstance(filter_sets_payload, list):
-                    filter_sets_payload = []
-                filter_sets: list[dict[str, object]] = []
-                for filter_payload in filter_sets_payload:
-                    if not isinstance(filter_payload, dict):
-                        continue
-                    settings_payload = filter_payload.get(
-                        "posterior_filter_settings"
-                    )
-                    if not isinstance(settings_payload, dict):
-                        settings_payload = filter_payload.get("settings", {})
-                    if not isinstance(settings_payload, dict):
-                        settings_payload = {}
-                    settings = PosteriorFilterSettings.from_dict(
-                        settings_payload
-                    )
-                    label = str(filter_payload.get("label", "")).strip()
-                    filter_sets.append(
-                        {
-                            "label": label,
-                            "settings": settings,
-                        }
-                    )
-            except Exception:
+        seen_ids: set[str] = set()
+        for source, preset_dir in self._filter_list_preset_dirs():
+            if not preset_dir.is_dir():
                 continue
-            if not filter_sets:
-                continue
-            label = str(payload.get("label", path.stem)).strip() or path.stem
-            description = str(
-                payload.get(
-                    "description",
-                    self._filter_list_preset_description(filter_sets),
+            for path in sorted(preset_dir.glob("*.json")):
+                preset_id = (
+                    f"saved:{path.name}"
+                    if source == "user"
+                    else f"project:{path.name}"
                 )
-            ).strip()
-            presets.append(
-                {
-                    "id": f"saved:{path.name}",
-                    "label": label,
-                    "description": description,
-                    "filter_sets": filter_sets,
-                    "path": path,
-                }
-            )
+                if preset_id in seen_ids:
+                    continue
+                if source == "project" and f"saved:{path.name}" in seen_ids:
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    filter_sets_payload = payload.get("filter_sets", [])
+                    if not isinstance(filter_sets_payload, list):
+                        filter_sets_payload = []
+                    filter_sets: list[dict[str, object]] = []
+                    for filter_payload in filter_sets_payload:
+                        if not isinstance(filter_payload, dict):
+                            continue
+                        settings_payload = filter_payload.get(
+                            "posterior_filter_settings"
+                        )
+                        if not isinstance(settings_payload, dict):
+                            settings_payload = filter_payload.get(
+                                "settings",
+                                {},
+                            )
+                        if not isinstance(settings_payload, dict):
+                            settings_payload = {}
+                        settings = PosteriorFilterSettings.from_dict(
+                            settings_payload
+                        )
+                        label = str(filter_payload.get("label", "")).strip()
+                        filter_sets.append(
+                            {
+                                "label": label,
+                                "settings": settings,
+                            }
+                        )
+                except Exception:
+                    continue
+                if not filter_sets:
+                    continue
+                label = (
+                    str(payload.get("label", path.stem)).strip() or path.stem
+                )
+                description = str(
+                    payload.get(
+                        "description",
+                        self._filter_list_preset_description(filter_sets),
+                    )
+                ).strip()
+                presets.append(
+                    {
+                        "id": preset_id,
+                        "label": label,
+                        "description": description,
+                        "filter_sets": filter_sets,
+                        "path": path,
+                        "source": source,
+                    }
+                )
+                seen_ids.add(preset_id)
         return presets
 
     def _on_filter_list_preset_changed(self, _index: int) -> None:
@@ -2206,16 +2374,44 @@ class DreamBatchRunFileWindow(QMainWindow):
             self._set_status("Filter list preset save failed.")
 
     def _filter_preset_dir(self) -> Path:
-        manager = self._require_manager()
-        return (
-            Path(manager.workflow.dream_dir)
-            / DREAM_BATCH_FILTER_PRESET_DIR_NAME
+        return _configured_user_preset_dir(
+            specific_env_var=DREAM_BATCH_FILTER_PRESET_DIR_ENV_VAR,
+            folder_name=DREAM_BATCH_FILTER_PRESET_DIR_NAME,
         )
 
     def _filter_list_preset_dir(self) -> Path:
-        manager = self._require_manager()
+        return _configured_user_preset_dir(
+            specific_env_var=DREAM_BATCH_FILTER_LIST_PRESET_DIR_ENV_VAR,
+            folder_name=DREAM_BATCH_FILTER_LIST_PRESET_DIR_NAME,
+        )
+
+    def _filter_preset_dirs(self) -> list[tuple[str, Path]]:
+        dirs = [("user", self._filter_preset_dir())]
+        legacy_dir = self._legacy_project_filter_preset_dir()
+        if legacy_dir is not None and legacy_dir != dirs[0][1]:
+            dirs.append(("project", legacy_dir))
+        return dirs
+
+    def _filter_list_preset_dirs(self) -> list[tuple[str, Path]]:
+        dirs = [("user", self._filter_list_preset_dir())]
+        legacy_dir = self._legacy_project_filter_list_preset_dir()
+        if legacy_dir is not None and legacy_dir != dirs[0][1]:
+            dirs.append(("project", legacy_dir))
+        return dirs
+
+    def _legacy_project_filter_preset_dir(self) -> Path | None:
+        if self._manager is None:
+            return None
         return (
-            Path(manager.workflow.dream_dir)
+            Path(self._manager.workflow.dream_dir)
+            / DREAM_BATCH_FILTER_PRESET_DIR_NAME
+        )
+
+    def _legacy_project_filter_list_preset_dir(self) -> Path | None:
+        if self._manager is None:
+            return None
+        return (
+            Path(self._manager.workflow.dream_dir)
             / DREAM_BATCH_FILTER_LIST_PRESET_DIR_NAME
         )
 
@@ -2382,9 +2578,17 @@ class DreamBatchRunFileWindow(QMainWindow):
                     or "default_filter",
                     settings=settings,
                 )
+            export_plot_data = bool(self.export_plot_data_checkbox.isChecked())
+            if export_plot_data and not self._confirm_export_plot_data():
+                self._set_status("Shell script generation cancelled.")
+                return
+            manager.run_set.export_plot_data = export_plot_data
+            manager.save_manifest()
             script_path, commands_path = manager.generate_shell_script(
                 new_run_set_dir=True
             )
+            manager.run_set.export_plot_data = export_plot_data
+            manager.save_manifest()
             self.run_set_edit.setText(
                 str(manager.run_set.resolved_run_set_dir)
             )
@@ -2402,6 +2606,42 @@ class DreamBatchRunFileWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "DREAM Backend Batch Setup", str(exc))
             self._set_status("Shell script generation failed.")
+
+    def _confirm_export_plot_data(self) -> bool:
+        response = QMessageBox.question(
+            self,
+            "Confirm DREAM Plot Data Export",
+            (
+                "Plot data export is enabled for this DREAM batch run.\n\n"
+                "The runner will write model-fit CSV files, violin sample "
+                "CSV files, and metrics JSON files for every completed "
+                "fit/filter pair. Large batches can create GB of data.\n\n"
+                "Continue with plot data export enabled?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return response == QMessageBox.StandardButton.Yes
+
+    def _on_export_plot_data_toggled(self, checked: bool) -> None:
+        if self._manager is None:
+            return
+        self._manager.run_set.export_plot_data = bool(checked)
+        self._manager.save_manifest()
+        self._refresh_command_box()
+
+    def _sync_export_plot_data_checkbox(self) -> None:
+        if not hasattr(self, "export_plot_data_checkbox"):
+            return
+        checked = bool(
+            self._manager is not None
+            and self._manager.run_set.export_plot_data
+        )
+        was_blocked = self.export_plot_data_checkbox.blockSignals(True)
+        try:
+            self.export_plot_data_checkbox.setChecked(checked)
+        finally:
+            self.export_plot_data_checkbox.blockSignals(was_blocked)
 
     def _reveal_command_set_file(self, *_args: object) -> None:
         try:

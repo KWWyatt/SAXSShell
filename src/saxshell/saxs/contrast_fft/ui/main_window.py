@@ -102,6 +102,7 @@ from saxshell.saxs.ui._pane_snap import PaneSnapFilter
 from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
 
@@ -4885,10 +4886,7 @@ def launch_3d_fft_born_approximation_ui(
     )
     window.show()
     window.raise_()
-    _OPEN_WINDOWS.append(window)
-    window.destroyed.connect(
-        lambda _obj=None, win=window: _forget_open_window(win)
-    )
+    track_saxshell_window(window, _OPEN_WINDOWS)
     return window
 
 

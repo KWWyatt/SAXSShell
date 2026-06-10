@@ -12,6 +12,7 @@ import numpy as np
 StructureDistributionCategory = Literal[
     "bond",
     "angle",
+    "dihedral",
     "coordination",
     "cutoff_pair",
 ]
@@ -301,6 +302,24 @@ def _collect_bond_angle_entry(
                 structure_id=structure_id,
                 values=values,
             )
+    dihedral_arrays = entry.get("dihedral_arrays", {})
+    if isinstance(dihedral_arrays, dict):
+        for definition_id, array_key in dihedral_arrays.items():
+            values = arrays.get(str(array_key))
+            if values is None:
+                missing += 1
+                continue
+            _add_values(
+                aggregates,
+                source_name=source_name,
+                category="dihedral",
+                definition_id=str(definition_id),
+                display_label=_dihedral_definition_label(str(definition_id)),
+                xlabel="Dihedral (deg)",
+                cluster_label=cluster_label,
+                structure_id=structure_id,
+                values=values,
+            )
     coordination_arrays = entry.get("coordination_arrays", {})
     if isinstance(coordination_arrays, dict):
         for definition_id, array_key in coordination_arrays.items():
@@ -470,8 +489,9 @@ def _category_sort_key(category: StructureDistributionCategory) -> int:
     return {
         "bond": 0,
         "angle": 1,
-        "coordination": 2,
-        "cutoff_pair": 3,
+        "dihedral": 2,
+        "coordination": 3,
+        "cutoff_pair": 4,
     }.get(category, 99)
 
 
@@ -515,6 +535,24 @@ def _coordination_definition_label(definition_id: str) -> str:
     if cutoff is None:
         return label
     return f"{label} <= {cutoff:g} A"
+
+
+def _dihedral_definition_label(definition_id: str) -> str:
+    payload = _definition_payload(definition_id)
+    atom1 = str(payload.get("atom1", "")).strip()
+    atom2 = str(payload.get("atom2", "")).strip()
+    atom3 = str(payload.get("atom3", "")).strip()
+    atom4 = str(payload.get("atom4", "")).strip()
+    cutoff12 = _optional_float(payload.get("cutoff12_angstrom"))
+    cutoff23 = _optional_float(payload.get("cutoff23_angstrom"))
+    cutoff34 = _optional_float(payload.get("cutoff34_angstrom"))
+    label = (
+        "-".join(part for part in (atom1, atom2, atom3, atom4) if part)
+        or definition_id
+    )
+    if cutoff12 is None or cutoff23 is None or cutoff34 is None:
+        return label
+    return f"{label} <= {cutoff12:g}/{cutoff23:g}/{cutoff34:g} A"
 
 
 def _pair_definition_label(pair_key: str) -> str:

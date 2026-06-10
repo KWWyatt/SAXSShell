@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import math
 import sys
+import threading
 from pathlib import Path
+from typing import Callable, Mapping, Sequence
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -27,6 +31,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -45,6 +50,7 @@ from saxshell.bondanalysis import (
     BondAnalysisWorkflow,
     BondPairDefinition,
     CoordinationNumberDefinition,
+    DihedralQuartetDefinition,
     load_presets,
     ordered_preset_names,
     save_custom_preset,
@@ -66,9 +72,11 @@ from saxshell.saxs.project_manager import (
     build_project_paths,
 )
 from saxshell.saxs.ui.branding import (
+    build_saxshell_stylesheet,
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
 from saxshell.saxs.ui.project_status_label import CompactProjectStatusLabel
@@ -78,6 +86,8 @@ from saxshell.structure_distributions import (
 
 _OPEN_WINDOWS: list["BondAnalysisMainWindow"] = []
 BOND_ANALYSIS_WINDOW_LOAD_TOTAL_STEPS = 5
+SELECTION_PREVIEW_TOTAL_STEPS = 4
+SELECTION_PREVIEW_DEBOUNCE_MS = 350
 
 
 def _safe_path_label(value: str) -> str:
@@ -96,6 +106,56 @@ def _has_results_index(output_dir: str | Path) -> bool:
             LEGACY_RESULTS_INDEX_FILENAME,
         )
     )
+
+
+def _result_index_paths_below(root: str | Path) -> tuple[Path, ...]:
+    root_path = Path(root).expanduser()
+    if root_path.is_file() and root_path.name in {
+        RESULTS_INDEX_FILENAME,
+        LEGACY_RESULTS_INDEX_FILENAME,
+    }:
+        return (root_path,)
+    if not root_path.is_dir():
+        return ()
+
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    candidate_dirs = [root_path]
+    try:
+        candidate_dirs.extend(
+            child for child in root_path.iterdir() if child.is_dir()
+        )
+    except OSError:
+        candidate_dirs = [root_path]
+
+    for directory in candidate_dirs:
+        for filename in (
+            RESULTS_INDEX_FILENAME,
+            LEGACY_RESULTS_INDEX_FILENAME,
+        ):
+            candidate = directory / filename
+            if not candidate.is_file():
+                continue
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                resolved = candidate
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            paths.append(candidate)
+    paths.sort(
+        key=lambda path: (_safe_mtime(path), str(path)),
+        reverse=True,
+    )
+    return tuple(paths)
+
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 class CollapsibleSection(QWidget):
@@ -155,10 +215,15 @@ class BondAnalysisWorker(QObject):
     status = Signal(str)
     finished = Signal(object)
     failed = Signal(str)
+    canceled = Signal(str)
 
     def __init__(self, workflow: BondAnalysisWorkflow) -> None:
         super().__init__()
         self.workflow = workflow
+        self._cancel_requested = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
 
     @Slot()
     def run(self) -> None:
@@ -166,8 +231,11 @@ class BondAnalysisWorker(QObject):
             result = self.workflow.run(
                 progress_callback=self._emit_progress,
                 log_callback=self.log.emit,
+                cancel_callback=self._cancel_requested.is_set,
             )
             self.finished.emit(result)
+        except InterruptedError as exc:
+            self.canceled.emit(str(exc))
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -183,6 +251,8 @@ class BondAnalysisWorker(QObject):
 
 class BondAnalysisMainWindow(QMainWindow):
     """Main Qt window for bond-pair and angle-distribution analysis."""
+
+    plot_window_opened = Signal(object)
 
     def __init__(
         self,
@@ -200,11 +270,34 @@ class BondAnalysisMainWindow(QMainWindow):
         self._run_thread: QThread | None = None
         self._run_worker: BondAnalysisWorker | None = None
         self._active_run_status = ""
+        self._run_is_saving_distribution_outputs = False
+        self._run_cancel_requested = False
+        self._close_after_run_cancel = False
         self._presets: dict[str, BondAnalysisPreset] = {}
         self._results_index: BondAnalysisResultIndex | None = None
+        self._stored_result_indices_cache: dict[
+            tuple[str, ...],
+            tuple[BondAnalysisResultIndex, ...],
+        ] = {}
         self._plot_windows: list[BondAnalysisPlotWindow] = []
         self._startup_progress_dialog: SAXSProgressDialog | None = None
         self._last_startup_load_message = ""
+        self._selection_summary_progress_dialog: SAXSProgressDialog | None = (
+            None
+        )
+        self._last_selection_summary_progress_message = ""
+        self._selection_summary_pending_show_progress = False
+        self._selection_summary_pending_reason = (
+            "Refreshing selection preview..."
+        )
+        self._selection_summary_timer = QTimer(self)
+        self._selection_summary_timer.setSingleShot(True)
+        self._selection_summary_timer.setInterval(
+            SELECTION_PREVIEW_DEBOUNCE_MS
+        )
+        self._selection_summary_timer.timeout.connect(
+            self._run_scheduled_selection_summary_update
+        )
         self._begin_startup_load_progress("Preparing Bond Analysis window...")
         try:
             self._update_startup_load_progress(
@@ -275,13 +368,25 @@ class BondAnalysisMainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._run_thread is not None and self._run_thread.isRunning():
-            QMessageBox.warning(
+            if self._close_after_run_cancel:
+                event.ignore()
+                return
+            response = QMessageBox.warning(
                 self,
-                "Bond Analysis",
-                "Please wait for the current bond-analysis run to finish "
-                "before closing this window.\n\nCurrent step: "
+                "Cancel Bond Analysis?",
+                "A bond-analysis run is still active. You can cancel it at "
+                "the next safe checkpoint and close this window, or keep the "
+                "run going.\n\nCurrent step: "
                 f"{self._active_run_status or 'running'}",
+                (
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No
+                ),
+                QMessageBox.StandardButton.No,
             )
+            if response == QMessageBox.StandardButton.Yes:
+                self._request_run_cancel(close_when_finished=True)
+                self.hide()
             event.ignore()
             return
         super().closeEvent(event)
@@ -299,7 +404,7 @@ class BondAnalysisMainWindow(QMainWindow):
 
         self.project_banner = None
 
-        root.addWidget(self._build_header())
+        root.addWidget(self._build_header(), stretch=0)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_left_panel())
@@ -307,7 +412,7 @@ class BondAnalysisMainWindow(QMainWindow):
         splitter.setObjectName("BondAnalysisSplitter")
         splitter.setSizes([560, 760])
 
-        root.addWidget(splitter)
+        root.addWidget(splitter, stretch=1)
         self.setCentralWidget(central)
         self._apply_presentation_style()
         self.project_status_label = self._build_project_status_label()
@@ -318,11 +423,19 @@ class BondAnalysisMainWindow(QMainWindow):
     def _build_header(self) -> QWidget:
         header = QFrame()
         header.setObjectName("BondAnalysisHeader")
+        header.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(16, 12, 16, 12)
         header_layout.setSpacing(12)
 
         title_block = QWidget()
+        title_block.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         title_layout = QVBoxLayout(title_block)
         title_layout.setContentsMargins(0, 0, 0, 0)
         title_layout.setSpacing(2)
@@ -332,7 +445,7 @@ class BondAnalysisMainWindow(QMainWindow):
         title_layout.addWidget(title_label)
 
         subtitle_label = QLabel(
-            "Bond, angle, and coordination-distribution workspace"
+            "Bond, angle, dihedral, and coordination-distribution workspace"
         )
         subtitle_label.setObjectName("BondAnalysisSubtitle")
         title_layout.addWidget(subtitle_label)
@@ -345,113 +458,21 @@ class BondAnalysisMainWindow(QMainWindow):
         self.window_context_label = QLabel(context_text)
         self.window_context_label.setObjectName("BondAnalysisContextPill")
         self.window_context_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header_layout.addWidget(self.window_context_label)
+        self.window_context_label.setSizePolicy(
+            QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Fixed,
+        )
+        header_layout.addWidget(
+            self.window_context_label,
+            alignment=Qt.AlignmentFlag.AlignVCenter,
+        )
         return header
 
     def _apply_presentation_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QWidget#BondAnalysisCentral {
-                background: #f6f7f9;
-            }
-            QFrame#BondAnalysisHeader {
-                background: #ffffff;
-                border: 1px solid #d9dee7;
-                border-radius: 8px;
-            }
-            QLabel#BondAnalysisTitle {
-                color: #172033;
-                font-size: 20px;
-                font-weight: 700;
-            }
-            QLabel#BondAnalysisSubtitle {
-                color: #5d6678;
-                font-size: 12px;
-            }
-            QLabel#BondAnalysisContextPill {
-                background: #e8f1ff;
-                border: 1px solid #bfd4f6;
-                border-radius: 10px;
-                color: #1d4f91;
-                font-weight: 600;
-                padding: 4px 10px;
-            }
-            QGroupBox {
-                background: #ffffff;
-                border: 1px solid #d9dee7;
-                border-radius: 8px;
-                margin-top: 18px;
-                padding: 10px;
-                font-weight: 600;
-                color: #253047;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 4px;
-            }
-            QToolButton#CollapsibleSectionHeader {
-                background: #ffffff;
-                border: 1px solid #d9dee7;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-                color: #253047;
-                font-weight: 600;
-                padding: 8px;
-                text-align: left;
-            }
-            QFrame#CollapsibleSectionContent {
-                background: #ffffff;
-                border: 1px solid #d9dee7;
-                border-top: 0;
-                border-bottom-left-radius: 8px;
-                border-bottom-right-radius: 8px;
-            }
-            QLineEdit, QTextEdit, QListWidget, QTreeWidget, QTableWidget {
-                background: #ffffff;
-                border: 1px solid #cfd6e2;
-                border-radius: 5px;
-                selection-background-color: #2563eb;
-            }
-            QPushButton {
-                background: #f8fafc;
-                border: 1px solid #cbd5e1;
-                border-radius: 5px;
-                padding: 5px 10px;
-            }
-            QPushButton:hover {
-                background: #eef4ff;
-                border-color: #8fb3e8;
-            }
-            QPushButton#PrimaryActionButton {
-                background: #1f6feb;
-                border-color: #1b5ec9;
-                color: #ffffff;
-                font-weight: 600;
-                padding: 8px 12px;
-            }
-            QPushButton#PrimaryActionButton:hover {
-                background: #1b5ec9;
-            }
-            QLabel#MutedPanelLabel {
-                background: #f8fafc;
-                border: 1px solid #e1e7ef;
-                border-radius: 6px;
-                color: #596579;
-                padding: 8px;
-            }
-            QProgressBar {
-                border: 1px solid #cfd6e2;
-                border-radius: 5px;
-                background: #f8fafc;
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                background: #2f7de1;
-                border-radius: 4px;
-            }
-            """
-        )
+        app = QApplication.instance()
+        if app is not None and app.styleSheet() == build_saxshell_stylesheet():
+            return
+        self.setStyleSheet(build_saxshell_stylesheet())
 
     def _begin_startup_load_progress(self, message: str) -> None:
         dialog = SAXSProgressDialog(self)
@@ -519,6 +540,81 @@ class BondAnalysisMainWindow(QMainWindow):
         self._last_startup_load_message = ""
         if self._startup_progress_dialog is not None:
             self._startup_progress_dialog.close()
+
+    def _begin_selection_summary_progress(self, message: str) -> None:
+        dialog = self._selection_summary_progress_dialog
+        if dialog is None:
+            dialog = SAXSProgressDialog(self)
+            self._selection_summary_progress_dialog = dialog
+        self._last_selection_summary_progress_message = ""
+        dialog.begin(
+            SELECTION_PREVIEW_TOTAL_STEPS,
+            message,
+            unit_label="steps",
+            title="Updating Selection Preview",
+        )
+        self._append_selection_summary_progress_output(message)
+        QApplication.processEvents()
+
+    def _update_selection_summary_progress(
+        self,
+        processed: int,
+        total: int,
+        message: str,
+    ) -> None:
+        if self._selection_summary_progress_dialog is None:
+            return
+        self._selection_summary_progress_dialog.update_progress(
+            processed,
+            total,
+            message,
+            unit_label="steps",
+        )
+        self._append_selection_summary_progress_output(message)
+        self.statusBar().showMessage(message)
+        QApplication.processEvents()
+
+    def _append_selection_summary_progress_output(self, message: str) -> None:
+        stripped = str(message).strip()
+        if (
+            not stripped
+            or self._selection_summary_progress_dialog is None
+            or stripped == self._last_selection_summary_progress_message
+        ):
+            return
+        self._last_selection_summary_progress_message = stripped
+        self._selection_summary_progress_dialog.append_output(stripped)
+
+    def _close_selection_summary_progress_dialog(self) -> None:
+        self._last_selection_summary_progress_message = ""
+        if self._selection_summary_progress_dialog is not None:
+            self._selection_summary_progress_dialog.close()
+
+    def _schedule_selection_summary_update(
+        self,
+        *_args,
+        reason: str = "Selection changed; refreshing preview...",
+        show_progress: bool = False,
+    ) -> None:
+        if not hasattr(self, "_selection_summary_timer"):
+            return
+        self._selection_summary_pending_reason = reason
+        self._selection_summary_pending_show_progress = (
+            self._selection_summary_pending_show_progress or show_progress
+        )
+        self._selection_summary_timer.start(SELECTION_PREVIEW_DEBOUNCE_MS)
+
+    def _run_scheduled_selection_summary_update(self) -> None:
+        show_progress = self._selection_summary_pending_show_progress
+        reason = self._selection_summary_pending_reason
+        self._selection_summary_pending_show_progress = False
+        self._selection_summary_pending_reason = (
+            "Refreshing selection preview..."
+        )
+        self._update_selection_summary(
+            show_progress=show_progress,
+            progress_message=reason,
+        )
 
     def _load_project_settings(self) -> ProjectSettings | None:
         if self._project_dir is None:
@@ -603,15 +699,307 @@ class BondAnalysisMainWindow(QMainWindow):
 
     def _load_default_existing_results_if_available(self) -> None:
         output_dir = self._output_dir_path()
-        if output_dir is None or not _has_results_index(output_dir):
-            return
-        try:
-            self.load_existing_results_dir(output_dir)
-        except Exception as exc:
-            self._append_log(
-                "Unable to load existing bondanalysis results from "
-                f"{output_dir}: {exc}"
+        candidate_dirs: list[Path] = []
+        if output_dir is not None and _has_results_index(output_dir):
+            candidate_dirs.append(output_dir)
+        clusters_dir = self._clusters_dir_path()
+        candidate_dirs.extend(
+            self._discover_existing_result_dirs_for_clusters(clusters_dir)
+        )
+        seen: set[Path] = set()
+        for candidate_dir in candidate_dirs:
+            resolved = candidate_dir.expanduser().resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                self.load_existing_results_dir(candidate_dir)
+                return
+            except Exception as exc:
+                self._append_log(
+                    "Unable to load existing bondanalysis results from "
+                    f"{candidate_dir}: {exc}"
+                )
+
+    def _discover_existing_result_dirs_for_clusters(
+        self,
+        clusters_dir: Path | None,
+    ) -> list[Path]:
+        return [
+            result_index.output_dir
+            for result_index in (
+                self._discover_existing_result_indices_for_clusters(
+                    clusters_dir
+                )
             )
+        ]
+
+    def _discover_existing_result_indices_for_clusters(
+        self,
+        clusters_dir: Path | None,
+    ) -> list[BondAnalysisResultIndex]:
+        if clusters_dir is None:
+            return []
+        roots = self._result_index_search_roots(clusters_dir)
+        cache_key = self._stored_result_indices_cache_key(
+            clusters_dir,
+            roots,
+        )
+        cached_indices = self._stored_result_indices_cache.get(cache_key)
+        if cached_indices is not None:
+            return list(cached_indices)
+
+        expected_clusters_dir = clusters_dir.expanduser().resolve()
+        result_indices: list[BondAnalysisResultIndex] = []
+        seen_paths: set[Path] = set()
+        for root in roots:
+            for index_path in _result_index_paths_below(root):
+                resolved_index = index_path.resolve()
+                if resolved_index in seen_paths:
+                    continue
+                seen_paths.add(resolved_index)
+                try:
+                    result_index = load_result_index(index_path.parent)
+                except Exception:
+                    continue
+                if (
+                    result_index.clusters_dir.expanduser().resolve()
+                    != expected_clusters_dir
+                ):
+                    continue
+                result_indices.append(result_index)
+        result_indices.sort(
+            key=lambda result_index: (
+                result_index.results_index_path.stat().st_mtime,
+                str(result_index.results_index_path),
+            ),
+            reverse=True,
+        )
+        self._stored_result_indices_cache[cache_key] = tuple(result_indices)
+        return result_indices
+
+    def _result_index_search_roots(self, clusters_dir: Path) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[Path] = set()
+
+        def append_root(root: Path) -> None:
+            root = root.expanduser()
+            try:
+                resolved = root.resolve()
+            except OSError:
+                resolved = root
+            if resolved in seen:
+                return
+            seen.add(resolved)
+            roots.append(root)
+
+        output_dir = self._output_dir_path()
+        if output_dir is not None:
+            append_root(output_dir.parent)
+        if self._project_dir is not None:
+            append_root(
+                build_project_paths(self._project_dir).analysis_dir
+                / "bondanalysis"
+            )
+        append_root(clusters_dir.expanduser().parent)
+        return roots
+
+    def _stored_result_indices_cache_key(
+        self,
+        clusters_dir: Path,
+        roots: Sequence[Path],
+    ) -> tuple[str, ...]:
+        try:
+            clusters_token = str(clusters_dir.expanduser().resolve())
+        except OSError:
+            clusters_token = str(clusters_dir.expanduser())
+        return (
+            clusters_token,
+            *(self._path_cache_token(root) for root in roots),
+        )
+
+    @staticmethod
+    def _path_cache_token(path: Path) -> str:
+        expanded = path.expanduser()
+        try:
+            resolved = expanded.resolve()
+        except OSError:
+            resolved = expanded
+        try:
+            mtime_ns = resolved.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = -1
+        return f"{resolved}:{mtime_ns}"
+
+    def _invalidate_stored_result_indices_cache(self) -> None:
+        self._stored_result_indices_cache.clear()
+
+    def _stored_results_preview_lines(
+        self,
+        *,
+        clusters_dir: Path,
+        selected_cluster_types: list[str] | None,
+        bond_pairs: Sequence[BondPairDefinition] | None,
+        angle_triplets: Sequence[AngleTripletDefinition] | None,
+        dihedral_quartets: Sequence[DihedralQuartetDefinition] | None,
+        coordination_numbers: Sequence[CoordinationNumberDefinition] | None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> list[str]:
+        if progress_callback is not None:
+            progress_callback(
+                2,
+                SELECTION_PREVIEW_TOTAL_STEPS,
+                "Searching for stored bond-analysis results...",
+            )
+        result_indices = self._discover_existing_result_indices_for_clusters(
+            clusters_dir
+        )
+        if not result_indices:
+            if progress_callback is not None:
+                progress_callback(
+                    SELECTION_PREVIEW_TOTAL_STEPS,
+                    SELECTION_PREVIEW_TOTAL_STEPS,
+                    "Selection preview ready.",
+                )
+            return [
+                "Stored computed runs for this clusters directory: none found"
+            ]
+
+        if progress_callback is not None:
+            progress_callback(
+                3,
+                SELECTION_PREVIEW_TOTAL_STEPS,
+                "Comparing current selections to stored runs...",
+            )
+        lines = [
+            "Stored computed runs for this clusters directory: "
+            f"{len(result_indices)}"
+        ]
+        current_signature = self._current_selection_analysis_signature(
+            clusters_dir=clusters_dir,
+            selected_cluster_types=selected_cluster_types,
+            bond_pairs=bond_pairs,
+            angle_triplets=angle_triplets,
+            dihedral_quartets=dihedral_quartets,
+            coordination_numbers=coordination_numbers,
+        )
+        exact_match = None
+        if current_signature is not None:
+            exact_match = next(
+                (
+                    result_index
+                    for result_index in result_indices
+                    if result_index.analysis_signature == current_signature
+                ),
+                None,
+            )
+        if exact_match is not None:
+            lines.append(
+                "Current settings match stored run: "
+                f"{exact_match.output_dir} (Run will reuse without "
+                "recalculation)."
+            )
+
+        for result_index in result_indices[:3]:
+            summary = self._stored_result_distribution_summary(result_index)
+            cluster_count = len(result_index.cluster_type_names)
+            gds_count = len(result_index.gds_variable_registry)
+            exact_suffix = (
+                "; exact current settings"
+                if result_index is exact_match
+                else ""
+            )
+            lines.append(
+                f"- {result_index.output_dir}: "
+                f"{cluster_count} cluster type(s); {summary}; "
+                f"{gds_count} GDS variable(s){exact_suffix}"
+            )
+        if len(result_indices) > 3:
+            lines.append(
+                f"- ... {len(result_indices) - 3} older stored run(s) also "
+                "available"
+            )
+        if progress_callback is not None:
+            progress_callback(
+                SELECTION_PREVIEW_TOTAL_STEPS,
+                SELECTION_PREVIEW_TOTAL_STEPS,
+                "Selection preview ready.",
+            )
+        return lines
+
+    def _current_selection_analysis_signature(
+        self,
+        *,
+        clusters_dir: Path,
+        selected_cluster_types: list[str] | None,
+        bond_pairs: Sequence[BondPairDefinition] | None,
+        angle_triplets: Sequence[AngleTripletDefinition] | None,
+        dihedral_quartets: Sequence[DihedralQuartetDefinition] | None,
+        coordination_numbers: Sequence[CoordinationNumberDefinition] | None,
+    ) -> str | None:
+        if (
+            bond_pairs is None
+            or angle_triplets is None
+            or dihedral_quartets is None
+            or coordination_numbers is None
+        ):
+            return None
+        if not (
+            bond_pairs
+            or angle_triplets
+            or dihedral_quartets
+            or coordination_numbers
+        ):
+            return None
+        try:
+            workflow = BondAnalysisWorkflow(
+                clusters_dir,
+                bond_pairs=bond_pairs,
+                angle_triplets=angle_triplets,
+                dihedral_quartets=dihedral_quartets,
+                coordination_numbers=coordination_numbers,
+                output_dir=self._output_dir_path(),
+                selected_cluster_types=selected_cluster_types,
+            )
+            return workflow.analysis_signature()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _stored_result_distribution_summary(
+        result_index: BondAnalysisResultIndex,
+    ) -> str:
+        parts = [
+            BondAnalysisMainWindow._count_label(
+                len(result_index.bond_groups),
+                "bond pair",
+                "bond pairs",
+            ),
+            BondAnalysisMainWindow._count_label(
+                len(result_index.angle_groups),
+                "angle",
+                "angles",
+            ),
+            BondAnalysisMainWindow._count_label(
+                len(result_index.dihedral_groups),
+                "dihedral",
+                "dihedrals",
+            ),
+            BondAnalysisMainWindow._count_label(
+                len(result_index.coordination_groups),
+                "coordination rule",
+                "coordination rules",
+            ),
+        ]
+        nonzero_parts = [part for part in parts if part]
+        return ", ".join(nonzero_parts) or "no browsable distributions"
+
+    @staticmethod
+    def _count_label(count: int, singular: str, plural: str) -> str:
+        if count <= 0:
+            return ""
+        label = singular if count == 1 else plural
+        return f"{count} {label}"
 
     def _build_left_panel(self) -> QWidget:
         left = QWidget()
@@ -624,6 +1012,7 @@ class BondAnalysisMainWindow(QMainWindow):
         layout.addWidget(self._build_cluster_types_group())
         layout.addWidget(self._build_bond_pairs_group())
         layout.addWidget(self._build_angle_triplets_group())
+        layout.addWidget(self._build_dihedral_quartets_group())
         layout.addWidget(self._build_coordination_numbers_group())
         layout.addStretch(1)
 
@@ -646,13 +1035,14 @@ class BondAnalysisMainWindow(QMainWindow):
         run_group = QGroupBox("Run")
         run_layout = QVBoxLayout(run_group)
         self.run_button = QPushButton(
-            "Analyze Bond, Angle, and Coordination Distributions"
+            "Analyze Bond, Angle, Dihedral, and Coordination Distributions"
         )
         self.run_button.setObjectName("PrimaryActionButton")
         self.run_button.clicked.connect(self._start_run)
         run_layout.addWidget(self.run_button)
 
         self.progress_label = QLabel("Progress: idle")
+        self.progress_label.setWordWrap(True)
         run_layout.addWidget(self.progress_label)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
@@ -698,18 +1088,18 @@ class BondAnalysisMainWindow(QMainWindow):
         self.refresh_results_button.clicked.connect(self._refresh_results_tree)
         controls.addWidget(self.refresh_results_button)
 
-        self.open_selected_window_button = QPushButton(
-            "Open Selected in Window"
-        )
+        self.open_selected_window_button = QPushButton("Open Selected in Tab")
         self.open_selected_window_button.clicked.connect(
             self._open_selected_plot_window
         )
         controls.addWidget(self.open_selected_window_button)
 
-        self.open_all_all_plots_button = QPushButton("Open All 'All' Plots")
+        self.open_all_all_plots_button = QPushButton(
+            "Open All 'All' Plot Tabs"
+        )
         self.open_all_all_plots_button.setToolTip(
             "Open every non-empty all-cluster distribution as tabs in the "
-            "plot window."
+            "plot workspace."
         )
         self.open_all_all_plots_button.clicked.connect(
             self._open_all_all_cluster_plot_windows
@@ -718,8 +1108,8 @@ class BondAnalysisMainWindow(QMainWindow):
 
         self.show_output_folder_button = QPushButton("Show Output Folder")
         self.show_output_folder_button.setToolTip(
-            "Open the computed bond, angle, and coordination output folder "
-            "in Finder."
+            "Open the computed bond, angle, dihedral, and coordination "
+            "output folder in Finder."
         )
         self.show_output_folder_button.clicked.connect(
             self._show_output_folder
@@ -732,6 +1122,10 @@ class BondAnalysisMainWindow(QMainWindow):
         self.results_tree.setColumnCount(3)
         self.results_tree.setHeaderLabels(["Distribution", "Scope", "Values"])
         self.results_tree.setAlternatingRowColors(True)
+        self.results_tree.setAnimated(True)
+        self.results_tree.setItemsExpandable(True)
+        self.results_tree.setRootIsDecorated(True)
+        self.results_tree.setExpandsOnDoubleClick(True)
         self.results_tree.setMinimumHeight(220)
         self.results_tree.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
@@ -754,14 +1148,52 @@ class BondAnalysisMainWindow(QMainWindow):
         )
         layout.addWidget(self.results_tree, stretch=1)
 
+        self.results_stats_table = QTableWidget(0, 9)
+        self.results_stats_table.setHorizontalHeaderLabels(
+            [
+                "Type",
+                "Distribution",
+                "N",
+                "Average",
+                "Median",
+                "Sigma",
+                "Unit",
+                "GDS Center Var",
+                "GDS Sigma Var",
+            ]
+        )
+        self.results_stats_table.setAlternatingRowColors(True)
+        self.results_stats_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.results_stats_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.results_stats_table.verticalHeader().setVisible(False)
+        self.results_stats_table.setMinimumHeight(150)
+        self.results_stats_table.horizontalHeader().setStretchLastSection(True)
+        self.results_stats_table.horizontalHeader().setSectionResizeMode(
+            1,
+            QHeaderView.ResizeMode.Stretch,
+        )
+        for column in (0, 2, 3, 4, 5, 6):
+            self.results_stats_table.horizontalHeader().setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+        layout.addWidget(self.results_stats_table)
+
         self.results_hint_label = QLabel(
-            "Select one computed bond, angle, or coordination distribution and use "
-            "'Open Selected in Window' to view it. Select multiple leaves "
-            "of the same type across different cluster types to overlay "
-            "them together in a separate window. The 'all' entry opens that "
-            "distribution across all cluster types, and "
-            "\"Open All 'All' Plots\" opens every non-empty all-cluster "
-            "distribution as plot tabs."
+            "Select one computed bond, angle, dihedral, or coordination "
+            "distribution and use 'Open Selected in Tab' to view it. "
+            "Select a distribution-name row to open its all-cluster plot "
+            "without expanding that distribution; Cmd-click or Ctrl-click "
+            "distribution-name rows to open multiple all-cluster plots. "
+            "Select multiple leaves of the same type across different "
+            "cluster types to overlay them together in a plot tab. "
+            "The 'all' entry opens that distribution across all cluster "
+            "types, and \"Open All 'All' Plot Tabs\" opens every non-empty "
+            "all-cluster distribution in the plot workspace."
         )
         self.results_hint_label.setWordWrap(True)
         layout.addWidget(self.results_hint_label)
@@ -822,9 +1254,6 @@ class BondAnalysisMainWindow(QMainWindow):
 
         row = QHBoxLayout()
         self.preset_combo = QComboBox()
-        self.preset_combo.currentIndexChanged.connect(
-            lambda _index: self._update_selection_summary()
-        )
         self.preset_combo.setToolTip(
             "Load a built-in bondanalysis preset or a custom preset saved "
             "from a previous session."
@@ -856,12 +1285,9 @@ class BondAnalysisMainWindow(QMainWindow):
         layout.setSpacing(8)
 
         self.use_checked_cluster_types_box = QCheckBox(
-            "Analyze only checked cluster types"
+            "Analyze all cluster types"
         )
         self.use_checked_cluster_types_box.setChecked(True)
-        self.use_checked_cluster_types_box.toggled.connect(
-            lambda _checked: self._update_selection_summary()
-        )
         layout.addWidget(self.use_checked_cluster_types_box)
 
         self.cluster_type_list = QListWidget()
@@ -874,6 +1300,9 @@ class BondAnalysisMainWindow(QMainWindow):
             lambda _item: self._update_selection_summary()
         )
         layout.addWidget(self.cluster_type_list)
+        self.use_checked_cluster_types_box.toggled.connect(
+            self._on_analyze_all_cluster_types_toggled
+        )
 
         self.cluster_type_status_label = QLabel("No clusters loaded.")
         self.cluster_type_status_label.setWordWrap(True)
@@ -881,6 +1310,8 @@ class BondAnalysisMainWindow(QMainWindow):
         layout.addWidget(self.cluster_type_status_label)
 
         self.cluster_types_section.set_content_layout(layout)
+        self._update_cluster_type_interactivity()
+        self.cluster_types_section.set_collapsed(True)
         return self.cluster_types_section
 
     def _build_bond_pairs_group(self) -> QGroupBox:
@@ -908,7 +1339,9 @@ class BondAnalysisMainWindow(QMainWindow):
         layout.addWidget(self.bond_pair_table)
         self._add_bond_pair_row()
         self.bond_pair_table.itemChanged.connect(
-            lambda _item: self._update_selection_summary()
+            lambda _item: self._schedule_selection_summary_update(
+                reason="Bond pair settings changed; refreshing preview..."
+            )
         )
         return group
 
@@ -943,7 +1376,54 @@ class BondAnalysisMainWindow(QMainWindow):
         layout.addWidget(self.angle_triplet_table)
         self._add_angle_triplet_row()
         self.angle_triplet_table.itemChanged.connect(
-            lambda _item: self._update_selection_summary()
+            lambda _item: self._schedule_selection_summary_update(
+                reason="Angle triplet settings changed; refreshing preview..."
+            )
+        )
+        return group
+
+    def _build_dihedral_quartets_group(self) -> QGroupBox:
+        group = QGroupBox("Dihedral Quartets")
+        layout = QVBoxLayout(group)
+
+        controls = QHBoxLayout()
+        add_button = QPushButton("Add Dihedral Quartet")
+        add_button.clicked.connect(self._add_dihedral_quartet_row)
+        remove_button = QPushButton("Remove Selected")
+        remove_button.clicked.connect(
+            self._remove_selected_dihedral_quartet_rows
+        )
+        controls.addWidget(add_button)
+        controls.addWidget(remove_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.dihedral_quartet_table = QTableWidget(0, 7)
+        self.dihedral_quartet_table.setHorizontalHeaderLabels(
+            [
+                "Atom 1",
+                "Atom 2",
+                "Atom 3",
+                "Atom 4",
+                "1-2 Cutoff (A)",
+                "2-3 Cutoff (A)",
+                "3-4 Cutoff (A)",
+            ]
+        )
+        self.dihedral_quartet_table.setAlternatingRowColors(True)
+        self.dihedral_quartet_table.verticalHeader().setVisible(False)
+        self.dihedral_quartet_table.setMinimumHeight(150)
+        self.dihedral_quartet_table.horizontalHeader().setStretchLastSection(
+            True
+        )
+        layout.addWidget(self.dihedral_quartet_table)
+        self._add_dihedral_quartet_row()
+        self.dihedral_quartet_table.itemChanged.connect(
+            lambda _item: self._schedule_selection_summary_update(
+                reason=(
+                    "Dihedral quartet settings changed; refreshing preview..."
+                )
+            )
         )
         return group
 
@@ -976,7 +1456,12 @@ class BondAnalysisMainWindow(QMainWindow):
         layout.addWidget(self.coordination_number_table)
         self._add_coordination_number_row()
         self.coordination_number_table.itemChanged.connect(
-            lambda _item: self._update_selection_summary()
+            lambda _item: self._schedule_selection_summary_update(
+                reason=(
+                    "Coordination-number settings changed; refreshing "
+                    "preview..."
+                )
+            )
         )
         return group
 
@@ -1042,6 +1527,7 @@ class BondAnalysisMainWindow(QMainWindow):
 
     def load_existing_results_dir(self, output_dir: str | Path) -> None:
         result_index = load_result_index(output_dir)
+        self._invalidate_stored_result_indices_cache()
         self._results_index = result_index
         self.output_dir_edit.blockSignals(True)
         self.output_dir_edit.setText(str(result_index.output_dir))
@@ -1052,6 +1538,7 @@ class BondAnalysisMainWindow(QMainWindow):
         self._register_project_clusters_dir()
         self._set_bond_pair_rows(result_index.bond_pairs)
         self._set_angle_triplet_rows(result_index.angle_triplets)
+        self._set_dihedral_quartet_rows(result_index.dihedral_quartets)
         self._set_coordination_number_rows(result_index.coordination_numbers)
         self._restore_cluster_type_list(result_index)
         self._refresh_results_tree()
@@ -1073,7 +1560,7 @@ class BondAnalysisMainWindow(QMainWindow):
     ) -> None:
         cluster_type_names = list(result_index.cluster_type_names)
         selected_names = set(result_index.selected_cluster_types)
-        use_checked_filter = bool(selected_names) and (
+        use_subset_filter = bool(selected_names) and (
             len(selected_names) != len(cluster_type_names)
         )
 
@@ -1087,15 +1574,16 @@ class BondAnalysisMainWindow(QMainWindow):
             )
             check_state = (
                 Qt.CheckState.Checked
-                if not selected_names or cluster_type in selected_names
+                if not use_subset_filter or cluster_type in selected_names
                 else Qt.CheckState.Unchecked
             )
             item.setCheckState(check_state)
             self.cluster_type_list.addItem(item)
         self.cluster_type_list.blockSignals(False)
         self.use_checked_cluster_types_box.blockSignals(True)
-        self.use_checked_cluster_types_box.setChecked(use_checked_filter)
+        self.use_checked_cluster_types_box.setChecked(not use_subset_filter)
         self.use_checked_cluster_types_box.blockSignals(False)
+        self._update_cluster_type_interactivity()
         self._set_cluster_type_status(
             f"{len(cluster_type_names)} cluster type(s) loaded from results."
         )
@@ -1105,6 +1593,7 @@ class BondAnalysisMainWindow(QMainWindow):
             self.cluster_type_status_label.setText(text)
 
     def _on_clusters_dir_changed(self, _text: str) -> None:
+        self._invalidate_stored_result_indices_cache()
         self._refresh_cluster_types()
 
     def _refresh_cluster_types(
@@ -1119,6 +1608,7 @@ class BondAnalysisMainWindow(QMainWindow):
         if clusters_dir is None:
             self.cluster_type_list.blockSignals(False)
             self._set_cluster_type_status("No clusters directory selected.")
+            self._update_cluster_type_interactivity()
             self._update_selection_summary()
             return
 
@@ -1128,6 +1618,7 @@ class BondAnalysisMainWindow(QMainWindow):
         except Exception as exc:
             self.cluster_type_list.blockSignals(False)
             self._set_cluster_type_status("Cluster scan unavailable.")
+            self._update_cluster_type_interactivity()
             self._append_log(f"Unable to inspect clusters directory: {exc}")
             self._update_selection_summary(error_text=str(exc))
             return
@@ -1143,6 +1634,7 @@ class BondAnalysisMainWindow(QMainWindow):
             )
             self.cluster_type_list.addItem(item)
         self.cluster_type_list.blockSignals(False)
+        self._update_cluster_type_interactivity()
         self._set_cluster_type_status(
             f"{self.cluster_type_list.count()} cluster type(s) ready."
         )
@@ -1152,7 +1644,9 @@ class BondAnalysisMainWindow(QMainWindow):
             self._suggest_output_dir_for_clusters(clusters_dir)
         )
         if not current_output_dir:
+            self.output_dir_edit.blockSignals(True)
             self.output_dir_edit.setText(suggested_output_dir)
+            self.output_dir_edit.blockSignals(False)
 
         self._update_selection_summary()
 
@@ -1165,7 +1659,7 @@ class BondAnalysisMainWindow(QMainWindow):
         return Path(text) if text else None
 
     def _selected_cluster_types(self) -> list[str] | None:
-        if not self.use_checked_cluster_types_box.isChecked():
+        if self.use_checked_cluster_types_box.isChecked():
             return None
         return self._checked_cluster_types()
 
@@ -1184,6 +1678,27 @@ class BondAnalysisMainWindow(QMainWindow):
             .checkState()
             for index in range(self.cluster_type_list.count())
         }
+
+    @Slot(bool)
+    def _on_analyze_all_cluster_types_toggled(self, _checked: bool) -> None:
+        self._update_cluster_type_interactivity()
+        self._update_selection_summary()
+
+    def _update_cluster_type_interactivity(self) -> None:
+        if not hasattr(self, "cluster_type_list"):
+            return
+        analyze_all = self.use_checked_cluster_types_box.isChecked()
+        self.cluster_type_list.setEnabled(not analyze_all)
+        if not analyze_all:
+            return
+        self.cluster_type_list.blockSignals(True)
+        try:
+            for index in range(self.cluster_type_list.count()):
+                self.cluster_type_list.item(index).setCheckState(
+                    Qt.CheckState.Checked
+                )
+        finally:
+            self.cluster_type_list.blockSignals(False)
 
     def _selected_preset_name(self) -> str | None:
         return self.preset_combo.currentData()
@@ -1214,8 +1729,13 @@ class BondAnalysisMainWindow(QMainWindow):
         preset = self._presets.get(preset_name)
         if preset is None:
             raise ValueError(f"Unknown preset: {preset_name}")
-        self._apply_preset(preset)
-        self._select_preset_name(preset_name)
+        self._selection_summary_timer.stop()
+        self._apply_preset(preset, update_summary=False)
+        self._select_preset_name(preset_name, block_signals=True)
+        self._update_selection_summary(
+            show_progress=True,
+            progress_message=f"Loading preset: {preset_name}",
+        )
         self._append_log(f"Loaded preset: {preset_name}")
 
     def save_current_preset(self, preset_name: str) -> None:
@@ -1226,17 +1746,30 @@ class BondAnalysisMainWindow(QMainWindow):
             name=name,
             bond_pairs=tuple(self._read_bond_pairs()),
             angle_triplets=tuple(self._read_angle_triplets()),
+            dihedral_quartets=tuple(self._read_dihedral_quartets()),
             coordination_numbers=tuple(self._read_coordination_numbers()),
         )
         save_custom_preset(preset)
         self._reload_presets(selected_name=name)
         self._append_log(f"Saved preset: {name}")
 
-    def _select_preset_name(self, preset_name: str) -> None:
-        for index in range(self.preset_combo.count()):
-            if self.preset_combo.itemData(index) == preset_name:
-                self.preset_combo.setCurrentIndex(index)
-                return
+    def _select_preset_name(
+        self,
+        preset_name: str,
+        *,
+        block_signals: bool = False,
+    ) -> None:
+        previous_blocked = None
+        if block_signals:
+            previous_blocked = self.preset_combo.blockSignals(True)
+        try:
+            for index in range(self.preset_combo.count()):
+                if self.preset_combo.itemData(index) == preset_name:
+                    self.preset_combo.setCurrentIndex(index)
+                    return
+        finally:
+            if previous_blocked is not None:
+                self.preset_combo.blockSignals(previous_blocked)
 
     def _load_selected_preset(self) -> None:
         preset_name = self._selected_preset_name()
@@ -1256,6 +1789,7 @@ class BondAnalysisMainWindow(QMainWindow):
         try:
             self._read_bond_pairs()
             self._read_angle_triplets()
+            self._read_dihedral_quartets()
             self._read_coordination_numbers()
         except Exception as exc:
             QMessageBox.warning(self, "Bond Analysis Presets", str(exc))
@@ -1288,108 +1822,175 @@ class BondAnalysisMainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Bond Analysis Presets", str(exc))
 
-    def _apply_preset(self, preset: BondAnalysisPreset) -> None:
+    def _apply_preset(
+        self,
+        preset: BondAnalysisPreset,
+        *,
+        update_summary: bool = True,
+    ) -> None:
         self._set_bond_pair_rows(preset.bond_pairs)
         self._set_angle_triplet_rows(preset.angle_triplets)
+        self._set_dihedral_quartet_rows(preset.dihedral_quartets)
         self._set_coordination_number_rows(preset.coordination_numbers)
-        self._update_selection_summary()
+        if update_summary:
+            self._update_selection_summary()
 
     def _set_bond_pair_rows(
         self,
         definitions: tuple[BondPairDefinition, ...],
     ) -> None:
-        self.bond_pair_table.blockSignals(True)
-        self.bond_pair_table.setRowCount(0)
-        if not definitions:
-            self._add_empty_bond_pair_row(blocked=True)
-        else:
-            for definition in definitions:
-                row = self.bond_pair_table.rowCount()
-                self.bond_pair_table.insertRow(row)
-                self.bond_pair_table.setItem(
-                    row,
-                    0,
-                    QTableWidgetItem(definition.atom1),
-                )
-                self.bond_pair_table.setItem(
-                    row,
-                    1,
-                    QTableWidgetItem(definition.atom2),
-                )
-                self.bond_pair_table.setItem(
-                    row,
-                    2,
-                    QTableWidgetItem(f"{definition.cutoff_angstrom:g}"),
-                )
-        self.bond_pair_table.blockSignals(False)
+        previous_blocked = self.bond_pair_table.blockSignals(True)
+        previous_updates_enabled = self.bond_pair_table.updatesEnabled()
+        self.bond_pair_table.setUpdatesEnabled(False)
+        try:
+            self.bond_pair_table.setRowCount(0)
+            if not definitions:
+                self._add_empty_bond_pair_row(blocked=True)
+            else:
+                self.bond_pair_table.setRowCount(len(definitions))
+                for row, definition in enumerate(definitions):
+                    self.bond_pair_table.setItem(
+                        row,
+                        0,
+                        QTableWidgetItem(definition.atom1),
+                    )
+                    self.bond_pair_table.setItem(
+                        row,
+                        1,
+                        QTableWidgetItem(definition.atom2),
+                    )
+                    self.bond_pair_table.setItem(
+                        row,
+                        2,
+                        QTableWidgetItem(f"{definition.cutoff_angstrom:g}"),
+                    )
+        finally:
+            self.bond_pair_table.setUpdatesEnabled(previous_updates_enabled)
+            self.bond_pair_table.blockSignals(previous_blocked)
 
     def _set_angle_triplet_rows(
         self,
         definitions: tuple[AngleTripletDefinition, ...],
     ) -> None:
-        self.angle_triplet_table.blockSignals(True)
-        self.angle_triplet_table.setRowCount(0)
-        if not definitions:
-            self._add_empty_angle_triplet_row(blocked=True)
-        else:
-            for definition in definitions:
-                row = self.angle_triplet_table.rowCount()
-                self.angle_triplet_table.insertRow(row)
-                self.angle_triplet_table.setItem(
-                    row,
-                    0,
-                    QTableWidgetItem(definition.vertex),
+        previous_blocked = self.angle_triplet_table.blockSignals(True)
+        previous_updates_enabled = self.angle_triplet_table.updatesEnabled()
+        self.angle_triplet_table.setUpdatesEnabled(False)
+        try:
+            self.angle_triplet_table.setRowCount(0)
+            if not definitions:
+                self._add_empty_angle_triplet_row(blocked=True)
+            else:
+                self.angle_triplet_table.setRowCount(len(definitions))
+                for row, definition in enumerate(definitions):
+                    self.angle_triplet_table.setItem(
+                        row,
+                        0,
+                        QTableWidgetItem(definition.vertex),
+                    )
+                    self.angle_triplet_table.setItem(
+                        row,
+                        1,
+                        QTableWidgetItem(definition.arm1),
+                    )
+                    self.angle_triplet_table.setItem(
+                        row,
+                        2,
+                        QTableWidgetItem(definition.arm2),
+                    )
+                    self.angle_triplet_table.setItem(
+                        row,
+                        3,
+                        QTableWidgetItem(f"{definition.cutoff1_angstrom:g}"),
+                    )
+                    self.angle_triplet_table.setItem(
+                        row,
+                        4,
+                        QTableWidgetItem(f"{definition.cutoff2_angstrom:g}"),
+                    )
+        finally:
+            self.angle_triplet_table.setUpdatesEnabled(
+                previous_updates_enabled
+            )
+            self.angle_triplet_table.blockSignals(previous_blocked)
+
+    def _set_dihedral_quartet_rows(
+        self,
+        definitions: tuple[DihedralQuartetDefinition, ...],
+    ) -> None:
+        editable_definitions = tuple(
+            definition
+            for definition in definitions
+            if not definition.branch_label
+        )
+        previous_blocked = self.dihedral_quartet_table.blockSignals(True)
+        previous_updates_enabled = self.dihedral_quartet_table.updatesEnabled()
+        self.dihedral_quartet_table.setUpdatesEnabled(False)
+        try:
+            self.dihedral_quartet_table.setRowCount(0)
+            if not editable_definitions:
+                self._add_empty_dihedral_quartet_row(blocked=True)
+            else:
+                self.dihedral_quartet_table.setRowCount(
+                    len(editable_definitions)
                 )
-                self.angle_triplet_table.setItem(
-                    row,
-                    1,
-                    QTableWidgetItem(definition.arm1),
-                )
-                self.angle_triplet_table.setItem(
-                    row,
-                    2,
-                    QTableWidgetItem(definition.arm2),
-                )
-                self.angle_triplet_table.setItem(
-                    row,
-                    3,
-                    QTableWidgetItem(f"{definition.cutoff1_angstrom:g}"),
-                )
-                self.angle_triplet_table.setItem(
-                    row,
-                    4,
-                    QTableWidgetItem(f"{definition.cutoff2_angstrom:g}"),
-                )
-        self.angle_triplet_table.blockSignals(False)
+                for row, definition in enumerate(editable_definitions):
+                    values = (
+                        definition.atom1,
+                        definition.atom2,
+                        definition.atom3,
+                        definition.atom4,
+                        f"{definition.cutoff12_angstrom:g}",
+                        f"{definition.cutoff23_angstrom:g}",
+                        f"{definition.cutoff34_angstrom:g}",
+                    )
+                    for column, value in enumerate(values):
+                        self.dihedral_quartet_table.setItem(
+                            row,
+                            column,
+                            QTableWidgetItem(value),
+                        )
+        finally:
+            self.dihedral_quartet_table.setUpdatesEnabled(
+                previous_updates_enabled
+            )
+            self.dihedral_quartet_table.blockSignals(previous_blocked)
 
     def _set_coordination_number_rows(
         self,
         definitions: tuple[CoordinationNumberDefinition, ...],
     ) -> None:
-        self.coordination_number_table.blockSignals(True)
-        self.coordination_number_table.setRowCount(0)
-        if not definitions:
-            self._add_empty_coordination_number_row(blocked=True)
-        else:
-            for definition in definitions:
-                row = self.coordination_number_table.rowCount()
-                self.coordination_number_table.insertRow(row)
-                self.coordination_number_table.setItem(
-                    row,
-                    0,
-                    QTableWidgetItem(definition.center_atom),
-                )
-                self.coordination_number_table.setItem(
-                    row,
-                    1,
-                    QTableWidgetItem(definition.neighbor_atom),
-                )
-                self.coordination_number_table.setItem(
-                    row,
-                    2,
-                    QTableWidgetItem(f"{definition.cutoff_angstrom:g}"),
-                )
-        self.coordination_number_table.blockSignals(False)
+        previous_blocked = self.coordination_number_table.blockSignals(True)
+        previous_updates_enabled = (
+            self.coordination_number_table.updatesEnabled()
+        )
+        self.coordination_number_table.setUpdatesEnabled(False)
+        try:
+            self.coordination_number_table.setRowCount(0)
+            if not definitions:
+                self._add_empty_coordination_number_row(blocked=True)
+            else:
+                self.coordination_number_table.setRowCount(len(definitions))
+                for row, definition in enumerate(definitions):
+                    self.coordination_number_table.setItem(
+                        row,
+                        0,
+                        QTableWidgetItem(definition.center_atom),
+                    )
+                    self.coordination_number_table.setItem(
+                        row,
+                        1,
+                        QTableWidgetItem(definition.neighbor_atom),
+                    )
+                    self.coordination_number_table.setItem(
+                        row,
+                        2,
+                        QTableWidgetItem(f"{definition.cutoff_angstrom:g}"),
+                    )
+        finally:
+            self.coordination_number_table.setUpdatesEnabled(
+                previous_updates_enabled
+            )
+            self.coordination_number_table.blockSignals(previous_blocked)
 
     def _add_empty_angle_triplet_row(self, *, blocked: bool = False) -> None:
         previous_blocked = self.angle_triplet_table.blockSignals(blocked)
@@ -1402,6 +2003,22 @@ class BondAnalysisMainWindow(QMainWindow):
                 QTableWidgetItem(""),
             )
         self.angle_triplet_table.blockSignals(previous_blocked)
+
+    def _add_empty_dihedral_quartet_row(
+        self,
+        *,
+        blocked: bool = False,
+    ) -> None:
+        previous_blocked = self.dihedral_quartet_table.blockSignals(blocked)
+        row = self.dihedral_quartet_table.rowCount()
+        self.dihedral_quartet_table.insertRow(row)
+        for column in range(self.dihedral_quartet_table.columnCount()):
+            self.dihedral_quartet_table.setItem(
+                row,
+                column,
+                QTableWidgetItem(""),
+            )
+        self.dihedral_quartet_table.blockSignals(previous_blocked)
 
     def _add_empty_bond_pair_row(self, *, blocked: bool = False) -> None:
         previous_blocked = self.bond_pair_table.blockSignals(blocked)
@@ -1429,8 +2046,6 @@ class BondAnalysisMainWindow(QMainWindow):
 
     def _add_bond_pair_row(self) -> None:
         self._add_empty_bond_pair_row(blocked=True)
-        if hasattr(self, "selection_box"):
-            self._update_selection_summary()
 
     def _remove_selected_bond_pair_rows(self) -> None:
         selected_rows = sorted(
@@ -1439,12 +2054,12 @@ class BondAnalysisMainWindow(QMainWindow):
         )
         for row in selected_rows:
             self.bond_pair_table.removeRow(row)
-        self._update_selection_summary()
+        self._schedule_selection_summary_update(
+            reason="Bond pair rows removed; refreshing preview..."
+        )
 
     def _add_angle_triplet_row(self) -> None:
         self._add_empty_angle_triplet_row(blocked=True)
-        if hasattr(self, "selection_box"):
-            self._update_selection_summary()
 
     def _remove_selected_angle_triplet_rows(self) -> None:
         selected_rows = sorted(
@@ -1456,12 +2071,29 @@ class BondAnalysisMainWindow(QMainWindow):
         )
         for row in selected_rows:
             self.angle_triplet_table.removeRow(row)
-        self._update_selection_summary()
+        self._schedule_selection_summary_update(
+            reason="Angle triplet rows removed; refreshing preview..."
+        )
+
+    def _add_dihedral_quartet_row(self) -> None:
+        self._add_empty_dihedral_quartet_row(blocked=True)
+
+    def _remove_selected_dihedral_quartet_rows(self) -> None:
+        selected_rows = sorted(
+            {
+                index.row()
+                for index in self.dihedral_quartet_table.selectedIndexes()
+            },
+            reverse=True,
+        )
+        for row in selected_rows:
+            self.dihedral_quartet_table.removeRow(row)
+        self._schedule_selection_summary_update(
+            reason="Dihedral quartet rows removed; refreshing preview..."
+        )
 
     def _add_coordination_number_row(self) -> None:
         self._add_empty_coordination_number_row(blocked=True)
-        if hasattr(self, "selection_box"):
-            self._update_selection_summary()
 
     def _remove_selected_coordination_number_rows(self) -> None:
         selected_rows = sorted(
@@ -1473,7 +2105,9 @@ class BondAnalysisMainWindow(QMainWindow):
         )
         for row in selected_rows:
             self.coordination_number_table.removeRow(row)
-        self._update_selection_summary()
+        self._schedule_selection_summary_update(
+            reason="Coordination-number rows removed; refreshing preview..."
+        )
 
     def _read_bond_pairs(self) -> list[BondPairDefinition]:
         definitions: list[BondPairDefinition] = []
@@ -1525,6 +2159,68 @@ class BondAnalysisMainWindow(QMainWindow):
             )
         return definitions
 
+    def _read_dihedral_quartets(self) -> list[DihedralQuartetDefinition]:
+        definitions: list[DihedralQuartetDefinition] = []
+        for row in range(self.dihedral_quartet_table.rowCount()):
+            atom1 = self._table_text(self.dihedral_quartet_table, row, 0)
+            atom2 = self._table_text(self.dihedral_quartet_table, row, 1)
+            atom3 = self._table_text(self.dihedral_quartet_table, row, 2)
+            atom4 = self._table_text(self.dihedral_quartet_table, row, 3)
+            cutoff12_text = self._table_text(
+                self.dihedral_quartet_table,
+                row,
+                4,
+            )
+            cutoff23_text = self._table_text(
+                self.dihedral_quartet_table,
+                row,
+                5,
+            )
+            cutoff34_text = self._table_text(
+                self.dihedral_quartet_table,
+                row,
+                6,
+            )
+            if not any(
+                (
+                    atom1,
+                    atom2,
+                    atom3,
+                    atom4,
+                    cutoff12_text,
+                    cutoff23_text,
+                    cutoff34_text,
+                )
+            ):
+                continue
+            if not all(
+                (
+                    atom1,
+                    atom2,
+                    atom3,
+                    atom4,
+                    cutoff12_text,
+                    cutoff23_text,
+                    cutoff34_text,
+                )
+            ):
+                raise ValueError(
+                    "Every populated dihedral-quartet row needs four atoms "
+                    "and three adjacent-pair cutoffs."
+                )
+            definitions.append(
+                DihedralQuartetDefinition(
+                    atom1,
+                    atom2,
+                    atom3,
+                    atom4,
+                    float(cutoff12_text),
+                    float(cutoff23_text),
+                    float(cutoff34_text),
+                )
+            )
+        return definitions
+
     def _read_coordination_numbers(
         self,
     ) -> list[CoordinationNumberDefinition]:
@@ -1570,35 +2266,57 @@ class BondAnalysisMainWindow(QMainWindow):
         self,
         *,
         error_text: str | None = None,
+        show_progress: bool = False,
+        progress_message: str = "Refreshing selection preview...",
     ) -> None:
-        clusters_dir = self._clusters_dir_path()
-        output_dir = self._output_dir_path()
-        selected_cluster_types = self._selected_cluster_types()
-
-        lines: list[str] = []
-        if error_text is not None:
-            lines.append(f"Inspection error: {error_text}")
-        if clusters_dir is None:
-            lines.append(
-                "Select a stoichiometry-level clusters directory to preview "
-                "the bond-analysis run."
+        if show_progress:
+            self._begin_selection_summary_progress(progress_message)
+        try:
+            progress_callback = (
+                self._update_selection_summary_progress
+                if show_progress
+                else None
             )
-            self.selection_box.setPlainText("\n".join(lines))
-            return
+            if progress_callback is not None:
+                progress_callback(
+                    1,
+                    SELECTION_PREVIEW_TOTAL_STEPS,
+                    "Reading current bond-analysis selections...",
+                )
+            clusters_dir = self._clusters_dir_path()
+            output_dir = self._output_dir_path()
+            selected_cluster_types = self._selected_cluster_types()
 
-        lines.append(f"Clusters directory: {clusters_dir}")
-        if output_dir is not None:
-            lines.append(f"Output directory: {output_dir}")
+            lines: list[str] = []
+            if error_text is not None:
+                lines.append(f"Inspection error: {error_text}")
+            if clusters_dir is None:
+                lines.append(
+                    "Select a stoichiometry-level clusters directory to "
+                    "preview the bond-analysis run."
+                )
+                self.selection_box.setPlainText("\n".join(lines))
+                return
 
-        cluster_types = [
-            self.cluster_type_list.item(index).text()
-            for index in range(self.cluster_type_list.count())
-        ]
-        lines.append(f"Cluster types detected: {len(cluster_types)}")
-        checked_cluster_types = self._checked_cluster_types()
-        lines.append(f"Checked cluster types: {len(checked_cluster_types)}")
-        if self.use_checked_cluster_types_box.isChecked():
-            if selected_cluster_types:
+            lines.append(f"Clusters directory: {clusters_dir}")
+            if output_dir is not None:
+                lines.append(f"Output directory: {output_dir}")
+
+            cluster_types = [
+                self.cluster_type_list.item(index).text()
+                for index in range(self.cluster_type_list.count())
+            ]
+            lines.append(f"Cluster types detected: {len(cluster_types)}")
+            checked_cluster_types = self._checked_cluster_types()
+            lines.append(
+                f"Checked cluster types: {len(checked_cluster_types)}"
+            )
+            if self.use_checked_cluster_types_box.isChecked():
+                if cluster_types:
+                    lines.append("Analyzing cluster types: all detected types")
+                else:
+                    lines.append("Analyzing cluster types: none detected yet")
+            elif selected_cluster_types:
                 lines.append(
                     "Analyzing checked cluster types: "
                     + ", ".join(selected_cluster_types)
@@ -1607,38 +2325,67 @@ class BondAnalysisMainWindow(QMainWindow):
                 lines.append(
                     "Analyzing checked cluster types: none checked yet"
                 )
-        elif cluster_types:
-            lines.append("Analyzing cluster types: all detected types")
 
-        preset_name = self._selected_preset_name()
-        if preset_name is not None:
-            lines.append(f"Selected preset: {preset_name}")
+            preset_name = self._selected_preset_name()
+            if preset_name is not None:
+                lines.append(f"Selected preset: {preset_name}")
 
-        try:
-            bond_pairs = self._read_bond_pairs()
-            lines.append(f"Bond pairs configured: {len(bond_pairs)}")
-        except Exception as exc:
-            lines.append(f"Bond pairs configured: invalid ({exc})")
+            bond_pairs: list[BondPairDefinition] | None = None
+            try:
+                bond_pairs = self._read_bond_pairs()
+                lines.append(f"Bond pairs configured: {len(bond_pairs)}")
+            except Exception as exc:
+                lines.append(f"Bond pairs configured: invalid ({exc})")
 
-        try:
-            angle_triplets = self._read_angle_triplets()
-            lines.append(f"Angle triplets configured: {len(angle_triplets)}")
-        except Exception as exc:
-            lines.append(f"Angle triplets configured: invalid ({exc})")
+            angle_triplets: list[AngleTripletDefinition] | None = None
+            try:
+                angle_triplets = self._read_angle_triplets()
+                lines.append(
+                    f"Angle triplets configured: {len(angle_triplets)}"
+                )
+            except Exception as exc:
+                lines.append(f"Angle triplets configured: invalid ({exc})")
 
-        try:
-            coordination_numbers = self._read_coordination_numbers()
-            lines.append(
-                "Coordination rules configured: "
-                f"{len(coordination_numbers)}"
+            dihedral_quartets: list[DihedralQuartetDefinition] | None = None
+            try:
+                dihedral_quartets = self._read_dihedral_quartets()
+                lines.append(
+                    "Dihedral quartets configured: "
+                    f"{len(dihedral_quartets)}"
+                )
+            except Exception as exc:
+                lines.append(f"Dihedral quartets configured: invalid ({exc})")
+
+            coordination_numbers: list[CoordinationNumberDefinition] | None = (
+                None
             )
-        except Exception as exc:
-            lines.append(f"Coordination rules configured: invalid ({exc})")
+            try:
+                coordination_numbers = self._read_coordination_numbers()
+                lines.append(
+                    "Coordination rules configured: "
+                    f"{len(coordination_numbers)}"
+                )
+            except Exception as exc:
+                lines.append(f"Coordination rules configured: invalid ({exc})")
 
-        lines.append(
-            "Displacement analysis: deprecated and not part of this window"
-        )
-        self.selection_box.setPlainText("\n".join(lines))
+            lines.append(
+                "Displacement analysis: deprecated and not part of this window"
+            )
+            lines.extend(
+                self._stored_results_preview_lines(
+                    clusters_dir=clusters_dir,
+                    selected_cluster_types=selected_cluster_types,
+                    bond_pairs=bond_pairs,
+                    angle_triplets=angle_triplets,
+                    dihedral_quartets=dihedral_quartets,
+                    coordination_numbers=coordination_numbers,
+                    progress_callback=progress_callback,
+                )
+            )
+            self.selection_box.setPlainText("\n".join(lines))
+        finally:
+            if show_progress:
+                self._close_selection_summary_progress_dialog()
 
     def _refresh_results_tree(self) -> None:
         output_dir = self._output_dir_path()
@@ -1655,24 +2402,239 @@ class BondAnalysisMainWindow(QMainWindow):
             self._clear_results_tree(str(exc))
             return
 
-        self.results_tree.clear()
-        self._populate_results_category(
-            "Bond Pairs",
-            self._results_index.bond_groups,
-        )
-        self._populate_results_category(
-            "Bond Angles",
-            self._results_index.angle_groups,
-        )
-        self._populate_results_category(
-            "Coordination Numbers",
-            self._results_index.coordination_groups,
-        )
-        self.results_tree.expandAll()
+        previous_tree_blocked = self.results_tree.blockSignals(True)
+        previous_tree_updates = self.results_tree.updatesEnabled()
+        self.results_tree.setUpdatesEnabled(False)
+        try:
+            self.results_tree.clear()
+            self._populate_results_category(
+                "Bond Pairs",
+                self._results_index.bond_groups,
+            )
+            self._populate_results_category(
+                "Bond Angles",
+                self._results_index.angle_groups,
+            )
+            self._populate_results_category(
+                "Dihedral Angles",
+                self._results_index.dihedral_groups,
+            )
+            self._populate_results_category(
+                "Coordination Numbers",
+                self._results_index.coordination_groups,
+            )
+            self._expand_results_categories_only()
+        finally:
+            self.results_tree.setUpdatesEnabled(previous_tree_updates)
+            self.results_tree.blockSignals(previous_tree_blocked)
+        self._populate_all_cluster_stats_table(self._results_index)
         self.results_status_label.setText(
-            "Browse computed bond, angle, and coordination distributions from the "
-            f"current output directory: {self._results_index.output_dir}"
+            "Browse computed bond, angle, dihedral, and coordination "
+            "distributions from the current output directory: "
+            f"{self._results_index.output_dir}"
         )
+
+    def _populate_all_cluster_stats_table(
+        self,
+        result_index: BondAnalysisResultIndex,
+    ) -> None:
+        rows = self._all_cluster_stats_rows(result_index)
+        previous_blocked = self.results_stats_table.blockSignals(True)
+        previous_updates_enabled = self.results_stats_table.updatesEnabled()
+        self.results_stats_table.setUpdatesEnabled(False)
+        try:
+            self.results_stats_table.setRowCount(len(rows))
+            for row_index, row_values in enumerate(rows):
+                for column_index, value in enumerate(row_values):
+                    item = QTableWidgetItem(value)
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    self.results_stats_table.setItem(
+                        row_index,
+                        column_index,
+                        item,
+                    )
+        finally:
+            self.results_stats_table.setUpdatesEnabled(
+                previous_updates_enabled
+            )
+            self.results_stats_table.blockSignals(previous_blocked)
+
+    def _all_cluster_stats_rows(
+        self,
+        result_index: BondAnalysisResultIndex,
+    ) -> list[tuple[str, str, str, str, str, str, str, str, str]]:
+        rows: list[tuple[str, str, str, str, str, str, str, str, str]] = []
+        rows.extend(
+            self._stats_rows_for_groups(
+                result_index,
+                category="bond",
+                type_label="Bond Pair",
+                definitions=result_index.bond_pairs,
+                groups=result_index.bond_groups,
+            )
+        )
+        rows.extend(
+            self._stats_rows_for_groups(
+                result_index,
+                category="angle",
+                type_label="Angle",
+                definitions=result_index.angle_triplets,
+                groups=result_index.angle_groups,
+            )
+        )
+        rows.extend(
+            self._stats_rows_for_groups(
+                result_index,
+                category="dihedral",
+                type_label="Dihedral",
+                definitions=result_index.dihedral_quartets,
+                groups=result_index.dihedral_groups,
+            )
+        )
+        rows.extend(
+            self._stats_rows_for_groups(
+                result_index,
+                category="coordination",
+                type_label="Coordination",
+                definitions=result_index.coordination_numbers,
+                groups=result_index.coordination_groups,
+            )
+        )
+        return rows
+
+    def _stats_rows_for_groups(
+        self,
+        result_index: BondAnalysisResultIndex,
+        *,
+        category: str,
+        type_label: str,
+        definitions: Sequence[object],
+        groups: Sequence[object],
+    ) -> list[tuple[str, str, str, str, str, str, str, str, str]]:
+        rows: list[tuple[str, str, str, str, str, str, str, str, str]] = []
+        all_clusters_dir = result_index.output_dir / "all_clusters"
+        for definition, group in zip(definitions, groups):
+            histogram_path = (
+                all_clusters_dir / f"{definition.filename_stem}_histogram.csv"
+            )
+            metadata = self._read_histogram_metadata(histogram_path)
+            rows.append(
+                self._stats_row_from_metadata(
+                    category=category,
+                    type_label=type_label,
+                    display_label=group.display_label,
+                    point_count=group.all_leaf.point_count,
+                    metadata=metadata,
+                )
+            )
+        return rows
+
+    def _stats_row_from_metadata(
+        self,
+        *,
+        category: str,
+        type_label: str,
+        display_label: str,
+        point_count: int,
+        metadata: Mapping[str, str],
+    ) -> tuple[str, str, str, str, str, str, str, str, str]:
+        if category == "bond":
+            average_keys = ("gds_center_angstrom", "mean")
+            sigma_keys = ("gds_sigma_angstrom", "sigma")
+            unit = "A"
+        elif category == "angle":
+            average_keys = ("gds_center_degrees", "mean")
+            sigma_keys = ("gds_sigma_degrees", "sigma")
+            unit = "deg"
+        elif category == "dihedral":
+            average_keys = (
+                "gds_center_degrees",
+                "circular_mean_degrees",
+                "mean",
+            )
+            sigma_keys = (
+                "gds_sigma_degrees",
+                "circular_sigma_degrees",
+                "sigma",
+            )
+            unit = "deg"
+        else:
+            average_keys = ("mean",)
+            sigma_keys = ("sigma",)
+            unit = "count"
+        average = self._metadata_float(metadata, *average_keys)
+        median = self._metadata_float(metadata, "median")
+        sigma = self._metadata_float(metadata, *sigma_keys)
+        metadata_count = self._metadata_int(metadata, "point_count")
+        return (
+            type_label,
+            display_label,
+            str(metadata_count if metadata_count is not None else point_count),
+            self._format_stat_value(average),
+            self._format_stat_value(median),
+            self._format_stat_value(sigma),
+            unit,
+            metadata.get("gds_center_variable", "-") or "-",
+            metadata.get("gds_sigma_variable", "-") or "-",
+        )
+
+    @staticmethod
+    def _read_histogram_metadata(histogram_path: Path) -> dict[str, str]:
+        metadata: dict[str, str] = {}
+        if not histogram_path.exists():
+            return metadata
+        try:
+            with histogram_path.open(newline="") as stream:
+                for row in csv.reader(stream):
+                    if not row:
+                        continue
+                    if not row[0].startswith("#"):
+                        break
+                    if len(row) < 2:
+                        continue
+                    key = row[0].removeprefix("# ").strip()
+                    if key:
+                        metadata[key] = row[1]
+        except OSError:
+            return {}
+        return metadata
+
+    @staticmethod
+    def _metadata_float(
+        metadata: Mapping[str, str],
+        *keys: str,
+    ) -> float | None:
+        for key in keys:
+            value = metadata.get(key)
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                return number
+        return None
+
+    @staticmethod
+    def _metadata_int(
+        metadata: Mapping[str, str],
+        key: str,
+    ) -> int | None:
+        value = metadata.get(key)
+        if value is None:
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_stat_value(value: float | None) -> str:
+        if value is None:
+            return "-"
+        text = f"{value:.6g}"
+        return "0" if text == "-0" else text
 
     def _populate_results_category(
         self,
@@ -1682,19 +2644,48 @@ class BondAnalysisMainWindow(QMainWindow):
         if not groups:
             return
         category_item = QTreeWidgetItem([title, "", ""])
+        category_item.setChildIndicatorPolicy(
+            QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+        )
         category_item.setFlags(
             category_item.flags() & ~Qt.ItemFlag.ItemIsSelectable
         )
+        category_item.setToolTip(
+            0,
+            "Use the arrow to expand or collapse this distribution section.",
+        )
         self.results_tree.addTopLevelItem(category_item)
         for group in groups:
-            group_item = QTreeWidgetItem([group.display_label, "", ""])
-            group_item.setFlags(
-                group_item.flags() & ~Qt.ItemFlag.ItemIsSelectable
+            group_item = QTreeWidgetItem(
+                [
+                    group.display_label,
+                    "all clusters",
+                    str(group.all_leaf.point_count),
+                ]
+            )
+            group_item.setChildIndicatorPolicy(
+                QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+            )
+            group_item.setData(0, Qt.ItemDataRole.UserRole, group.all_leaf)
+            group_item.setToolTip(
+                0,
+                "Select this distribution-name row to open the all-cluster "
+                "plot. Cmd-click or Ctrl-click distribution-name rows to "
+                "select multiple all-cluster plots. Use the arrow to show "
+                "or hide cluster-level entries.",
             )
             category_item.addChild(group_item)
             group_item.addChild(self._make_results_leaf_item(group.all_leaf))
             for leaf in group.cluster_leaves:
                 group_item.addChild(self._make_results_leaf_item(leaf))
+            group_item.setExpanded(False)
+
+    def _expand_results_categories_only(self) -> None:
+        for category_index in range(self.results_tree.topLevelItemCount()):
+            category_item = self.results_tree.topLevelItem(category_index)
+            category_item.setExpanded(True)
+            for group_index in range(category_item.childCount()):
+                category_item.child(group_index).setExpanded(False)
 
     def _make_results_leaf_item(
         self,
@@ -1714,9 +2705,19 @@ class BondAnalysisMainWindow(QMainWindow):
 
     def _selected_result_leaves(self) -> list[BondAnalysisResultLeaf]:
         leaves: list[BondAnalysisResultLeaf] = []
+        seen_keys: set[tuple[str, str, str, bool]] = set()
         for item in self.results_tree.selectedItems():
             payload = item.data(0, Qt.ItemDataRole.UserRole)
             if isinstance(payload, BondAnalysisResultLeaf):
+                key = (
+                    payload.category,
+                    payload.display_label,
+                    payload.scope_name,
+                    payload.is_all,
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
                 leaves.append(payload)
         return leaves
 
@@ -1725,8 +2726,8 @@ class BondAnalysisMainWindow(QMainWindow):
         if not leaves:
             self.results_status_label.setText(
                 "Select one computed distribution and use 'Open Selected in "
-                "Window' to view it, or select multiple leaves of the same "
-                "type and open them together as an overlay."
+                "Tab' to view it, or select multiple leaves of the same "
+                "type and open them together as an overlay tab."
             )
             return
 
@@ -1734,7 +2735,15 @@ class BondAnalysisMainWindow(QMainWindow):
             leaf = leaves[0]
             self.results_status_label.setText(
                 f"Ready to open {leaf.display_label} for {leaf.scope_name} "
-                "in a separate plot window."
+                "in a plot tab."
+            )
+            return
+
+        if all(leaf.is_all for leaf in leaves):
+            self.results_status_label.setText(
+                "Ready to open "
+                f"{len(leaves)} selected all-cluster distributions as plot "
+                "tabs."
             )
             return
 
@@ -1776,11 +2785,42 @@ class BondAnalysisMainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Computed Distributions",
-                "Select one or more computed bond, angle, or coordination "
-                "distributions first.",
+                "Select one or more computed bond, angle, dihedral, or "
+                "coordination distributions first.",
             )
             return
+        if len(leaves) > 1 and all(leaf.is_all for leaf in leaves):
+            self._open_selected_all_cluster_plot_windows(leaves)
+            return
         self._open_plot_window_for_leaves(leaves)
+
+    def _open_selected_all_cluster_plot_windows(
+        self,
+        leaves: list[BondAnalysisResultLeaf],
+    ) -> None:
+        if self._results_index is None:
+            self._refresh_results_tree()
+        if self._results_index is None:
+            QMessageBox.warning(
+                self,
+                "Computed Distributions",
+                "Run bondanalysis or refresh an existing output directory "
+                "before opening plot tabs.",
+            )
+            return
+        opened_count = 0
+        for leaf in leaves:
+            try:
+                plot_request = build_plot_request(self._results_index, [leaf])
+            except Exception as exc:
+                QMessageBox.warning(self, "Computed Distributions", str(exc))
+                return
+            self._open_plot_window_for_request(plot_request)
+            opened_count += 1
+        self.results_status_label.setText(
+            f"Opened {opened_count} selected all-cluster distribution "
+            "plot(s)."
+        )
 
     def _open_all_all_cluster_plot_windows(self) -> None:
         if self._results_index is None:
@@ -1821,6 +2861,7 @@ class BondAnalysisMainWindow(QMainWindow):
         groups = (
             *self._results_index.bond_groups,
             *self._results_index.angle_groups,
+            *self._results_index.dihedral_groups,
             *self._results_index.coordination_groups,
         )
         return [
@@ -1864,7 +2905,7 @@ class BondAnalysisMainWindow(QMainWindow):
                 self,
                 "Computed Distributions",
                 "Run bondanalysis or refresh an existing output directory "
-                "before opening standalone plot windows.",
+                "before opening plot tabs.",
             )
             return
         try:
@@ -1894,10 +2935,8 @@ class BondAnalysisMainWindow(QMainWindow):
                 default_output_dir=default_output_dir,
                 parent=self,
             )
-            window.destroyed.connect(
-                lambda _obj=None, win=window: self._remove_plot_window(win)
-            )
-            self._plot_windows.append(window)
+            track_saxshell_window(window, self._plot_windows)
+            self.plot_window_opened.emit(window)
         window.show()
         window.raise_()
         window.activateWindow()
@@ -1911,6 +2950,8 @@ class BondAnalysisMainWindow(QMainWindow):
 
     def _clear_results_tree(self, message: str) -> None:
         self.results_tree.clear()
+        if hasattr(self, "results_stats_table"):
+            self.results_stats_table.setRowCount(0)
         self.results_status_label.setText(message)
 
     def _append_log(self, text: str) -> None:
@@ -1933,18 +2974,19 @@ class BondAnalysisMainWindow(QMainWindow):
             output_dir = self._output_dir_path()
             selected_cluster_types = self._selected_cluster_types()
             if (
-                self.use_checked_cluster_types_box.isChecked()
+                not self.use_checked_cluster_types_box.isChecked()
                 and not selected_cluster_types
             ):
                 raise ValueError(
-                    "Check at least one cluster type, or turn off the "
-                    "checked-cluster-type filter."
+                    "Check at least one cluster type, or turn on "
+                    "'Analyze all cluster types'."
                 )
 
             workflow = BondAnalysisWorkflow(
                 clusters_dir,
                 bond_pairs=self._read_bond_pairs(),
                 angle_triplets=self._read_angle_triplets(),
+                dihedral_quartets=self._read_dihedral_quartets(),
                 coordination_numbers=self._read_coordination_numbers(),
                 output_dir=output_dir,
                 selected_cluster_types=selected_cluster_types,
@@ -1967,8 +3009,9 @@ class BondAnalysisMainWindow(QMainWindow):
         self.run_button.setEnabled(False)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
-        self.progress_label.setText("Progress: starting")
+        self.progress_label.setText("Progress: preparing")
         self._active_run_status = "Preparing bond analysis..."
+        self._run_is_saving_distribution_outputs = False
         self.statusBar().showMessage("Preparing bond analysis...")
 
         self._run_thread = QThread(self)
@@ -1980,13 +3023,40 @@ class BondAnalysisMainWindow(QMainWindow):
         self._run_worker.status.connect(self._update_run_status)
         self._run_worker.finished.connect(self._finish_run)
         self._run_worker.failed.connect(self._fail_run)
+        self._run_worker.canceled.connect(self._cancel_run_finished)
         self._run_worker.finished.connect(self._run_thread.quit)
         self._run_worker.failed.connect(self._run_thread.quit)
+        self._run_worker.canceled.connect(self._run_thread.quit)
         self._run_worker.finished.connect(self._run_worker.deleteLater)
         self._run_worker.failed.connect(self._run_worker.deleteLater)
+        self._run_worker.canceled.connect(self._run_worker.deleteLater)
         self._run_thread.finished.connect(self._cleanup_run_thread)
         self._run_thread.finished.connect(self._run_thread.deleteLater)
         self._run_thread.start()
+
+    def _request_run_cancel(
+        self, *, close_when_finished: bool = False
+    ) -> None:
+        if self._run_cancel_requested:
+            if close_when_finished:
+                self._close_after_run_cancel = True
+            return
+        self._run_cancel_requested = True
+        self._close_after_run_cancel = close_when_finished
+        self.run_button.setEnabled(False)
+        self._active_run_status = "Canceling bond analysis..."
+        self._run_is_saving_distribution_outputs = False
+        self.progress_label.setText(
+            "Progress: canceling at next safe checkpoint"
+        )
+        self.statusBar().showMessage(
+            "Canceling bond analysis at the next safe checkpoint..."
+        )
+        self._append_log(
+            "Cancel requested; stopping at the next safe checkpoint."
+        )
+        if self._run_worker is not None:
+            self._run_worker.request_cancel()
 
     def _update_progress(
         self,
@@ -2000,20 +3070,48 @@ class BondAnalysisMainWindow(QMainWindow):
         self.progress_bar.setValue(processed)
         self.progress_bar.setFormat("%v / %m steps")
         if message:
+            self._active_run_status = message
+            self._run_is_saving_distribution_outputs = (
+                self._is_distribution_save_progress_message(message)
+            )
+        if message:
             self.progress_label.setText(
                 f"Progress: {message} ({processed}/{total})"
             )
+            self.progress_label.setToolTip(message)
         else:
             self.progress_label.setText(
                 f"Progress: {processed} processed, "
                 f"{total - processed} remaining"
             )
+            self.progress_label.setToolTip("")
 
     def _update_run_status(self, message: str) -> None:
         self._active_run_status = message
+        self._run_is_saving_distribution_outputs = (
+            self._is_distribution_save_progress_message(message)
+        )
         self.statusBar().showMessage(message)
 
+    @staticmethod
+    def _is_distribution_save_progress_message(message: str) -> bool:
+        normalized = str(message).strip().lower()
+        return (
+            normalized.startswith("saving cached structure measurements")
+            or (
+                normalized.startswith("writing ")
+                and " distributions" in normalized
+            )
+            or normalized.startswith(
+                (
+                    "writing cluster comparison overlays",
+                    "writing bond-analysis results index",
+                )
+            )
+        )
+
     def _finish_run(self, result: BondAnalysisBatchResult) -> None:
+        self._invalidate_stored_result_indices_cache()
         self.run_button.setEnabled(True)
         self.progress_bar.setValue(self.progress_bar.maximum())
         self.progress_label.setText(
@@ -2023,16 +3121,24 @@ class BondAnalysisMainWindow(QMainWindow):
             f"Bond analysis complete: {result.output_dir}"
         )
         self._active_run_status = "Bond analysis complete."
+        self._run_is_saving_distribution_outputs = False
+        self._run_cancel_requested = False
         self.output_dir_edit.setText(str(result.output_dir))
         self._append_log(f"Output directory: {result.output_dir}")
         self._append_log(f"Results index file: {result.results_index_path}")
         for cluster_result in result.cluster_results:
+            bond_total = sum(cluster_result.bond_value_counts.values())
+            angle_total = sum(cluster_result.angle_value_counts.values())
+            dihedral_total = sum(cluster_result.dihedral_value_counts.values())
             coordination_total = sum(
                 cluster_result.coordination_value_counts.values()
             )
             self._append_log(
                 f"{cluster_result.cluster_type}: "
                 f"{cluster_result.structure_count} file(s), "
+                f"{bond_total} bond values, "
+                f"{angle_total} angle values, "
+                f"{dihedral_total} dihedral values, "
                 f"{coordination_total} coordination values"
             )
         self._refresh_results_tree()
@@ -2043,12 +3149,28 @@ class BondAnalysisMainWindow(QMainWindow):
         self.progress_label.setText("Progress: failed")
         self.statusBar().showMessage("Bond analysis failed")
         self._active_run_status = "Bond analysis failed."
+        self._run_is_saving_distribution_outputs = False
+        self._run_cancel_requested = False
+        self._close_after_run_cancel = False
         self._append_log(f"Run failed: {message}")
         QMessageBox.critical(self, "Bond Analysis", message)
+
+    def _cancel_run_finished(self, message: str) -> None:
+        self.run_button.setEnabled(True)
+        self.progress_label.setText("Progress: canceled")
+        self.progress_label.setToolTip("")
+        self.statusBar().showMessage("Bond analysis canceled")
+        self._active_run_status = "Bond analysis canceled."
+        self._run_is_saving_distribution_outputs = False
+        self._append_log(message or "Bond analysis canceled.")
 
     def _cleanup_run_thread(self) -> None:
         self._run_worker = None
         self._run_thread = None
+        self._run_cancel_requested = False
+        if self._close_after_run_cancel:
+            self._close_after_run_cancel = False
+            QTimer.singleShot(0, self.close)
 
 
 def launch_bondanalysis_ui(
@@ -2063,7 +3185,7 @@ def launch_bondanalysis_ui(
     configure_saxshell_application(app)
 
     window = BondAnalysisMainWindow(initial_clusters_dir=clusters_dir)
-    _OPEN_WINDOWS.append(window)
+    track_saxshell_window(window, _OPEN_WINDOWS)
     window.show()
     if owns_app:
         return app.exec()

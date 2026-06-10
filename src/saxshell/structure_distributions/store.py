@@ -17,12 +17,13 @@ from saxshell.bondanalysis.bondanalyzer import (
     BondAnalyzer,
     BondPairDefinition,
     CoordinationNumberDefinition,
+    DihedralQuartetDefinition,
     _normalized_element_symbol,
 )
 from saxshell.saxs.debye import load_structure_file
 
 STORE_SCHEMA_VERSION = 1
-ANALYZER_VERSION = "structure-distributions-v1"
+ANALYZER_VERSION = "structure-distributions-v2-solvent-dihedrals"
 STRUCTURE_SUFFIXES = {".pdb", ".xyz"}
 
 
@@ -31,6 +32,7 @@ class CachedStructureMeasurement:
     structure_path: Path
     bond_values: dict[BondPairDefinition, list[float]]
     angle_values: dict[AngleTripletDefinition, list[float]]
+    dihedral_values: dict[DihedralQuartetDefinition, list[float]]
     coordination_values: dict[CoordinationNumberDefinition, list[float]]
     from_cache: bool
     cache_key: str
@@ -89,6 +91,7 @@ class StructureDistributionStore:
         *,
         bond_pairs: Sequence[BondPairDefinition],
         angle_triplets: Sequence[AngleTripletDefinition],
+        dihedral_quartets: Sequence[DihedralQuartetDefinition] = (),
         coordination_numbers: Sequence[CoordinationNumberDefinition] = (),
         cluster_label: str | None = None,
         relative_label: str | None = None,
@@ -99,6 +102,7 @@ class StructureDistributionStore:
         analyzer = BondAnalyzer(
             bond_pairs=tuple(bond_pairs),
             angle_triplets=tuple(angle_triplets),
+            dihedral_quartets=tuple(dihedral_quartets),
             coordination_numbers=tuple(coordination_numbers),
         )
         with self._lock:
@@ -107,6 +111,7 @@ class StructureDistributionStore:
                 self._bond_angle_definition_signature(
                     bond_pairs,
                     angle_triplets,
+                    dihedral_quartets,
                     coordination_numbers,
                 ),
             )
@@ -115,22 +120,30 @@ class StructureDistributionStore:
                 path,
                 tuple(bond_pairs),
                 tuple(angle_triplets),
+                tuple(dihedral_quartets),
                 tuple(coordination_numbers),
             )
             if cached is not None:
                 return cached
 
-            bond_values, angle_values, coordination_values = (
-                analyzer.measure_structure_with_coordination(path)
+            (
+                bond_values,
+                angle_values,
+                dihedral_values,
+                coordination_values,
+            ) = analyzer.measure_structure_with_coordination_and_dihedrals(
+                path
             )
             measurement = self._store_bond_angle_measurement(
                 cache_key,
                 path,
                 tuple(bond_pairs),
                 tuple(angle_triplets),
+                tuple(dihedral_quartets),
                 tuple(coordination_numbers),
                 bond_values,
                 angle_values,
+                dihedral_values,
                 coordination_values,
                 cluster_label=cluster_label,
                 relative_label=relative_label,
@@ -149,6 +162,7 @@ class StructureDistributionStore:
         *,
         bond_pairs: Sequence[BondPairDefinition],
         angle_triplets: Sequence[AngleTripletDefinition],
+        dihedral_quartets: Sequence[DihedralQuartetDefinition] = (),
         coordination_numbers: Sequence[CoordinationNumberDefinition] = (),
         cluster_label: str | None = None,
         relative_label: str | None = None,
@@ -159,6 +173,7 @@ class StructureDistributionStore:
         analyzer = BondAnalyzer(
             bond_pairs=tuple(bond_pairs),
             angle_triplets=tuple(angle_triplets),
+            dihedral_quartets=tuple(dihedral_quartets),
             coordination_numbers=tuple(coordination_numbers),
         )
         normalized_elements = tuple(
@@ -170,6 +185,7 @@ class StructureDistributionStore:
                 self._bond_angle_definition_signature(
                     bond_pairs,
                     angle_triplets,
+                    dihedral_quartets,
                     coordination_numbers,
                 ),
             )
@@ -178,25 +194,31 @@ class StructureDistributionStore:
                 path,
                 tuple(bond_pairs),
                 tuple(angle_triplets),
+                tuple(dihedral_quartets),
                 tuple(coordination_numbers),
             )
             if cached is not None:
                 return cached
 
-            bond_values, angle_values, coordination_values = (
-                analyzer.measure_structure_data_with_coordination(
-                    np.asarray(coordinates, dtype=float),
-                    normalized_elements,
-                )
+            (
+                bond_values,
+                angle_values,
+                dihedral_values,
+                coordination_values,
+            ) = analyzer.measure_structure_data_with_coordination_and_dihedrals(
+                np.asarray(coordinates, dtype=float),
+                normalized_elements,
             )
             measurement = self._store_bond_angle_measurement(
                 cache_key,
                 path,
                 tuple(bond_pairs),
                 tuple(angle_triplets),
+                tuple(dihedral_quartets),
                 tuple(coordination_numbers),
                 bond_values,
                 angle_values,
+                dihedral_values,
                 coordination_values,
                 cluster_label=cluster_label,
                 relative_label=relative_label,
@@ -298,6 +320,7 @@ class StructureDistributionStore:
         path: Path,
         bond_pairs: tuple[BondPairDefinition, ...],
         angle_triplets: tuple[AngleTripletDefinition, ...],
+        dihedral_quartets: tuple[DihedralQuartetDefinition, ...],
         coordination_numbers: tuple[CoordinationNumberDefinition, ...],
     ) -> CachedStructureMeasurement | None:
         entry = self._manifest.get("entries", {}).get(cache_key)
@@ -308,11 +331,13 @@ class StructureDistributionStore:
         arrays = self._load_arrays()
         bond_values: dict[BondPairDefinition, list[float]] = {}
         angle_values: dict[AngleTripletDefinition, list[float]] = {}
+        dihedral_values: dict[DihedralQuartetDefinition, list[float]] = {}
         coordination_values: dict[
             CoordinationNumberDefinition, list[float]
         ] = {}
         bond_arrays = dict(entry.get("bond_arrays", {}))
         angle_arrays = dict(entry.get("angle_arrays", {}))
+        dihedral_arrays = dict(entry.get("dihedral_arrays", {}))
         coordination_arrays = dict(entry.get("coordination_arrays", {}))
         for definition in bond_pairs:
             array_key = bond_arrays.get(_definition_key(definition))
@@ -324,6 +349,13 @@ class StructureDistributionStore:
             if array_key is None or array_key not in arrays:
                 return None
             angle_values[definition] = arrays[array_key].astype(float).tolist()
+        for definition in dihedral_quartets:
+            array_key = dihedral_arrays.get(_definition_key(definition))
+            if array_key is None or array_key not in arrays:
+                return None
+            dihedral_values[definition] = (
+                arrays[array_key].astype(float).tolist()
+            )
         for definition in coordination_numbers:
             array_key = coordination_arrays.get(_definition_key(definition))
             if array_key is None or array_key not in arrays:
@@ -335,6 +367,7 @@ class StructureDistributionStore:
             structure_path=path,
             bond_values=bond_values,
             angle_values=angle_values,
+            dihedral_values=dihedral_values,
             coordination_values=coordination_values,
             from_cache=True,
             cache_key=cache_key,
@@ -372,9 +405,11 @@ class StructureDistributionStore:
         path: Path,
         bond_pairs: tuple[BondPairDefinition, ...],
         angle_triplets: tuple[AngleTripletDefinition, ...],
+        dihedral_quartets: tuple[DihedralQuartetDefinition, ...],
         coordination_numbers: tuple[CoordinationNumberDefinition, ...],
         bond_values: dict[BondPairDefinition, list[float]],
         angle_values: dict[AngleTripletDefinition, list[float]],
+        dihedral_values: dict[DihedralQuartetDefinition, list[float]],
         coordination_values: dict[CoordinationNumberDefinition, list[float]],
         *,
         cluster_label: str | None,
@@ -385,6 +420,7 @@ class StructureDistributionStore:
         arrays = self._load_arrays()
         bond_arrays: dict[str, str] = {}
         angle_arrays: dict[str, str] = {}
+        dihedral_arrays: dict[str, str] = {}
         coordination_arrays: dict[str, str] = {}
         for definition in bond_pairs:
             definition_key = _definition_key(definition)
@@ -402,6 +438,14 @@ class StructureDistributionStore:
                 dtype=float,
             )
             angle_arrays[definition_key] = array_key
+        for definition in dihedral_quartets:
+            definition_key = _definition_key(definition)
+            array_key = f"{cache_key}__dihedral__{_short_hash(definition_key)}"
+            arrays[array_key] = np.asarray(
+                dihedral_values.get(definition, []),
+                dtype=float,
+            )
+            dihedral_arrays[definition_key] = array_key
         for definition in coordination_numbers:
             definition_key = _definition_key(definition)
             array_key = (
@@ -421,6 +465,7 @@ class StructureDistributionStore:
             "definition_signature": self._bond_angle_definition_signature(
                 bond_pairs,
                 angle_triplets,
+                dihedral_quartets,
                 coordination_numbers,
             ),
             "cluster_label": cluster_label,
@@ -428,6 +473,7 @@ class StructureDistributionStore:
             "motif_label": motif_label,
             "bond_arrays": bond_arrays,
             "angle_arrays": angle_arrays,
+            "dihedral_arrays": dihedral_arrays,
             "coordination_arrays": coordination_arrays,
         }
         self._dirty = True
@@ -440,6 +486,10 @@ class StructureDistributionStore:
             angle_values={
                 definition: list(angle_values.get(definition, []))
                 for definition in angle_triplets
+            },
+            dihedral_values={
+                definition: list(dihedral_values.get(definition, []))
+                for definition in dihedral_quartets
             },
             coordination_values={
                 definition: list(coordination_values.get(definition, []))
@@ -561,6 +611,7 @@ class StructureDistributionStore:
     def _bond_angle_definition_signature(
         bond_pairs: Sequence[BondPairDefinition],
         angle_triplets: Sequence[AngleTripletDefinition],
+        dihedral_quartets: Sequence[DihedralQuartetDefinition] = (),
         coordination_numbers: Sequence[CoordinationNumberDefinition] = (),
     ) -> str:
         return _stable_json(
@@ -572,6 +623,9 @@ class StructureDistributionStore:
                 ],
                 "angle_triplets": [
                     definition.to_dict() for definition in angle_triplets
+                ],
+                "dihedral_quartets": [
+                    definition.to_dict() for definition in dihedral_quartets
                 ],
                 "coordination_numbers": [
                     definition.to_dict() for definition in coordination_numbers

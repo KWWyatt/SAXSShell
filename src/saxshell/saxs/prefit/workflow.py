@@ -2997,9 +2997,9 @@ class SAXSPrefitWorkflow:
                 if predicted_state.dataset_file is None:
                     raise FileNotFoundError(
                         "Predicted Structures mode is enabled, but no "
-                        "Cluster Dynamics ML prediction bundle was found in "
-                        "this project. Open Tools > Cluster Dynamics > Open "
-                        "Cluster Dynamics (ML), run a prediction, then "
+                        "Cluster Dynamics prediction bundle was found in "
+                        "this project. Open Tools > Structure Analysis > "
+                        "Open Cluster Dynamics, run a prediction, then "
                         "rebuild the SAXS components."
                     )
                 raise FileNotFoundError(
@@ -3022,9 +3022,9 @@ class SAXSPrefitWorkflow:
                 if predicted_state.dataset_file is None:
                     raise FileNotFoundError(
                         "Predicted Structures mode is enabled, but no "
-                        "Cluster Dynamics ML prediction bundle was found in "
-                        "this project. Open Tools > Cluster Dynamics > Open "
-                        "Cluster Dynamics (ML), run a prediction, then "
+                        "Cluster Dynamics prediction bundle was found in "
+                        "this project. Open Tools > Structure Analysis > "
+                        "Open Cluster Dynamics, run a prediction, then "
                         "generate the prior weights."
                     )
                 raise FileNotFoundError(

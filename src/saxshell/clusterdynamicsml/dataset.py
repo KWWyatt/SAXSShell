@@ -214,6 +214,7 @@ def _serialize_preview(preview: ClusterDynamicsMLPreview) -> dict[str, object]:
         "total_structure_files": int(preview.total_structure_files),
         "observed_node_counts": list(preview.observed_node_counts),
         "target_node_counts": list(preview.target_node_counts),
+        "prediction_enabled": bool(preview.prediction_enabled),
         "warnings": list(preview.warnings),
     }
 
@@ -322,6 +323,9 @@ def _deserialize_preview(payload: object) -> ClusterDynamicsMLPreview:
         target_node_counts=tuple(
             int(value)
             for value in preview_payload.get("target_node_counts", [])
+        ),
+        prediction_enabled=bool(
+            preview_payload.get("prediction_enabled", True)
         ),
         warnings=tuple(
             str(value) for value in preview_payload.get("warnings", [])

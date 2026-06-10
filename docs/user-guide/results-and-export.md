@@ -49,6 +49,6 @@ the current export schema is declared stable.
 - [Project Configuration](project-configuration.md)
 - [SAXS Prefit](saxs-prefit.md)
 - [pyDREAM Workflow](pydream-workflow.md)
-- [Cluster Dynamics](cluster-dynamics.md)
-- [Cluster Dynamics ML](cluster-dynamics-ml.md)
+- [Cluster Dynamics](cluster-dynamics-ml.md)
+- [Cluster Dynamics Time-Binned](cluster-dynamics.md)
 - [PDF Calculation](pdf-calculation.md)

@@ -275,6 +275,11 @@ class BondAnalysisBatchWorker(QObject):
             )
             try:
                 result = self._run_job(item_id, job)
+            except InterruptedError as exc:
+                message = str(exc) or "Bond analysis canceled by user."
+                self.log.emit(f"[{job.project_dir.name}] {message}")
+                self.status.emit("Bond analysis batch queue stopped")
+                break
             except Exception as exc:
                 message = str(exc)
                 self.item_failed.emit(item_id, message)
@@ -316,6 +321,7 @@ class BondAnalysisBatchWorker(QObject):
             job.clusters_dir,
             bond_pairs=job.preset.bond_pairs,
             angle_triplets=job.preset.angle_triplets,
+            dihedral_quartets=job.preset.dihedral_quartets,
             coordination_numbers=job.preset.coordination_numbers,
             output_dir=job.output_dir,
             structure_distribution_store_dir=(
@@ -329,6 +335,7 @@ class BondAnalysisBatchWorker(QObject):
         batch_result = workflow.run(
             progress_callback=on_progress,
             log_callback=on_log,
+            cancel_callback=self._cancel_requested.is_set,
         )
         csv_files = tuple(sorted(batch_result.output_dir.rglob("*.csv")))
         self.log.emit(
@@ -839,11 +846,11 @@ class BondAnalysisBatchQueueWindow(QMainWindow):
     def _request_cancel(self) -> None:
         self.cancel_button.setEnabled(False)
         self.queue_status_label.setText(
-            "Stopping queue after the active project finishes"
+            "Stopping queue at the next safe checkpoint"
         )
         self._append_log(
-            "Stop requested; the current project will finish before the "
-            "queue exits."
+            "Stop requested; the active project will stop at the next safe "
+            "checkpoint."
         )
         if self._run_worker is not None:
             self._run_worker.request_cancel()

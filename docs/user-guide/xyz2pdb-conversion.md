@@ -445,8 +445,9 @@ does not require the legacy JSON input file.
 Use the setup window to save a project-local run file for repeatable
 conversions:
 
-From the main SAXSShell window, use **Tools > CLI Setup > Open XYZ -> PDB CLI
-Setup (Beta)**. The same setup window can also be launched from a terminal:
+From the main SAXSShell window, use **Tools > (beta) > CLI Setup > Open XYZ ->
+PDB CLI Setup (Beta)**. The same setup window can also be launched from a
+terminal:
 
 ```bash
 xyz2pdb setup-ui /path/to/saxshell_project --input-path /path/to/xyz_frames

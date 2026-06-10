@@ -13,8 +13,8 @@ from matplotlib.backends.backend_qtagg import (
     NavigationToolbar2QT as NavigationToolbar,
 )
 from matplotlib.figure import Figure
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import QObject, QSize, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -40,10 +40,12 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -85,6 +87,7 @@ from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
+    track_saxshell_window,
 )
 from saxshell.saxs.ui.experimental_data_loader import (
     ExperimentalDataHeaderDialog,
@@ -115,6 +118,26 @@ QSplitter::handle:pressed {
 """
 
 
+def _default_plot_control_font() -> QFont:
+    families = set(QFontDatabase.families())
+    for family in (
+        "Arial",
+        "Helvetica",
+        "DejaVu Sans",
+        "Liberation Sans",
+        "Noto Sans",
+    ):
+        if family in families:
+            return QFont(family)
+
+    app_font_family = QApplication.font().family()
+    if app_font_family in families:
+        return QFont(app_font_family)
+    if families:
+        return QFont(sorted(families)[0])
+    return QFont()
+
+
 def _configure_resize_splitter(
     splitter: QSplitter,
     *,
@@ -141,10 +164,12 @@ class DebyerPDFWorker(QObject):
         self,
         settings: DebyerPDFSettings,
         *,
+        debyer_executable: str | Path | None = None,
         preview_enabled: bool = True,
     ) -> None:
         super().__init__()
         self.settings = settings
+        self.debyer_executable = debyer_executable
         self._cancel_requested = threading.Event()
         self._preview_enabled = threading.Event()
         self._preview_update_requested = threading.Event()
@@ -164,7 +189,10 @@ class DebyerPDFWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        workflow = DebyerPDFWorkflow(self.settings)
+        workflow = DebyerPDFWorkflow(
+            self.settings,
+            debyer_executable=self.debyer_executable,
+        )
         try:
             result = workflow.run(
                 progress_callback=self._emit_progress,
@@ -506,6 +534,7 @@ class DebyerPDFMainWindow(QMainWindow):
 
         right_splitter = QSplitter(Qt.Orientation.Vertical)
         plot_container = QWidget()
+        plot_container.setMinimumHeight(320)
         plot_layout = QVBoxLayout(plot_container)
         plot_layout.setContentsMargins(0, 0, 0, 0)
         plot_layout.setSpacing(6)
@@ -527,8 +556,10 @@ class DebyerPDFMainWindow(QMainWindow):
         )
         self.calculation_info_label.setWordWrap(True)
         self.calculation_info_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.calculation_info_label.setMaximumHeight(84)
         table_layout.addWidget(self.calculation_info_label)
         self.trace_table = QTableWidget(0, 8)
+        self.trace_table.setMinimumHeight(320)
         self.trace_table.setHorizontalHeaderLabels(
             [
                 "Visible",
@@ -558,14 +589,17 @@ class DebyerPDFMainWindow(QMainWindow):
             4, QHeaderView.ResizeMode.Stretch
         )
         self.trace_table.horizontalHeader().setSectionResizeMode(
-            5, QHeaderView.ResizeMode.ResizeToContents
+            5, QHeaderView.ResizeMode.Fixed
         )
         self.trace_table.horizontalHeader().setSectionResizeMode(
-            6, QHeaderView.ResizeMode.ResizeToContents
+            6, QHeaderView.ResizeMode.Fixed
         )
         self.trace_table.horizontalHeader().setSectionResizeMode(
             7, QHeaderView.ResizeMode.ResizeToContents
         )
+        self.trace_table.setColumnWidth(5, 34)
+        self.trace_table.setColumnWidth(6, 34)
+        table_container.setMinimumHeight(420)
         table_layout.addWidget(self.trace_table, stretch=1)
         right_splitter.addWidget(table_container)
         _configure_resize_splitter(
@@ -573,7 +607,9 @@ class DebyerPDFMainWindow(QMainWindow):
             handle_width=12,
             tooltip="Drag to resize the plot and trace table.",
         )
-        right_splitter.setSizes([620, 260])
+        right_splitter.setStretchFactor(0, 1)
+        right_splitter.setStretchFactor(1, 1)
+        right_splitter.setSizes([500, 440])
         layout.addWidget(right_splitter, stretch=1)
         return tab
 
@@ -709,7 +745,7 @@ class DebyerPDFMainWindow(QMainWindow):
         form.addRow("Tag font size", self.tag_font_size_spin)
 
         self.tag_font_family_combo = QFontComboBox()
-        self.tag_font_family_combo.setCurrentFont(QFont("DejaVu Sans"))
+        self.tag_font_family_combo.setCurrentFont(_default_plot_control_font())
         self.tag_font_family_combo.currentFontChanged.connect(
             self._refresh_plot
         )
@@ -741,7 +777,9 @@ class DebyerPDFMainWindow(QMainWindow):
         form.addRow("Axis label size", self.axis_label_size_spin)
 
         self.axis_font_family_combo = QFontComboBox()
-        self.axis_font_family_combo.setCurrentFont(QFont("DejaVu Sans"))
+        self.axis_font_family_combo.setCurrentFont(
+            _default_plot_control_font()
+        )
         self.axis_font_family_combo.currentFontChanged.connect(
             self._refresh_plot
         )
@@ -795,6 +833,33 @@ class DebyerPDFMainWindow(QMainWindow):
     def _build_runtime_group(self) -> QGroupBox:
         group = QGroupBox("Debyer Runtime")
         layout = QVBoxLayout(group)
+
+        path_form = QFormLayout()
+        path_row = QWidget()
+        path_layout = QHBoxLayout(path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        self.debyer_executable_edit = QLineEdit()
+        self.debyer_executable_edit.setPlaceholderText(
+            "Auto-detect debyer on PATH"
+        )
+        self.debyer_executable_edit.setClearButtonEnabled(False)
+        self.debyer_executable_edit.setToolTip(
+            "Leave blank to auto-detect Debyer on PATH, or enter the exact "
+            "Debyer executable to validate and use for calculations."
+        )
+        self.debyer_executable_edit.editingFinished.connect(
+            self._refresh_runtime_status
+        )
+        path_layout.addWidget(self.debyer_executable_edit, stretch=1)
+        browse_button = QPushButton("Browse...")
+        browse_button.clicked.connect(self._choose_debyer_executable)
+        path_layout.addWidget(browse_button)
+        revalidate_button = QPushButton("Revalidate")
+        revalidate_button.clicked.connect(self._refresh_runtime_status)
+        path_layout.addWidget(revalidate_button)
+        path_form.addRow("Executable", path_row)
+        layout.addLayout(path_form)
+
         self.runtime_status_label = QLabel("Checking Debyer...")
         self.runtime_status_label.setWordWrap(True)
         self.runtime_status_label.setTextInteractionFlags(
@@ -1126,10 +1191,26 @@ class DebyerPDFMainWindow(QMainWindow):
             )
         self._refresh_saved_calculations()
 
+    def _debyer_executable_from_ui(self) -> Path | None:
+        text = self.debyer_executable_edit.text().strip()
+        if not text:
+            return None
+        return Path(text).expanduser()
+
     def _refresh_runtime_status(self) -> None:
-        status = check_debyer_runtime()
+        requested_executable = self._debyer_executable_from_ui()
+        status = check_debyer_runtime(requested_executable)
+        executable_text = (
+            str(status.executable_path)
+            if status.executable_path is not None
+            else "not detected"
+        )
+        if status.executable_path is not None:
+            self.debyer_executable_edit.setText(str(status.executable_path))
         self.runtime_status_label.setText(
             status.message
+            + "\nDebyer executable path: "
+            + executable_text
             + "\n\nDebyer docs: "
             + DEBYER_DOCS_URL
             + "\nDebyer GitHub: "
@@ -1137,6 +1218,24 @@ class DebyerPDFMainWindow(QMainWindow):
             + "\nTotal scattering formalism reference: "
             + TOTAL_SCATTERING_PAPER_URL
         )
+
+    def _choose_debyer_executable(self) -> None:
+        current = self.debyer_executable_edit.text().strip()
+        start_dir = (
+            str(Path(current).expanduser().parent)
+            if current
+            else str(Path.home())
+        )
+        selected_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select Debyer executable",
+            start_dir,
+            "Executable files (*)",
+        )
+        if not selected_path:
+            return
+        self.debyer_executable_edit.setText(selected_path)
+        self._refresh_runtime_status()
 
     def _choose_project_dir(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -2245,6 +2344,7 @@ class DebyerPDFMainWindow(QMainWindow):
             )
             return
         settings.project_dir.mkdir(parents=True, exist_ok=True)
+        debyer_executable = self._debyer_executable_from_ui()
         self.calculate_button.setEnabled(False)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
@@ -2258,6 +2358,7 @@ class DebyerPDFMainWindow(QMainWindow):
         self._run_thread = QThread(self)
         self._run_worker = DebyerPDFWorker(
             settings,
+            debyer_executable=debyer_executable,
             preview_enabled=self.update_plot_during_run_checkbox.isChecked(),
         )
         self._run_worker.moveToThread(self._run_thread)
@@ -3095,8 +3196,11 @@ class DebyerPDFMainWindow(QMainWindow):
             )
             self.trace_table.setItem(row_index, 4, peaks_item)
 
-            edit_button = QPushButton("Edit")
-            edit_button.setEnabled(is_partial)
+            edit_button = self._trace_table_action_button(
+                QStyle.StandardPixmap.SP_FileDialogDetailedView,
+                enabled=is_partial,
+                tooltip="Edit peak labels and tag positions for this partial.",
+            )
             if is_partial:
                 edit_button.clicked.connect(
                     lambda _checked=False, trace_key=key: self._edit_peak_markers(
@@ -3105,8 +3209,11 @@ class DebyerPDFMainWindow(QMainWindow):
                 )
             self.trace_table.setCellWidget(row_index, 5, edit_button)
 
-            reset_button = QPushButton("Reset")
-            reset_button.setEnabled(is_partial)
+            reset_button = self._trace_table_action_button(
+                QStyle.StandardPixmap.SP_BrowserReload,
+                enabled=is_partial,
+                tooltip="Reset automatically detected peaks for this partial.",
+            )
             if is_partial:
                 reset_button.clicked.connect(
                     lambda _checked=False, trace_key=key: self._reset_partial_peak_markers(
@@ -3128,6 +3235,35 @@ class DebyerPDFMainWindow(QMainWindow):
             self.trace_table.setCellWidget(row_index, 7, color_button)
 
         self._update_toggle_button_labels()
+
+    def _trace_table_action_button(
+        self,
+        icon: QStyle.StandardPixmap,
+        *,
+        enabled: bool,
+        tooltip: str,
+    ) -> QToolButton:
+        button = QToolButton()
+        button.setIcon(self.style().standardIcon(icon))
+        button.setIconSize(QSize(14, 14))
+        button.setAutoRaise(True)
+        button.setEnabled(enabled)
+        button.setToolTip(tooltip)
+        button.setFixedSize(24, 22)
+        button.setStyleSheet(
+            "QToolButton {"
+            "padding: 0;"
+            "margin: 0;"
+            "border: 1px solid #b7cbcf;"
+            "border-radius: 3px;"
+            "background: #f6fbfb;"
+            "}"
+            "QToolButton:disabled {"
+            "color: #8a9a9d;"
+            "background: #edf3f3;"
+            "}"
+        )
+        return button
 
     def _configure_color_button(
         self,
@@ -3253,8 +3389,7 @@ def launch_debyer_pdf_ui(
     )
     window.show()
     window.raise_()
-    _OPEN_WINDOWS.append(window)
-    window.destroyed.connect(lambda _obj=None: _OPEN_WINDOWS.remove(window))
+    track_saxshell_window(window, _OPEN_WINDOWS)
     if not should_exec:
         return 0
     return app.exec()

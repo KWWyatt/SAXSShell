@@ -130,6 +130,23 @@ def test_definitions_panel_builds_atom_and_pair_rules(qapp):
     assert panel.pair_cutoff_definitions() == {("Pb", "I"): {0: 1.7, 1: 1.9}}
 
 
+def test_definitions_panel_atom_type_column_keeps_labels_readable(qapp):
+    panel = ClusterDefinitionsPanel()
+    panel.atom_table.setRowCount(0)
+
+    panel._add_atom_row("node", element="Pb", residue="PBI")
+    panel._add_atom_row("linker", element="I", residue="PBI")
+    panel._add_atom_row("shell", element="O", residue="DMS")
+
+    assert panel.atom_table.columnWidth(0) >= 128
+    for row, expected in enumerate(("node", "linker", "shell")):
+        combo = panel.atom_table.cellWidget(row, 0)
+        assert isinstance(combo, QComboBox)
+        assert combo.currentText() == expected
+        assert combo.minimumWidth() >= 112
+        assert combo.minimumContentsLength() >= len("linker")
+
+
 def test_definitions_panel_switches_to_xyz_mode(qapp):
     panel = ClusterDefinitionsPanel()
 
@@ -326,6 +343,76 @@ def test_cluster_main_window_shows_compact_project_status_and_registers_paths(
         }
     ]
     assert "Updated project folder references:" in (message or "")
+    window.close()
+
+
+def test_cluster_main_window_registers_extraction_settings_memory(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    manager.create_project(project_dir)
+    frames_dir = tmp_path / "splitxyz0001"
+    frames_dir.mkdir()
+    clusters_dir = tmp_path / "clusters_splitxyz0001"
+    clusters_dir.mkdir()
+    config = ClusterJobConfig(
+        frames_dir=frames_dir,
+        atom_type_definitions={
+            "node": [("Pb", None)],
+            "linker": [("I", None)],
+            "shell": [("O", "DMS")],
+        },
+        pair_cutoff_definitions={
+            ("Pb", "I"): {0: 3.36},
+            ("Pb", "O"): {1: 3.20},
+        },
+        box_dimensions=(20.0, 21.0, 22.0),
+        use_pbc=True,
+        search_mode="vectorized",
+        save_state_frequency=250,
+        default_cutoff=4.5,
+        shell_levels=(1, 2),
+        include_shell_levels=(0, 1, 2),
+        shared_shells=False,
+        smart_solvation_shells=True,
+        include_shell_atoms_in_stoichiometry=True,
+        output_dir=clusters_dir,
+    )
+    window = ClusterMainWindow(initial_project_dir=project_dir)
+
+    window._register_project_paths(
+        frames_dir=frames_dir,
+        clusters_dir=clusters_dir,
+        cluster_config=config,
+    )
+
+    settings = manager.load_project(project_dir)
+    memory = settings.cluster_extraction_settings
+    assert memory["frames_dir"] == str(frames_dir.resolve())
+    assert memory["clusters_dir"] == str(clusters_dir.resolve())
+    assert memory["box_dimensions"] == [20.0, 21.0, 22.0]
+    assert memory["use_pbc"] is True
+    assert memory["search_mode"] == "vectorized"
+    assert memory["save_state_frequency"] == 250
+    assert memory["default_cutoff"] == pytest.approx(4.5)
+    assert memory["shell_levels"] == [1, 2]
+    assert memory["include_shell_levels"] == [0, 1, 2]
+    assert memory["shared_shells"] is False
+    assert memory["smart_solvation_shells"] is True
+    assert memory["include_shell_atoms_in_stoichiometry"] is True
+    assert memory["atom_type_definitions"]["shell"] == [
+        {"element": "O", "residue": "DMS"}
+    ]
+    assert {
+        (entry["atom1"], entry["atom2"]): entry["shell_cutoffs"]
+        for entry in memory["pair_cutoff_definitions"]
+    } == {
+        ("Pb", "I"): {"0": 3.36},
+        ("Pb", "O"): {"1": 3.20},
+    }
     window.close()
 
 

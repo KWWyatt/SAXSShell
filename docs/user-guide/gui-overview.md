@@ -137,20 +137,23 @@ Use these tools when you want to analyze the sorted clusters themselves.
 
 - `bondanalysis` measures bond-pair and angle distributions from the cluster
   folders.
+- `Cluster Dynamics` extends the observed structure series, generates
+  predicted structures, and compares observed-only versus
+  observed-plus-predicted SAXS models.
 - `Representative Structures` selects project-backed representative structures
   from stoichiometry folders. The beta CLI setup path writes a run file for the
   same backend when headless execution is preferred.
+- `EXAFS GDS Mapping` combines completed representative structures with
+  bondanalysis GDS variable registries, previews labeled EXAFS paths, and
+  writes Artemis setup files.
 
-### Cluster Dynamics
+### Cluster Dynamics Time-Binned
 
-Use these tools when you need time-resolved cluster populations or want to
-extend the observed structure series.
+Use this beta tool when you need time-resolved cluster populations without the
+prediction workflow.
 
 - `clusterdynamics` builds time-binned cluster-distribution heatmaps, optional
   energy overlays, and lifetime / association / dissociation summaries.
-- `clusterdynamicsml` extrapolates larger cluster candidates, generates
-  predicted structures, and compares observed-only versus
-  observed-plus-predicted SAXS models.
 
 ### PDF
 
@@ -193,7 +196,12 @@ settings outside the main computed-distribution flow.
 Use this section for smaller estimate windows such as volume-fraction, number
 density, attenuation, and fluorescence calculators.
 
-### CLI Setup
+### (beta)
+
+Use this section for early-access workflows that are exposed from the main
+`Tools` menu but still need extra caution.
+
+#### CLI Setup
 
 Use this section when you want the GUI to prepare a project-local run file, but
 you want the heavier work to run later from a terminal.
@@ -208,22 +216,19 @@ you want the heavier work to run later from a terminal.
   project folder so `clusterdynamics run /path/to/project` can generate the
   time-binned heatmap dataset, cluster lifetime table, and association /
   dissociation rate exports from the terminal.
-- `Cluster Dynamics ML CLI Setup` saves `cluster_dynamics_ml_cli_run.json` in
-  the project folder so `clusterdynamicsml run /path/to/project` can run the
-  prediction workflow, write predicted structures and SAXS/profile exports,
-  and keep the outputs linked to the project folder.
+- `Cluster Dynamics Prediction CLI Setup` saves
+  `cluster_dynamics_ml_cli_run.json` in the project folder so
+  `clusterdynamicsml run /path/to/project` can run the prediction workflow,
+  write predicted structures and SAXS/profile exports, and keep the outputs
+  linked to the project folder.
 - `Representative CLI Setup` saves `representative_structure_cli_run.json` in
   the project folder so `representativefinder run /path/to/project` can execute
   the representative-selection backend without the plotting and viewer UI.
 
-Cluster Dynamics and Cluster Dynamics ML also provide `batch-run --workers N`
-subcommands for processing multiple prepared project folders from one terminal
-session.
+The cluster dynamics CLIs also provide `batch-run --workers N` subcommands for
+processing multiple prepared project folders from one terminal session.
 
-### (beta)
-
-Use this section for early-access workflows that are exposed from the main
-`Tools` menu but still need extra caution.
+#### Standalone beta tools
 
 - `Debye-Waller Analysis` estimates intra-molecular and inter-molecular
   Debye-Waller coefficients from sorted PDB cluster folders and saves them in
@@ -244,12 +249,12 @@ using the Project Setup integration path.
 ### Structure Analysis
 
 - [Bond Analysis](bond-analysis.md)
+- [Cluster Dynamics](cluster-dynamics-ml.md)
 - [Representative Structure CLI](representative-structure-cli.md)
 
-### Cluster Dynamics
+### Cluster Dynamics Time-Binned
 
-- [Cluster Dynamics](cluster-dynamics.md)
-- [Cluster Dynamics ML](cluster-dynamics-ml.md)
+- [Cluster Dynamics Time-Binned](cluster-dynamics.md)
 
 ### PDF
 
